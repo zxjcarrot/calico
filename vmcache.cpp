@@ -341,7 +341,7 @@ struct BufferManager {
    Page* virtMem;
    Page* frameMem;
    PageState* pageState;
-   std::unique_ptr<std::atomic<u32>[]> pidToFrameArray;
+   std::unique_ptr<std::atomic<u64>[]> pidToFrameArray;
    std::unique_ptr<std::atomic<PID>[]> frameToPidArray;
    ShardedMap<PID, u32> pidToFrameMap;
    ShardedMap<u32, PID> frameToPidMap;
@@ -734,7 +734,7 @@ BufferManager::BufferManager()
          pidToFrameMap.reserve(virtCount);
          frameToPidMap.reserve(physCount);
       } else {
-         pidToFrameArray.reset(new std::atomic<u32>[virtCount]);
+         pidToFrameArray.reset(new std::atomic<u64>[virtCount]);
          frameToPidArray.reset(new std::atomic<PID>[physCount]);
          for (u64 i = 0; i < virtCount; i++)
             pidToFrameArray[i].store(invalidFrame, std::memory_order_relaxed);
