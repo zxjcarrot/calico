@@ -40,8 +40,10 @@
 __thread uint16_t workerThreadId = 0;
 __thread int32_t tpcchistorycounter = 0;
 #include "tpcc/TPCCWorkload.hpp"
+#include "tpcc/ZipfianGenerator.hpp"
 
 using namespace std;
+using namespace tpcc;
 
 typedef uint8_t u8;
 typedef uint16_t u16;
@@ -533,7 +535,7 @@ struct BufferManager {
    int blockfd;
    int exmapfd;
 
-   static constexpr u32 invalidFrame = std::numeric_limits<u32>::max();
+   static constexpr u64 invalidFrame = std::numeric_limits<u64>::max();
    static constexpr PID invalidPID = std::numeric_limits<PID>::max();
    static constexpr u32 freePartitionCount = 64;
 
@@ -583,7 +585,7 @@ struct BufferManager {
    void releaseFrame(PID pid);
    u32 popFreeFrame();
 
-   u32 partitionForFrame(u32 frame) const;
+   u32 partitionForFrame(u64 frame) const;
    void lockPartition(u32 partition);
    void unlockPartition(u32 partition);
 };
@@ -894,6 +896,12 @@ u64 envOr(const char* env, u64 value) {
    return value;
 }
 
+double envOrDouble(const char* env, double value) {
+   if (getenv(env))
+      return atof(getenv(env));
+   return value;
+}
+
 BufferManager::BufferManager()
    : virtSize(envOr("VIRTGB", 16) * gb),
      physSize(envOr("PHYSGB", 4) * gb),
@@ -946,8 +954,8 @@ BufferManager::BufferManager()
       }
       if (hashMode == HashMode::Array) {
          pidToFrameArray.reset(new std::atomic<u64>[virtCount]);
-         // if (virtCount * sizeof(std::atomic<u64>) >= 2 * mb)
-         //    madvise(pidToFrameArray.get(), virtCount * sizeof(std::atomic<u64>), MADV_HUGEPAGE);
+         if (virtCount * sizeof(std::atomic<u64>) >= 2 * mb)
+            madvise(pidToFrameArray.get(), virtCount * sizeof(std::atomic<u64>), MADV_HUGEPAGE);
          frameToPidArray.reset(new std::atomic<PID>[physCount]);
          for (u64 i = 0; i < virtCount; i++)
             pidToFrameArray[i].store(invalidFrame, std::memory_order_relaxed);
@@ -1032,12 +1040,12 @@ PID BufferManager::toPID(void* page) {
       auto idx = ptr - frameMem;
       assert(idx >= 0 && static_cast<u64>(idx) < physCount);
       if (hashMode == HashMode::Array) {
-         PID pid = frameToPidArray[static_cast<u32>(idx)].load(std::memory_order_acquire);
+         PID pid = frameToPidArray[static_cast<size_t>(idx)].load(std::memory_order_acquire);
          assert(pid != invalidPID);
          return pid;
       } else {
          PID pid;
-         bool ok = frameToPidHash->tryGet(static_cast<u32>(idx), pid);
+         bool ok = frameToPidHash->tryGet(static_cast<u64>(idx), pid);
          assert(ok);
          return pid;
       }
@@ -1056,7 +1064,8 @@ Page* BufferManager::residentPtr(PID pid) {
          bool ok = pidToFrameHash->tryGet(pid, frame);
          assert(ok);
       }
-      return frameMem + frame;
+      assert(frame < physCount);
+      return frameMem + static_cast<size_t>(frame);
    }
    return virtMem + pid;
 }
@@ -1097,11 +1106,12 @@ Page* BufferManager::acquireFrameForPid(PID pid) {
       return virtMem + pid;
    u32 frame = popFreeFrame();
    if (hashMode == HashMode::Array) {
-      pidToFrameArray[pid].store(frame, std::memory_order_release);
+      pidToFrameArray[pid].store(static_cast<u64>(frame), std::memory_order_release);
       frameToPidArray[frame].store(pid, std::memory_order_release);
    } else {
-      pidToFrameHash->insertOrAssign(pid, frame);
-      frameToPidHash->insertOrAssign(frame, pid);
+      u64 frameId = static_cast<u64>(frame);
+      pidToFrameHash->insertOrAssign(pid, frameId);
+      frameToPidHash->insertOrAssign(frameId, pid);
    }
    return frameMem + frame;
 }
@@ -1113,7 +1123,8 @@ void BufferManager::releaseFrame(PID pid) {
    if (hashMode == HashMode::Array) {
       frame = pidToFrameArray[pid].exchange(invalidFrame, std::memory_order_acq_rel);
       assert(frame != invalidFrame);
-      frameToPidArray[frame].store(invalidPID, std::memory_order_release);
+      assert(frame < physCount);
+      frameToPidArray[static_cast<size_t>(frame)].store(invalidPID, std::memory_order_release);
    } else {
       bool ok = pidToFrameHash->erase(pid, frame);
       assert(ok);
@@ -1122,18 +1133,19 @@ void BufferManager::releaseFrame(PID pid) {
       assert(ok2);
    }
 
+   u32 frameIdx = static_cast<u32>(frame);
    u32 partition = partitionForFrame(frame);
    auto& part = freePartitions[partition];
    lockPartition(partition);
    assert(part.top < part.frames.size());
-   part.frames[part.top++] = frame;
+   part.frames[part.top++] = frameIdx;
    unlockPartition(partition);
 }
 
-u32 BufferManager::partitionForFrame(u32 frame) const {
+u32 BufferManager::partitionForFrame(u64 frame) const {
    if (partitionFrameSpan == 0)
       return 0;
-   u32 partition = frame / partitionFrameSpan;
+   u32 partition = static_cast<u32>(frame / partitionFrameSpan);
    return (partition >= freePartitionCount) ? (freePartitionCount - 1) : partition;
 }
 
@@ -2337,6 +2349,7 @@ int main(int argc, char** argv) {
    u64 n = envOr("DATASIZE", 10);
    u64 runForSec = envOr("RUNFOR", 30);
    bool isRndread = envOr("RNDREAD", 0);
+   double skewFactor = envOrDouble("SKEW", 0.0); // Zipfian skew factor, 0.0 = uniform
 
 
 
@@ -2359,19 +2372,26 @@ int main(int argc, char** argv) {
       : (bm.useExmap ? "exmap" : "vmcache");
 
    auto statFn = [&]() {
-      cout << "ts,tx,rmb,wmb,system,threads,datasize,workload,batch" << endl;
+      cout << "ts,tx,rmb,wmb,system,threads,datasize,workload,batch,skew" << endl;
       u64 cnt = 0;
       for (uint64_t i=0; i<runForSec; i++) {
          sleep(1);
          float rmb = (bm.readCount.exchange(0)*pageSize)/(1024.0*1024);
          float wmb = (bm.writeCount.exchange(0)*pageSize)/(1024.0*1024);
          u64 prog = txProgress.exchange(0);
-         cout << cnt++ << "," << prog << "," << rmb << "," << wmb << "," << systemName << "," << nthreads << "," << n << "," << (isRndread?"rndread":"tpcc") << "," << bm.batch << endl;
+         cout << cnt++ << "," << prog << "," << rmb << "," << wmb << "," << systemName << "," << nthreads << "," << n << "," << (isRndread?"rndread":"tpcc") << "," << bm.batch << "," << skewFactor << endl;
       }
       keepRunning = false;
    };
 
    if (isRndread) {
+      // Print information about the key distribution being used
+      if (skewFactor > 0.0) {
+         cerr << "Using Zipfian key distribution with skew factor: " << skewFactor << endl;
+      } else {
+         cerr << "Using uniform random key distribution" << endl;
+      }
+      
       BTree bt;
       bt.splitOrdered = true;
 
@@ -2404,9 +2424,22 @@ int main(int argc, char** argv) {
          workerThreadId = worker;
          u64 cnt = 0;
          u64 start = rdtsc();
+         
+         // Initialize key generator based on skew factor
+         std::unique_ptr<ScrambledZipfGenerator> zipfGen;
+         if (skewFactor > 0.0) {
+            zipfGen = std::make_unique<ScrambledZipfGenerator>(0, n, skewFactor);
+         }
+         
          while (keepRunning.load()) {
             union { u64 v1; u8 k1[sizeof(u64)]; };
-            v1 = __builtin_bswap64(RandomGenerator::getRand<u64>(0, n));
+            
+            // Generate key using either uniform random or Zipfian distribution
+            if (skewFactor > 0.0) {
+               v1 = __builtin_bswap64(zipfGen->rand());
+            } else {
+               v1 = __builtin_bswap64(RandomGenerator::getRand<u64>(0, n));
+            }
 
             array<u8, 120> payload;
             bool succ = bt.lookup({k1, sizeof(u64)}, [&](span<u8> p) {
