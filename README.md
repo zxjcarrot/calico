@@ -19,6 +19,7 @@ Code repository for SIGMOD'23 paper [Virtual-Memory Assisted Buffer Management](
 * `TRADITIONAL=1` turns on the in-process buffer pool instead of the default vmcache/exmap fault-driven path. Pages are tracked with the lock-free frame array.
 * `TRADHASH=1` (only relevant together with `TRADITIONAL=1`) uses the sharded `std::unordered_map` translator, retaining per-shard read/write locks.
 * `TRADHASH=2` enables the new open-addressing translator, which keeps the same sharding layout but uses probing tables to avoid chaining overhead.
+* `TRADHASH=3` selects the single-access array translator, embedding the frame id directly into the page state to minimize metadata fetches.
 * Leave both knobs unset to keep the original vmcache behaviour (`TRADITIONAL=0`, `EXMAP=0`), or combine `EXMAP=1` with `TRADITIONAL=0` to exercise the kernel-assisted variant.
 
 vmcache mmap: `TRADITIONAL=0 TRADHASH=0 RNDREAD=1 BLOCK=/mnt/data/vmcache/heapfile THREADS=1 DATASIZE=2e7 ./vmcache`
@@ -28,6 +29,8 @@ vmcache array: `TRADITIONAL=1 TRADHASH=0 RNDREAD=1 BLOCK=/mnt/data/vmcache/heapf
 vmcache hash (unordered): `TRADITIONAL=1 TRADHASH=1 RNDREAD=1 BLOCK=/mnt/data/vmcache/heapfile THREADS=1 DATASIZE=2e7 ./vmcache`
 
 vmcache hash (open addressing): `TRADITIONAL=1 TRADHASH=2 RNDREAD=1 BLOCK=/mnt/data/vmcache/heapfile THREADS=1 DATASIZE=2e7 ./vmcache`
+
+vmcache array (single access): `TRADITIONAL=1 TRADHASH=3 RNDREAD=1 BLOCK=/mnt/data/vmcache/heapfile THREADS=1 DATASIZE=2e7 ./vmcache`
 
 Graph BFS benchmark: `GRAPH=1 GRAPHN=10000 GRAPHSTART=0 ./vmcache`
 

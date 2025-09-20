@@ -57,9 +57,9 @@ struct alignas(4096) Page {
    bool dirty;
 };
 
-struct GraphNodePage {
+struct GraphNodePage: public Page {
    u32 neighborCount;
-    u32 padding;
+   u32 padding;
    u64 value;
    PID neighbors[1];
 
@@ -106,12 +106,48 @@ struct PageState {
    static const u64 Marked = 254;
    static const u64 Evicted = 255;
 
+   static constexpr u64 stateMask = 0xFF00000000000000ULL;
+   static constexpr u64 lowMask = 0x00FFFFFFFFFFFFFFULL;
+   static constexpr u64 frameMask = 0x00000000FFFFFFFFULL;
+   static constexpr u64 versionMaskPacked = 0x00FFFFFF00000000ULL;
+   static constexpr u32 versionBitsPacked = 24;
+   static constexpr u64 versionMaxPacked = (1ULL << versionBitsPacked) - 1;
+   static constexpr u32 packedInvalidFrame = 0xFFFFFFFFu;
+
+   static bool packedMode;
+   static void setPackedMode(bool value) { packedMode = value; }
+   static bool isPackedMode() { return packedMode; }
+
    PageState() {}
 
-   void init() { stateAndVersion.store(sameVersion(0, Evicted), std::memory_order_release); }
+   static inline u64 extractLow(u64 v) { return v & lowMask; }
+   static inline u64 extractFrame(u64 v) { return v & frameMask; }
 
-   static inline u64 sameVersion(u64 oldStateAndVersion, u64 newState) { return ((oldStateAndVersion<<8)>>8) | newState<<56; }
-   static inline u64 nextVersion(u64 oldStateAndVersion, u64 newState) { return (((oldStateAndVersion<<8)>>8)+1) | newState<<56; }
+   static inline u64 compose(u64 state, u64 low) { return (state << 56) | (low & lowMask); }
+
+   static inline u64 incrementLow(u64 oldStateAndVersion) {
+      if (!packedMode)
+         return (extractLow(oldStateAndVersion) + 1) & lowMask;
+      u64 framePart = oldStateAndVersion & frameMask;
+      u64 versionPart = (oldStateAndVersion & versionMaskPacked) >> 32;
+      versionPart = (versionPart + 1) & versionMaxPacked;
+      return ((versionPart << 32) & versionMaskPacked) | framePart;
+   }
+
+   void init() {
+      u64 low = 0;
+      if (packedMode)
+         low = (0ULL << 32) | static_cast<u64>(packedInvalidFrame);
+      stateAndVersion.store(compose(Evicted, low), std::memory_order_release);
+   }
+
+   static inline u64 sameVersion(u64 oldStateAndVersion, u64 newState) {
+      return compose(newState, extractLow(oldStateAndVersion));
+   }
+
+   static inline u64 nextVersion(u64 oldStateAndVersion, u64 newState) {
+      return compose(newState, incrementLow(oldStateAndVersion));
+   }
 
    bool tryLockX(u64 oldStateAndVersion) {
       return stateAndVersion.compare_exchange_strong(oldStateAndVersion, sameVersion(oldStateAndVersion, Locked));
@@ -159,8 +195,39 @@ struct PageState {
    static u64 getState(u64 v) { return v >> 56; };
    u64 getState() { return getState(stateAndVersion.load()); }
 
+   static u64 getFrameValue(u64 v) {
+      if (!packedMode)
+         return 0;
+      return v & frameMask;
+   }
+
+   u64 getFrameValue() const {
+      if (!packedMode)
+         return 0;
+      return extractFrame(stateAndVersion.load(std::memory_order_acquire));
+   }
+
+   void setFrameValue(u64 frame) {
+      if (!packedMode)
+         return;
+      frame &= frameMask;
+      u64 expected = stateAndVersion.load(std::memory_order_relaxed);
+      while (true) {
+         u64 desired = (expected & ~frameMask) | frame;
+         if (stateAndVersion.compare_exchange_weak(expected, desired, std::memory_order_release, std::memory_order_relaxed))
+            return;
+      }
+   }
+
+   void clearFrameValue() {
+      if (packedMode)
+         setFrameValue(packedInvalidFrame);
+   }
+
    void operator=(PageState&) = delete;
 };
+
+bool PageState::packedMode = false;
 
 // open addressing hash table used for second chance replacement to keep track of currently-cached pages
 struct ResidentPageSet {
@@ -361,6 +428,7 @@ class ShardedOpenAddressMap : public PartitionedMap<K, V> {
          }
          table.swap(newTable);
          size = oldSize;
+         madvise(table.data(), table.size() * sizeof(OAEntry<K, V>), MADV_HUGEPAGE);
       }
 
       static void insertInto(std::vector<OAEntry<K, V>>& tbl, const K& key, const V& value) {
@@ -527,7 +595,7 @@ struct BufferManager {
    struct exmap_user_interface* exmapInterface[maxWorkerThreads];
    vector<LibaioInterface> libaioInterface;
 
-   enum class HashMode { Array = 0, Unordered = 1, OpenAddress = 2 };
+   enum class HashMode { Array = 0, Unordered = 1, OpenAddress = 2, Array1Access = 3 };
 
    bool useTraditional;
    bool useExmap;
@@ -573,6 +641,7 @@ struct BufferManager {
    PID toPID(void* page);
    Page* toPtr(PID pid);
    Page* residentPtr(PID pid);
+   Page* residentPtr(PID pid, PageState& ps, u64 stateAndVersion);
    Page* preparePageForWrite(PID pid);
 
    void ensureFreePages();
@@ -661,7 +730,7 @@ struct GuardO {
             case PageState::Marked: {
                u64 newV = PageState::sameVersion(v, PageState::Unlocked);
                if (ps.stateAndVersion.compare_exchange_weak(v, newV)) {
-                  ptr = reinterpret_cast<T*>(bm.residentPtr(pid));
+                  ptr = reinterpret_cast<T*>(bm.residentPtr(pid, ps, newV));
                   version = newV;
                   return;
                }
@@ -676,7 +745,7 @@ struct GuardO {
                }
                break;
             default:
-               ptr = reinterpret_cast<T*>(bm.residentPtr(pid));
+               ptr = reinterpret_cast<T*>(bm.residentPtr(pid, ps, v));
                version = v;
                return;
          }
@@ -925,8 +994,11 @@ BufferManager::BufferManager()
       hashMode = HashMode::Unordered;
    else if (tradHashSetting == 2)
       hashMode = HashMode::OpenAddress;
+   else if (tradHashSetting == 3)
+      hashMode = HashMode::Array1Access;
    else
       hashMode = HashMode::Array;
+   PageState::setPackedMode(hashMode == HashMode::Array1Access);
    virtMem = nullptr;
    frameMem = nullptr;
 
@@ -952,15 +1024,20 @@ BufferManager::BufferManager()
             std::random_shuffle(partition.frames.begin(), partition.frames.end());
          partition.top = partition.frames.size();
       }
+      frameToPidArray.reset(new std::atomic<PID>[physCount]);
+      for (u64 i = 0; i < physCount; i++)
+         frameToPidArray[i].store(invalidPID, std::memory_order_relaxed);
+
       if (hashMode == HashMode::Array) {
          pidToFrameArray.reset(new std::atomic<u64>[virtCount]);
          if (virtCount * sizeof(std::atomic<u64>) >= 2 * mb)
             madvise(pidToFrameArray.get(), virtCount * sizeof(std::atomic<u64>), MADV_HUGEPAGE);
-         frameToPidArray.reset(new std::atomic<PID>[physCount]);
          for (u64 i = 0; i < virtCount; i++)
             pidToFrameArray[i].store(invalidFrame, std::memory_order_relaxed);
-         for (u64 i = 0; i < physCount; i++)
-            frameToPidArray[i].store(invalidPID, std::memory_order_relaxed);
+      } else if (hashMode == HashMode::Array1Access) {
+         pidToFrameArray.reset();
+         pidToFrameHash.reset();
+         frameToPidHash.reset();
       } else {
          if (hashMode == HashMode::Unordered) {
             pidToFrameHash = std::make_unique<ShardedUnorderedMap<PID, u64>>();
@@ -1039,7 +1116,7 @@ PID BufferManager::toPID(void* page) {
    if (useTraditional) {
       auto idx = ptr - frameMem;
       assert(idx >= 0 && static_cast<u64>(idx) < physCount);
-      if (hashMode == HashMode::Array) {
+      if (hashMode == HashMode::Array || hashMode == HashMode::Array1Access) {
          PID pid = frameToPidArray[static_cast<size_t>(idx)].load(std::memory_order_acquire);
          assert(pid != invalidPID);
          return pid;
@@ -1055,19 +1132,37 @@ PID BufferManager::toPID(void* page) {
 
 Page* BufferManager::residentPtr(PID pid) {
    assert(pid < virtCount);
-   if (useTraditional) {
-      u64 frame;
-      if (hashMode == HashMode::Array) {
-         frame = pidToFrameArray[pid].load(std::memory_order_acquire);
-         assert(frame != invalidFrame);
-      } else {
-         bool ok = pidToFrameHash->tryGet(pid, frame);
-         assert(ok);
-      }
+   if (!useTraditional)
+      return virtMem + pid;
+   PageState& ps = getPageState(pid);
+   u64 stateAndVersion = ps.stateAndVersion.load(std::memory_order_acquire);
+   return residentPtr(pid, ps, stateAndVersion);
+}
+
+Page* BufferManager::residentPtr(PID pid, PageState& ps, u64 stateAndVersion) {
+   assert(pid < virtCount);
+   if (!useTraditional)
+      return virtMem + pid;
+
+   if (hashMode == HashMode::Array) {
+      u64 frame = pidToFrameArray[pid].load(std::memory_order_acquire);
+      assert(frame != invalidFrame);
       assert(frame < physCount);
       return frameMem + static_cast<size_t>(frame);
    }
-   return virtMem + pid;
+
+   if (hashMode == HashMode::Array1Access) {
+      u64 frame = PageState::extractFrame(stateAndVersion);
+      assert(frame != PageState::packedInvalidFrame);
+      assert(frame < physCount);
+      return frameMem + static_cast<size_t>(frame);
+   }
+
+   u64 frame;
+   bool ok = pidToFrameHash->tryGet(pid, frame);
+   assert(ok);
+   assert(frame < physCount);
+   return frameMem + static_cast<size_t>(frame);
 }
 
 Page* BufferManager::toPtr(PID pid) {
@@ -1108,6 +1203,9 @@ Page* BufferManager::acquireFrameForPid(PID pid) {
    if (hashMode == HashMode::Array) {
       pidToFrameArray[pid].store(static_cast<u64>(frame), std::memory_order_release);
       frameToPidArray[frame].store(pid, std::memory_order_release);
+   } else if (hashMode == HashMode::Array1Access) {
+      pageState[pid].setFrameValue(frame);
+      frameToPidArray[frame].store(pid, std::memory_order_release);
    } else {
       u64 frameId = static_cast<u64>(frame);
       pidToFrameHash->insertOrAssign(pid, frameId);
@@ -1119,22 +1217,27 @@ Page* BufferManager::acquireFrameForPid(PID pid) {
 void BufferManager::releaseFrame(PID pid) {
    if (!useTraditional)
       return;
-   u64 frame;
+   u64 frameId;
    if (hashMode == HashMode::Array) {
-      frame = pidToFrameArray[pid].exchange(invalidFrame, std::memory_order_acq_rel);
-      assert(frame != invalidFrame);
-      assert(frame < physCount);
-      frameToPidArray[static_cast<size_t>(frame)].store(invalidPID, std::memory_order_release);
+      frameId = pidToFrameArray[pid].exchange(invalidFrame, std::memory_order_acq_rel);
+      assert(frameId != invalidFrame);
+      frameToPidArray[static_cast<size_t>(frameId)].store(invalidPID, std::memory_order_release);
+   } else if (hashMode == HashMode::Array1Access) {
+      frameId = pageState[pid].getFrameValue();
+      assert(frameId != PageState::packedInvalidFrame);
+      pageState[pid].clearFrameValue();
+      frameToPidArray[static_cast<size_t>(frameId)].store(invalidPID, std::memory_order_release);
    } else {
-      bool ok = pidToFrameHash->erase(pid, frame);
+      bool ok = pidToFrameHash->erase(pid, frameId);
       assert(ok);
       PID ignored;
-      bool ok2 = frameToPidHash->erase(frame, ignored);
+      bool ok2 = frameToPidHash->erase(frameId, ignored);
       assert(ok2);
    }
 
-   u32 frameIdx = static_cast<u32>(frame);
-   u32 partition = partitionForFrame(frame);
+   assert(frameId < physCount);
+   u32 frameIdx = static_cast<u32>(frameId);
+   u32 partition = partitionForFrame(frameId);
    auto& part = freePartitions[partition];
    lockPartition(partition);
    assert(part.top < part.frames.size());
@@ -1318,8 +1421,10 @@ Page* BufferManager::fixX(PID pid) {
             break;
          }
          case PageState::Marked: case PageState::Unlocked: {
-            if (ps.tryLockX(stateAndVersion))
-               return residentPtr(pid);
+            if (ps.tryLockX(stateAndVersion)) {
+               u64 lockedState = PageState::sameVersion(stateAndVersion, PageState::Locked);
+               return residentPtr(pid, ps, stateAndVersion);
+            }
             break;
          }
       }
@@ -1342,8 +1447,12 @@ Page* BufferManager::fixS(PID pid) {
             break;
          }
          default: {
-            if (ps.tryLockS(stateAndVersion))
-               return residentPtr(pid);
+            if (ps.tryLockS(stateAndVersion)) {
+               u64 s = PageState::getState(stateAndVersion);
+               u64 nextState = (s < PageState::MaxShared) ? (s + 1) : 1;
+               u64 newState = PageState::sameVersion(stateAndVersion, nextState);
+               return residentPtr(pid, ps, newState);
+            }
          }
       }
       yield(repeatCounter);
@@ -2363,7 +2472,9 @@ int main(int argc, char** argv) {
    atomic<u64> txProgress(0);
    atomic<bool> keepRunning(true);
    const char* tradMode = "traditional-array";
-   if (bm.hashMode == BufferManager::HashMode::Unordered)
+   if (bm.hashMode == BufferManager::HashMode::Array1Access)
+      tradMode = "traditional-array1";
+   else if (bm.hashMode == BufferManager::HashMode::Unordered)
       tradMode = "traditional-hash-unordered";
    else if (bm.hashMode == BufferManager::HashMode::OpenAddress)
       tradMode = "traditional-hash-open";
