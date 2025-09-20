@@ -11,6 +11,11 @@
 #include <set>
 #include <thread>
 #include <vector>
+#include <limits>
+#include <memory>
+#include <unordered_map>
+#include <array>
+#include <shared_mutex>
 #include <span>
 
 #include <errno.h>
@@ -223,46 +228,80 @@ struct ResidentPageSet {
    }
 };
 
+template <typename K, typename V, size_t ShardCount = 64>
+class ShardedMap {
+   static_assert((ShardCount & (ShardCount - 1)) == 0, "ShardCount must be a power of two");
+
+   struct Shard {
+      std::unordered_map<K, V> map;
+      mutable std::shared_mutex mutex;
+   };
+
+   std::array<Shard, ShardCount> shards;
+
+   static constexpr size_t shardMask = ShardCount - 1;
+
+   static size_t shardFor(const K& key) {
+      return std::hash<K>{}(key) & shardMask;
+   }
+
+public:
+   void reserve(size_t entriesPerMap) {
+      size_t perShard = (entriesPerMap + ShardCount - 1) / ShardCount;
+      for (auto& shard : shards)
+         shard.map.reserve(perShard);
+   }
+
+   void insertOrAssign(const K& key, const V& value) {
+      auto& shard = shards[shardFor(key)];
+      std::unique_lock lock(shard.mutex);
+      shard.map[key] = value;
+   }
+
+   bool tryGet(const K& key, V& value) const {
+      auto& shard = shards[shardFor(key)];
+      std::shared_lock lock(shard.mutex);
+      auto it = shard.map.find(key);
+      if (it == shard.map.end())
+         return false;
+      value = it->second;
+      return true;
+   }
+
+   bool erase(const K& key, V& value) {
+      auto& shard = shards[shardFor(key)];
+      std::unique_lock lock(shard.mutex);
+      auto it = shard.map.find(key);
+      if (it == shard.map.end())
+         return false;
+      value = it->second;
+      shard.map.erase(it);
+      return true;
+   }
+
+   bool erase(const K& key) {
+      auto& shard = shards[shardFor(key)];
+      std::unique_lock lock(shard.mutex);
+      return shard.map.erase(key) > 0;
+   }
+};
+
+struct BufferManager;
+
 // libaio interface used to write batches of pages
 struct LibaioInterface {
    static const u64 maxIOs = 256;
 
    int blockfd;
-   Page* virtMem;
+   BufferManager* bm;
    io_context_t ctx;
    iocb cb[maxIOs];
    iocb* cbPtr[maxIOs];
    io_event events[maxIOs];
 
-   LibaioInterface(int blockfd, Page* virtMem) : blockfd(blockfd), virtMem(virtMem) {
-      memset(&ctx, 0, sizeof(io_context_t));
-      int ret = io_setup(maxIOs, &ctx);
-      if (ret != 0) {
-         std::cerr << "libaio io_setup error: " << ret << " ";
-         switch (-ret) {
-            case EAGAIN: std::cerr << "EAGAIN"; break;
-            case EFAULT: std::cerr << "EFAULT"; break;
-            case EINVAL: std::cerr << "EINVAL"; break;
-            case ENOMEM: std::cerr << "ENOMEM"; break;
-            case ENOSYS: std::cerr << "ENOSYS"; break;
-         };
-         exit(EXIT_FAILURE);
-      }
-   }
+   LibaioInterface(int blockfd, BufferManager* bm);
 
-   void writePages(const vector<PID>& pages) {
-      assert(pages.size() < maxIOs);
-      for (u64 i=0; i<pages.size(); i++) {
-         PID pid = pages[i];
-         virtMem[pid].dirty = false;
-         cbPtr[i] = &cb[i];
-         io_prep_pwrite(cb+i, blockfd, &virtMem[pid], pageSize, pageSize*pid);
-      }
-      int cnt = io_submit(ctx, pages.size(), cbPtr);
-      assert(cnt == pages.size());
-      cnt = io_getevents(ctx, pages.size(), pages.size(), events, nullptr);
-      assert(cnt == pages.size());
-   }
+   void writePages(const vector<PID>& pages);
 };
 
 struct BufferManager {
@@ -275,9 +314,14 @@ struct BufferManager {
    struct exmap_user_interface* exmapInterface[maxWorkerThreads];
    vector<LibaioInterface> libaioInterface;
 
+   bool useTraditional;
+   bool useHashTranslation;
    bool useExmap;
    int blockfd;
    int exmapfd;
+
+   static constexpr u32 invalidFrame = std::numeric_limits<u32>::max();
+   static constexpr PID invalidPID = std::numeric_limits<PID>::max();
 
    atomic<u64> physUsedCount;
    ResidentPageSet residentSet;
@@ -287,7 +331,14 @@ struct BufferManager {
    atomic<u64> writeCount;
 
    Page* virtMem;
+   Page* frameMem;
    PageState* pageState;
+   std::unique_ptr<std::atomic<u32>[]> pidToFrameArray;
+   std::unique_ptr<std::atomic<PID>[]> frameToPidArray;
+   ShardedMap<PID, u32> pidToFrameMap;
+   ShardedMap<u32, PID> frameToPidMap;
+   std::vector<u32> freeFrames;
+   std::mutex freeFrameMutex;
    u64 batch;
 
    PageState& getPageState(PID pid) {
@@ -302,16 +353,53 @@ struct BufferManager {
    Page* fixS(PID pid);
    void unfixS(PID pid);
 
-   bool isValidPtr(void* page) { return (page >= virtMem) && (page < (virtMem + virtSize + 16)); }
-   PID toPID(void* page) { return reinterpret_cast<Page*>(page) - virtMem; }
-   Page* toPtr(PID pid) { return virtMem + pid; }
+   bool isValidPtr(void* page);
+   PID toPID(void* page);
+   Page* toPtr(PID pid);
+   Page* residentPtr(PID pid);
+   Page* preparePageForWrite(PID pid);
 
    void ensureFreePages();
    Page* allocPage();
-   void handleFault(PID pid);
-   void readPage(PID pid);
+   Page* handleFault(PID pid);
+   void readPage(PID pid, Page* dest);
    void evict();
+
+   Page* acquireFrameForPid(PID pid);
+   void releaseFrame(PID pid);
+   u32 popFreeFrame();
 };
+
+
+LibaioInterface::LibaioInterface(int blockfd, BufferManager* bm) : blockfd(blockfd), bm(bm) {
+   memset(&ctx, 0, sizeof(io_context_t));
+   int ret = io_setup(maxIOs, &ctx);
+   if (ret != 0) {
+      std::cerr << "libaio io_setup error: " << ret << " ";
+      switch (-ret) {
+         case EAGAIN: std::cerr << "EAGAIN"; break;
+         case EFAULT: std::cerr << "EFAULT"; break;
+         case EINVAL: std::cerr << "EINVAL"; break;
+         case ENOMEM: std::cerr << "ENOMEM"; break;
+         case ENOSYS: std::cerr << "ENOSYS"; break;
+      };
+      exit(EXIT_FAILURE);
+   }
+}
+
+void LibaioInterface::writePages(const vector<PID>& pages) {
+   assert(pages.size() < maxIOs);
+   for (u64 i=0; i<pages.size(); i++) {
+      PID pid = pages[i];
+      Page* page = bm->preparePageForWrite(pid);
+      cbPtr[i] = &cb[i];
+      io_prep_pwrite(cb+i, blockfd, page, pageSize, pageSize*pid);
+   }
+   int cnt = io_submit(ctx, pages.size(), cbPtr);
+   assert(cnt == pages.size());
+   cnt = io_getevents(ctx, pages.size(), pages.size(), events, nullptr);
+   assert(cnt == pages.size());
+}
 
 
 BufferManager bm;
@@ -326,7 +414,7 @@ struct GuardO {
    static const u64 moved = ~0ull;
 
    // constructor
-   explicit GuardO(u64 pid) : pid(pid), ptr(reinterpret_cast<T*>(bm.toPtr(pid))) {
+   explicit GuardO(u64 pid) : pid(pid), ptr(nullptr) {
       init();
    }
 
@@ -334,7 +422,7 @@ struct GuardO {
    GuardO(u64 pid, GuardO<T2>& parent)  {
       parent.checkVersionAndRestart();
       this->pid = pid;
-      ptr = reinterpret_cast<T*>(bm.toPtr(pid));
+      ptr = nullptr;
       init();
    }
 
@@ -353,6 +441,7 @@ struct GuardO {
             case PageState::Marked: {
                u64 newV = PageState::sameVersion(v, PageState::Unlocked);
                if (ps.stateAndVersion.compare_exchange_weak(v, newV)) {
+                  ptr = reinterpret_cast<T*>(bm.residentPtr(pid));
                   version = newV;
                   return;
                }
@@ -362,11 +451,12 @@ struct GuardO {
                break;
             case PageState::Evicted:
                if (ps.tryLockX(v)) {
-                  bm.handleFault(pid);
+                  ptr = reinterpret_cast<T*>(bm.handleFault(pid));
                   bm.unfixX(pid);
                }
                break;
             default:
+               ptr = reinterpret_cast<T*>(bm.residentPtr(pid));
                version = v;
                return;
          }
@@ -586,50 +676,84 @@ u64 envOr(const char* env, u64 value) {
    return value;
 }
 
-BufferManager::BufferManager() : virtSize(envOr("VIRTGB", 16)*gb), physSize(envOr("PHYSGB", 4)*gb), virtCount(virtSize / pageSize), physCount(physSize / pageSize), residentSet(physCount) {
-   assert(virtSize>=physSize);
+BufferManager::BufferManager()
+   : virtSize(envOr("VIRTGB", 16) * gb),
+     physSize(envOr("PHYSGB", 4) * gb),
+     virtCount(virtSize / pageSize),
+     physCount(physSize / pageSize),
+     residentSet(physCount) {
+   assert(virtSize >= physSize);
    const char* path = getenv("BLOCK") ? getenv("BLOCK") : "/tmp/bm";
    blockfd = open(path, O_RDWR | O_DIRECT, S_IRWXU);
    if (blockfd == -1) {
       cerr << "cannot open BLOCK device '" << path << "'" << endl;
       exit(EXIT_FAILURE);
    }
-   u64 virtAllocSize = virtSize + (1<<16); // we allocate 64KB extra to prevent segfaults during optimistic reads
 
-   useExmap = envOr("EXMAP", 0);
-   if (useExmap) {
-      exmapfd = open("/dev/exmap", O_RDWR);
-      if (exmapfd < 0) die("open exmap");
+   useTraditional = envOr("TRADITIONAL", 0);
+   useHashTranslation = useTraditional && envOr("TRADHASH", 0);
+   useExmap = (!useTraditional) && envOr("EXMAP", 0);
+   virtMem = nullptr;
+   frameMem = nullptr;
 
-      struct exmap_ioctl_setup buffer;
-      buffer.fd             = blockfd;
-      buffer.max_interfaces = maxWorkerThreads;
-      buffer.buffer_size    = physCount;
-      buffer.flags          = 0;
-      if (ioctl(exmapfd, EXMAP_IOCTL_SETUP, &buffer) < 0)
-         die("ioctl: exmap_setup");
+   u64 virtAllocSize = virtSize + (1 << 16); // guard space for optimistic reads
 
-      for (unsigned i=0; i<maxWorkerThreads; i++) {
-         exmapInterface[i] = (struct exmap_user_interface *) mmap(NULL, pageSize, PROT_READ|PROT_WRITE, MAP_SHARED, exmapfd, EXMAP_OFF_INTERFACE(i));
-         if (exmapInterface[i] == MAP_FAILED)
-            die("setup exmapInterface");
+   if (useTraditional) {
+      frameMem = static_cast<Page*>(allocHuge(physCount * sizeof(Page)));
+      if (frameMem == MAP_FAILED)
+         die("allocHuge frameMem");
+      freeFrames.reserve(physCount);
+      for (u64 i = 0; i < physCount; i++)
+         freeFrames.push_back(static_cast<u32>(physCount - 1 - i));
+      if (useHashTranslation) {
+         pidToFrameMap.reserve(virtCount);
+         frameToPidMap.reserve(physCount);
+      } else {
+         pidToFrameArray.reset(new std::atomic<u32>[virtCount]);
+         frameToPidArray.reset(new std::atomic<PID>[physCount]);
+         for (u64 i = 0; i < virtCount; i++)
+            pidToFrameArray[i].store(invalidFrame, std::memory_order_relaxed);
+         for (u64 i = 0; i < physCount; i++)
+            frameToPidArray[i].store(invalidPID, std::memory_order_relaxed);
       }
-
-      virtMem = (Page*)mmap(NULL, virtAllocSize, PROT_READ|PROT_WRITE, MAP_SHARED, exmapfd, 0);
+      // shuffle free frames
+      std::random_shuffle(freeFrames.begin(), freeFrames.end());
    } else {
-      virtMem = (Page*)mmap(NULL, virtAllocSize, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
-      madvise(virtMem, virtAllocSize, MADV_NOHUGEPAGE);
+      if (useExmap) {
+         exmapfd = open("/dev/exmap", O_RDWR);
+         if (exmapfd < 0)
+            die("open exmap");
+
+         struct exmap_ioctl_setup buffer;
+         buffer.fd             = blockfd;
+         buffer.max_interfaces = maxWorkerThreads;
+         buffer.buffer_size    = physCount;
+         buffer.flags          = 0;
+         if (ioctl(exmapfd, EXMAP_IOCTL_SETUP, &buffer) < 0)
+            die("ioctl: exmap_setup");
+
+         for (unsigned i = 0; i < maxWorkerThreads; i++) {
+            exmapInterface[i] = (struct exmap_user_interface*) mmap(NULL, pageSize, PROT_READ | PROT_WRITE, MAP_SHARED, exmapfd, EXMAP_OFF_INTERFACE(i));
+            if (exmapInterface[i] == MAP_FAILED)
+               die("setup exmapInterface");
+         }
+
+         virtMem = (Page*) mmap(NULL, virtAllocSize, PROT_READ | PROT_WRITE, MAP_SHARED, exmapfd, 0);
+      } else {
+         virtMem = (Page*) mmap(NULL, virtAllocSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+         madvise(virtMem, virtAllocSize, MADV_NOHUGEPAGE);
+      }
+      if (virtMem == MAP_FAILED)
+         die("mmap failed");
    }
 
-   pageState = (PageState*)allocHuge(virtCount * sizeof(PageState));
-   for (u64 i=0; i<virtCount; i++)
+   pageState = (PageState*) allocHuge(virtCount * sizeof(PageState));
+   for (u64 i = 0; i < virtCount; i++)
       pageState[i].init();
-   if (virtMem == MAP_FAILED)
-      die("mmap failed");
 
    libaioInterface.reserve(maxWorkerThreads);
-   for (unsigned i=0; i<maxWorkerThreads; i++)
-      libaioInterface.emplace_back(LibaioInterface(blockfd, virtMem));
+   for (unsigned i = 0; i < maxWorkerThreads; i++)
+      libaioInterface.emplace_back(LibaioInterface(blockfd, this));
 
    physUsedCount = 0;
    allocCount = 1; // pid 0 reserved for meta data
@@ -637,7 +761,107 @@ BufferManager::BufferManager() : virtSize(envOr("VIRTGB", 16)*gb), physSize(envO
    writeCount = 0;
    batch = envOr("BATCH", 64);
 
-   cerr << "vmcache " << "blk:" << path << " virtgb:" << virtSize/gb << " physgb:" << physSize/gb << " exmap:" << useExmap << endl;
+   cerr << "vmcache "
+        << "blk:" << path
+        << " virtgb:" << virtSize / gb
+        << " physgb:" << physSize / gb
+        << " traditional:" << useTraditional
+        << " trad_hash:" << useHashTranslation
+        << " exmap:" << useExmap
+        << endl;
+}
+
+bool BufferManager::isValidPtr(void* page) {
+   if (useTraditional)
+      return (page >= frameMem) && (page < (frameMem + physCount));
+   if (!virtMem)
+      return false;
+   return (page >= virtMem) && (page < (virtMem + virtCount + 16));
+}
+
+PID BufferManager::toPID(void* page) {
+   Page* ptr = reinterpret_cast<Page*>(page);
+   if (useTraditional) {
+      auto idx = ptr - frameMem;
+      assert(idx >= 0 && static_cast<u64>(idx) < physCount);
+      if (useHashTranslation) {
+         PID pid;
+         bool ok = frameToPidMap.tryGet(static_cast<u32>(idx), pid);
+         assert(ok);
+         return pid;
+      } else {
+         PID pid = frameToPidArray[static_cast<u32>(idx)].load(std::memory_order_acquire);
+         assert(pid != invalidPID);
+         return pid;
+      }
+   }
+   return ptr - virtMem;
+}
+
+Page* BufferManager::residentPtr(PID pid) {
+   assert(pid < virtCount);
+   if (useTraditional) {
+      u32 frame;
+      if (useHashTranslation) {
+         bool ok = pidToFrameMap.tryGet(pid, frame);
+         assert(ok);
+      } else {
+         frame = pidToFrameArray[pid].load(std::memory_order_acquire);
+         assert(frame != invalidFrame);
+      }
+      return frameMem + frame;
+   }
+   return virtMem + pid;
+}
+
+Page* BufferManager::toPtr(PID pid) {
+   return residentPtr(pid);
+}
+
+Page* BufferManager::preparePageForWrite(PID pid) {
+   Page* page = residentPtr(pid);
+   page->dirty = false;
+   return page;
+}
+
+u32 BufferManager::popFreeFrame() {
+   std::lock_guard<std::mutex> lock(freeFrameMutex);
+   assert(!freeFrames.empty());
+   u32 frame = freeFrames.back();
+   freeFrames.pop_back();
+   return frame;
+}
+
+Page* BufferManager::acquireFrameForPid(PID pid) {
+   if (!useTraditional)
+      return virtMem + pid;
+   u32 frame = popFreeFrame();
+   if (useHashTranslation) {
+      pidToFrameMap.insertOrAssign(pid, frame);
+      frameToPidMap.insertOrAssign(frame, pid);
+   } else {
+      pidToFrameArray[pid].store(frame, std::memory_order_release);
+      frameToPidArray[frame].store(pid, std::memory_order_release);
+   }
+   return frameMem + frame;
+}
+
+void BufferManager::releaseFrame(PID pid) {
+   if (!useTraditional)
+      return;
+   u32 frame;
+   if (useHashTranslation) {
+      bool ok = pidToFrameMap.erase(pid, frame);
+      assert(ok);
+      bool ok2 = frameToPidMap.erase(frame);
+      assert(ok2);
+   } else {
+      frame = pidToFrameArray[pid].exchange(invalidFrame, std::memory_order_acq_rel);
+      assert(frame != invalidFrame);
+      frameToPidArray[frame].store(invalidPID, std::memory_order_release);
+   }
+   std::lock_guard<std::mutex> lock(freeFrameMutex);
+   freeFrames.push_back(frame);
 }
 
 void BufferManager::ensureFreePages() {
@@ -657,7 +881,7 @@ Page* BufferManager::allocPage() {
    u64 stateAndVersion = getPageState(pid).stateAndVersion;
    bool succ = getPageState(pid).tryLockX(stateAndVersion);
    assert(succ);
-   residentSet.insert(pid);
+   Page* page = acquireFrameForPid(pid);
 
    if (useExmap) {
       exmapInterface[workerThreadId]->iov[0].page = pid;
@@ -667,16 +891,20 @@ Page* BufferManager::allocPage() {
          ensureFreePages();
       }
    }
-   virtMem[pid].dirty = true;
 
-   return virtMem + pid;
+   residentSet.insert(pid);
+   page->dirty = true;
+
+   return page;
 }
 
-void BufferManager::handleFault(PID pid) {
+Page* BufferManager::handleFault(PID pid) {
    physUsedCount++;
    ensureFreePages();
-   readPage(pid);
+   Page* page = acquireFrameForPid(pid);
+   readPage(pid, page);
    residentSet.insert(pid);
+   return page;
 }
 
 Page* BufferManager::fixX(PID pid) {
@@ -686,14 +914,14 @@ Page* BufferManager::fixX(PID pid) {
       switch (PageState::getState(stateAndVersion)) {
          case PageState::Evicted: {
             if (ps.tryLockX(stateAndVersion)) {
-               handleFault(pid);
-               return virtMem + pid;
+               Page* page = handleFault(pid);
+               return page;
             }
             break;
          }
          case PageState::Marked: case PageState::Unlocked: {
             if (ps.tryLockX(stateAndVersion))
-               return virtMem + pid;
+               return residentPtr(pid);
             break;
          }
       }
@@ -717,7 +945,7 @@ Page* BufferManager::fixS(PID pid) {
          }
          default: {
             if (ps.tryLockS(stateAndVersion))
-               return virtMem + pid;
+               return residentPtr(pid);
          }
       }
       yield(repeatCounter);
@@ -732,12 +960,13 @@ void BufferManager::unfixX(PID pid) {
    getPageState(pid).unlockX();
 }
 
-void BufferManager::readPage(PID pid) {
+void BufferManager::readPage(PID pid, Page* dest) {
    if (useExmap) {
       for (u64 repeatCounter=0; ; repeatCounter++) {
-         int ret = pread(exmapfd, virtMem+pid, pageSize, workerThreadId);
+         int ret = pread(exmapfd, dest, pageSize, workerThreadId);
          if (ret == pageSize) {
             assert(ret == pageSize);
+            dest->dirty = false;
             readCount++;
             return;
          }
@@ -745,8 +974,9 @@ void BufferManager::readPage(PID pid) {
          ensureFreePages();
       }
    } else {
-      int ret = pread(blockfd, virtMem+pid, pageSize, pid*pageSize);
+      int ret = pread(blockfd, dest, pageSize, pid*pageSize);
       assert(ret==pageSize);
+      dest->dirty = false;
       readCount++;
    }
 }
@@ -764,7 +994,7 @@ void BufferManager::evict() {
          u64 v = ps.stateAndVersion;
          switch (PageState::getState(v)) {
             case PageState::Marked:
-               if (virtMem[pid].dirty) {
+               if (residentPtr(pid)->dirty) {
                   if (ps.tryLockS(v))
                      toWrite.push_back(pid);
                } else {
@@ -809,13 +1039,15 @@ void BufferManager::evict() {
       }
       if (exmapAction(exmapfd, EXMAP_OP_FREE, toEvict.size()) < 0)
          die("ioctl: EXMAP_OP_FREE");
-   } else {
+   } else if (!useTraditional) {
       for (u64& pid : toEvict)
          madvise(virtMem + pid, pageSize, MADV_DONTNEED);
    }
 
    // 5. remove from hash table and unlock
    for (u64& pid : toEvict) {
+      if (useTraditional)
+         releaseFrame(pid);
       bool succ = residentSet.remove(pid);
       assert(succ);
       getPageState(pid).unlockXEvicted();
@@ -1723,7 +1955,9 @@ int main(int argc, char** argv) {
    u64 statDiff = 1e8;
    atomic<u64> txProgress(0);
    atomic<bool> keepRunning(true);
-   auto systemName = bm.useExmap ? "exmap" : "vmcache";
+   const char* systemName = bm.useTraditional
+      ? (bm.useHashTranslation ? "traditional-hash" : "traditional-array")
+      : (bm.useExmap ? "exmap" : "vmcache");
 
    auto statFn = [&]() {
       cout << "ts,tx,rmb,wmb,system,threads,datasize,workload,batch" << endl;

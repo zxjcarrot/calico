@@ -14,10 +14,20 @@ Code repository for SIGMOD'23 paper [Virtual-Memory Assisted Buffer Management](
 * THREADS: number of threads; default=1
 * DATASIZE: number of warehouses for TPC-C, number of tuples for random read benchmark; default=10
 
+## More buffer pool knobs
+
+* `TRADITIONAL=1` turns on the in-process buffer pool instead of the default vmcache/exmap fault-driven path. Pages are tracked with the lock-free frame array.
+* `TRADHASH=1` (only relevant together with `TRADITIONAL=1`) switches the translation layer to the sharded hash-table implementation, which uses per-shard read/write locks to stay concurrency-friendly under heavier load.
+* Leave both variables unset to keep the original vmcache behaviour (`TRADITIONAL=0`, `EXMAP=0`), or combine `EXMAP=1` with `TRADITIONAL=0` to exercise the kernel-assisted variant.
+
+vmcache mmap: `TRADITIONAL=0 TRADHASH=0 RNDREAD=1 BLOCK=/mnt/data/vmcache/heapfile THREADS=1 DATASIZE=2e7 ./vmcache`
+vmcache array: `TRADITIONAL=1 TRADHASH=0 RNDREAD=1 BLOCK=/mnt/data/vmcache/heapfile THREADS=1 DATASIZE=2e7 ./vmcache`
+vmcache hash: `TRADITIONAL=1 TRADHASH=1 RNDREAD=1 BLOCK=/mnt/data/vmcache/heapfile THREADS=1 DATASIZE=2e7 ./vmcache`
+
 ## Example Command Lines
 
 * TPC-C, 4 threads, 2 warehouses: `BLOCK=/dev/nvme0n1 THREADS=4 DATASIZE=2 ./vmcache`
-* random read, 10 threads, 1 million tuples: `BLOCK=/dev/md0 THREADS=10 DATASIZE=1e6 ./vmcache`
+* random read, 10 threads, 1 million tuples: `RNDREAD=1 BLOCK=/dev/md0 THREADS=10 DATASIZE=1e6 ./vmcache`
 
 ## Dependencies and Configuration
 
