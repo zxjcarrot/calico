@@ -21,7 +21,9 @@ Code repository for SIGMOD'23 paper [Virtual-Memory Assisted Buffer Management](
 * Leave both variables unset to keep the original vmcache behaviour (`TRADITIONAL=0`, `EXMAP=0`), or combine `EXMAP=1` with `TRADITIONAL=0` to exercise the kernel-assisted variant.
 
 vmcache mmap: `TRADITIONAL=0 TRADHASH=0 RNDREAD=1 BLOCK=/mnt/data/vmcache/heapfile THREADS=1 DATASIZE=2e7 ./vmcache`
+
 vmcache array: `TRADITIONAL=1 TRADHASH=0 RNDREAD=1 BLOCK=/mnt/data/vmcache/heapfile THREADS=1 DATASIZE=2e7 ./vmcache`
+
 vmcache hash: `TRADITIONAL=1 TRADHASH=1 RNDREAD=1 BLOCK=/mnt/data/vmcache/heapfile THREADS=1 DATASIZE=2e7 ./vmcache`
 
 ## Example Command Lines
