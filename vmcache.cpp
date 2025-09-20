@@ -17,7 +17,13 @@
 #include <unordered_map>
 #include <array>
 #include <shared_mutex>
+#include <unordered_set>
+#include <queue>
+#include <random>
+#include <chrono>
+#include <cmath>
 #include <span>
+#include <cstddef>
 
 #include <errno.h>
 #include <libaio.h>
@@ -47,6 +53,18 @@ static const u64 pageSize = 4096;
 
 struct alignas(4096) Page {
    bool dirty;
+};
+
+struct GraphNodePage {
+   u32 neighborCount;
+    u32 padding;
+   u64 value;
+   PID neighbors[1];
+
+   static constexpr size_t headerSize() { return offsetof(GraphNodePage, neighbors); }
+   static constexpr u32 maxNeighbors() { return static_cast<u32>((pageSize - headerSize()) / sizeof(PID)); }
+   PID* neighborData() { return neighbors; }
+   const PID* neighborData() const { return neighbors; }
 };
 
 static const int16_t maxWorkerThreads = 128;
@@ -928,9 +946,8 @@ BufferManager::BufferManager()
       }
       if (hashMode == HashMode::Array) {
          pidToFrameArray.reset(new std::atomic<u64>[virtCount]);
-         // use huge page for pidToFrameArray if possible
-         if (virtCount * sizeof(std::atomic<u64>) >= 2 * mb)
-            madvise(pidToFrameArray.get(), virtCount * sizeof(std::atomic<u64>), MADV_HUGEPAGE);
+         // if (virtCount * sizeof(std::atomic<u64>) >= 2 * mb)
+         //    madvise(pidToFrameArray.get(), virtCount * sizeof(std::atomic<u64>), MADV_HUGEPAGE);
          frameToPidArray.reset(new std::atomic<PID>[physCount]);
          for (u64 i = 0; i < virtCount; i++)
             pidToFrameArray[i].store(invalidFrame, std::memory_order_relaxed);
@@ -1127,6 +1144,110 @@ void BufferManager::lockPartition(u32 partition) {
 
 void BufferManager::unlockPartition(u32 partition) {
    freePartitions[partition].lock.clear(std::memory_order_release);
+}
+
+static void runGraphBenchmark(u64 nodeCount, u64 startIndex) {
+   if (nodeCount == 0) {
+      std::cout << "graph_bfs nodes=0" << std::endl;
+      return;
+   }
+
+   u32 desiredNeighbors = static_cast<u32>(std::log(static_cast<double>(std::max<u64>(2, nodeCount))) / std::log(2.0));
+   desiredNeighbors = std::max<u32>(1, desiredNeighbors);
+   u32 maxNeighbors = GraphNodePage::maxNeighbors();
+   desiredNeighbors = std::min(desiredNeighbors, maxNeighbors);
+
+   std::vector<PID> nodePids;
+   nodePids.reserve(nodeCount);
+
+   std::mt19937_64 rng(42);
+   std::uniform_int_distribution<u64> distNode(0, nodeCount - 1);
+   std::uniform_int_distribution<u64> valueDist(1, 1000);
+
+   for (u64 i = 0; i < nodeCount; i++) {
+      auto* page = reinterpret_cast<GraphNodePage*>(bm.allocPage());
+      PID pid = bm.toPID(page);
+      page->neighborCount = 0;
+      page->padding = 0;
+      page->value = valueDist(rng);
+      nodePids.push_back(pid);
+      bm.unfixX(pid);
+   }
+
+
+   for (u64 i = 0; i < nodeCount; i++) {
+      GraphNodePage* node = reinterpret_cast<GraphNodePage*>(bm.fixX(nodePids[i]));
+      node->neighborCount = desiredNeighbors;
+      PID* neighbors = node->neighborData();
+      for (u32 j = 0; j < desiredNeighbors; j++)
+         neighbors[j] = nodePids[distNode(rng)];
+      bm.unfixX(nodePids[i]);
+   }
+
+
+   cerr << "space: " << (bm.allocCount.load()*pageSize)/(float)bm.gb << " GB " << endl;
+   PID basePid = nodePids.front();
+   PID maxPid = nodePids.back();
+
+   std::vector<uint8_t> visited(nodeCount, 0);
+   u64 clampedStart = std::min<u64>(startIndex, nodeCount - 1);
+   PID startPid = nodePids[clampedStart];
+   visited[clampedStart] = 1;
+
+   u64 totalValue = 0;
+   {
+      GuardS<GraphNodePage> startNode(startPid);
+      totalValue += startNode->value;
+   }
+
+   std::queue<PID> frontier;
+   frontier.push(startPid);
+
+   auto begin = std::chrono::steady_clock::now();
+   u64 visitCount = 0;
+
+   while (!frontier.empty()) {
+      PID current = frontier.front();
+      frontier.pop();
+      visitCount++;
+
+      GuardS<GraphNodePage> node(current);
+      GraphNodePage* page = node.ptr;
+      const PID* neighbors = page->neighborData();
+      for (u32 i = 0; i < page->neighborCount; i++) {
+         PID neighborPid = neighbors[i];
+         // if (neighborPid < basePid || neighborPid > maxPid)
+         //    continue;
+         u64 idx64 = neighborPid - basePid;
+         // if (idx64 >= nodeCount)
+         //    continue;
+         u32 idx = static_cast<u32>(idx64);
+         // if (!visited[idx]) {
+         //    visited[idx] = 1;
+            {
+               GuardS<GraphNodePage> neighborNode(neighborPid);
+               // compute something
+               totalValue += neighborNode->value;
+               if (!visited[idx]) {
+                  visited[idx] = 1;
+                  frontier.push(neighborPid);      
+               }
+            }
+            
+         // }
+      }
+   }
+
+   auto end = std::chrono::steady_clock::now();
+   auto durationMs = std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count();
+
+   std::cout << "graph_bfs nodes=" << nodeCount
+             << " neighbors_per_node=" << desiredNeighbors
+             << " visited=" << visitCount
+             << " value_sum=" << totalValue
+             << " time_ms=" << durationMs
+             << std::endl;
+   sleep(20);
 }
 
 void BufferManager::ensureFreePages() {
@@ -2217,6 +2338,14 @@ int main(int argc, char** argv) {
    u64 runForSec = envOr("RUNFOR", 30);
    bool isRndread = envOr("RNDREAD", 0);
 
+
+
+   if (envOr("GRAPH", 0)) {
+      u64 nodeCount = n;
+      u64 startIndex = envOr("GRAPHSTART", 0);
+      runGraphBenchmark(nodeCount, startIndex);
+      return 0;
+   }
    u64 statDiff = 1e8;
    atomic<u64> txProgress(0);
    atomic<bool> keepRunning(true);

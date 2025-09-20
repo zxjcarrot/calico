@@ -29,6 +29,11 @@ vmcache hash (unordered): `TRADITIONAL=1 TRADHASH=1 RNDREAD=1 BLOCK=/mnt/data/vm
 
 vmcache hash (open addressing): `TRADITIONAL=1 TRADHASH=2 RNDREAD=1 BLOCK=/mnt/data/vmcache/heapfile THREADS=1 DATASIZE=2e7 ./vmcache`
 
+Graph BFS benchmark: `GRAPH=1 GRAPHN=10000 GRAPHSTART=0 ./vmcache`
+
+* `GRAPHN` controls the number of nodes/pages in the graph (default 1024).
+* `GRAPHSTART` selects the starting node index for the breadth-first search (default 0).
+
 ## Example Command Lines
 
 * TPC-C, 4 threads, 2 warehouses: `BLOCK=/dev/nvme0n1 THREADS=4 DATASIZE=2 ./vmcache`
