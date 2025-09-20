@@ -3,6 +3,7 @@
 #include <cassert>
 #include <csignal>
 #include <exception>
+#include <stdexcept>
 #include <fcntl.h>
 #include <functional>
 #include <iostream>
@@ -304,6 +305,12 @@ struct LibaioInterface {
    void writePages(const vector<PID>& pages);
 };
 
+struct FreePartition {
+   std::atomic_flag lock = ATOMIC_FLAG_INIT;
+   std::vector<u32> frames;
+   u32 top = 0;
+};
+
 struct BufferManager {
    static const u64 mb = 1024ull * 1024;
    static const u64 gb = 1024ull * 1024 * 1024;
@@ -322,6 +329,7 @@ struct BufferManager {
 
    static constexpr u32 invalidFrame = std::numeric_limits<u32>::max();
    static constexpr PID invalidPID = std::numeric_limits<PID>::max();
+   static constexpr u32 freePartitionCount = 64;
 
    atomic<u64> physUsedCount;
    ResidentPageSet residentSet;
@@ -337,8 +345,8 @@ struct BufferManager {
    std::unique_ptr<std::atomic<PID>[]> frameToPidArray;
    ShardedMap<PID, u32> pidToFrameMap;
    ShardedMap<u32, PID> frameToPidMap;
-   std::vector<u32> freeFrames;
-   std::mutex freeFrameMutex;
+   std::array<FreePartition, freePartitionCount> freePartitions;
+   u32 partitionFrameSpan;
    u64 batch;
 
    PageState& getPageState(PID pid) {
@@ -368,6 +376,10 @@ struct BufferManager {
    Page* acquireFrameForPid(PID pid);
    void releaseFrame(PID pid);
    u32 popFreeFrame();
+
+   u32 partitionForFrame(u32 frame) const;
+   void lockPartition(u32 partition);
+   void unlockPartition(u32 partition);
 };
 
 
@@ -702,9 +714,22 @@ BufferManager::BufferManager()
       frameMem = static_cast<Page*>(allocHuge(physCount * sizeof(Page)));
       if (frameMem == MAP_FAILED)
          die("allocHuge frameMem");
-      freeFrames.reserve(physCount);
-      for (u64 i = 0; i < physCount; i++)
-         freeFrames.push_back(static_cast<u32>(physCount - 1 - i));
+      partitionFrameSpan = std::max<u32>(1, static_cast<u32>((physCount + freePartitionCount - 1) / freePartitionCount));
+      for (u32 i = 0; i < freePartitionCount; i++) {
+         auto& partition = freePartitions[i];
+         partition.lock.clear(std::memory_order_relaxed);
+         partition.frames.clear();
+         u32 start = i * partitionFrameSpan;
+         if (start >= physCount)
+            continue;
+         u32 end = std::min<u32>(start + partitionFrameSpan, physCount);
+         partition.frames.reserve(end - start);
+         for (u32 frame = start; frame < end; frame++)
+            partition.frames.push_back(frame);
+         if (!partition.frames.empty())
+            std::random_shuffle(partition.frames.begin(), partition.frames.end());
+         partition.top = partition.frames.size();
+      }
       if (useHashTranslation) {
          pidToFrameMap.reserve(virtCount);
          frameToPidMap.reserve(physCount);
@@ -716,8 +741,7 @@ BufferManager::BufferManager()
          for (u64 i = 0; i < physCount; i++)
             frameToPidArray[i].store(invalidPID, std::memory_order_relaxed);
       }
-      // shuffle free frames
-      std::random_shuffle(freeFrames.begin(), freeFrames.end());
+      // round robin cursors will skip empty partitions automatically
    } else {
       if (useExmap) {
          exmapfd = open("/dev/exmap", O_RDWR);
@@ -824,12 +848,25 @@ Page* BufferManager::preparePageForWrite(PID pid) {
    return page;
 }
 
+static thread_local u32 freePartitionCursor = 0;
+
 u32 BufferManager::popFreeFrame() {
-   std::lock_guard<std::mutex> lock(freeFrameMutex);
-   assert(!freeFrames.empty());
-   u32 frame = freeFrames.back();
-   freeFrames.pop_back();
-   return frame;
+   for (u32 attempt = 0; attempt < freePartitionCount; ++attempt) {
+      u32 partition = (freePartitionCursor + attempt) % freePartitionCount;
+      auto& part = freePartitions[partition];
+      if (part.frames.empty())
+         continue;
+
+      lockPartition(partition);
+      if (part.top > 0) {
+         u32 frame = part.frames[--part.top];
+         unlockPartition(partition);
+         freePartitionCursor = (partition + 1) % freePartitionCount;
+         return frame;
+      }
+      unlockPartition(partition);
+   }
+   throw std::runtime_error("no free frames available");
 }
 
 Page* BufferManager::acquireFrameForPid(PID pid) {
@@ -860,8 +897,29 @@ void BufferManager::releaseFrame(PID pid) {
       assert(frame != invalidFrame);
       frameToPidArray[frame].store(invalidPID, std::memory_order_release);
    }
-   std::lock_guard<std::mutex> lock(freeFrameMutex);
-   freeFrames.push_back(frame);
+
+   u32 partition = partitionForFrame(frame);
+   auto& part = freePartitions[partition];
+   lockPartition(partition);
+   assert(part.top < part.frames.size());
+   part.frames[part.top++] = frame;
+   unlockPartition(partition);
+}
+
+u32 BufferManager::partitionForFrame(u32 frame) const {
+   if (partitionFrameSpan == 0)
+      return 0;
+   u32 partition = frame / partitionFrameSpan;
+   return (partition >= freePartitionCount) ? (freePartitionCount - 1) : partition;
+}
+
+void BufferManager::lockPartition(u32 partition) {
+   while (freePartitions[partition].lock.test_and_set(std::memory_order_acquire))
+      _mm_pause();
+}
+
+void BufferManager::unlockPartition(u32 partition) {
+   freePartitions[partition].lock.clear(std::memory_order_release);
 }
 
 void BufferManager::ensureFreePages() {
