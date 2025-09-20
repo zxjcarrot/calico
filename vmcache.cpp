@@ -229,8 +229,18 @@ struct ResidentPageSet {
    }
 };
 
+template <typename K, typename V>
+class PartitionedMap {
+public:
+   virtual ~PartitionedMap() = default;
+   virtual void reserve(size_t entries) = 0;
+   virtual void insertOrAssign(const K& key, const V& value) = 0;
+   virtual bool tryGet(const K& key, V& value) const = 0;
+   virtual bool erase(const K& key, V& value) = 0;
+};
+
 template <typename K, typename V, size_t ShardCount = 64>
-class ShardedMap {
+class ShardedUnorderedMap : public PartitionedMap<K, V> {
    static_assert((ShardCount & (ShardCount - 1)) == 0, "ShardCount must be a power of two");
 
    struct Shard {
@@ -247,19 +257,19 @@ class ShardedMap {
    }
 
 public:
-   void reserve(size_t entriesPerMap) {
-      size_t perShard = (entriesPerMap + ShardCount - 1) / ShardCount;
+   void reserve(size_t entries) override {
+      size_t perShard = (entries + ShardCount - 1) / ShardCount;
       for (auto& shard : shards)
          shard.map.reserve(perShard);
    }
 
-   void insertOrAssign(const K& key, const V& value) {
+   void insertOrAssign(const K& key, const V& value) override {
       auto& shard = shards[shardFor(key)];
       std::unique_lock lock(shard.mutex);
       shard.map[key] = value;
    }
 
-   bool tryGet(const K& key, V& value) const {
+   bool tryGet(const K& key, V& value) const override {
       auto& shard = shards[shardFor(key)];
       std::shared_lock lock(shard.mutex);
       auto it = shard.map.find(key);
@@ -269,7 +279,7 @@ public:
       return true;
    }
 
-   bool erase(const K& key, V& value) {
+   bool erase(const K& key, V& value) override {
       auto& shard = shards[shardFor(key)];
       std::unique_lock lock(shard.mutex);
       auto it = shard.map.find(key);
@@ -279,11 +289,187 @@ public:
       shard.map.erase(it);
       return true;
    }
+};
 
-   bool erase(const K& key) {
+template <typename K, typename V>
+struct OAEntry {
+   enum class State : uint8_t { Empty, Occupied, Deleted };
+   K key{};
+   V value{};
+   State state = State::Empty;
+};
+
+template <typename K, typename V, size_t ShardCount = 64>
+class ShardedOpenAddressMap : public PartitionedMap<K, V> {
+   static_assert((ShardCount & (ShardCount - 1)) == 0, "ShardCount must be a power of two");
+
+   struct Shard {
+      mutable std::shared_mutex mutex;
+      std::vector<OAEntry<K, V>> table;
+      size_t size = 0;
+
+      static size_t nextPow2(size_t v) {
+         if (v < 8)
+            return 8;
+         v--;
+         v |= v >> 1;
+         v |= v >> 2;
+         v |= v >> 4;
+         v |= v >> 8;
+         v |= v >> 16;
+#if SIZE_MAX > UINT32_MAX
+         v |= v >> 32;
+#endif
+         return v + 1;
+      }
+
+      void ensureCapacity() {
+         if (table.empty())
+            rehash(8);
+         else if ((size + 1) * 10 > table.size() * 7)
+            rehash(table.size() * 2);
+      }
+
+      void rehash(size_t newCap) {
+         newCap = nextPow2(newCap);
+         std::vector<OAEntry<K, V>> newTable(newCap);
+         size_t oldSize = size;
+         size = 0;
+         for (auto& entry : table) {
+            if (entry.state == OAEntry<K, V>::State::Occupied)
+               insertInto(newTable, entry.key, entry.value);
+         }
+         table.swap(newTable);
+         size = oldSize;
+      }
+
+      static void insertInto(std::vector<OAEntry<K, V>>& tbl, const K& key, const V& value) {
+         size_t mask = tbl.size() - 1;
+         size_t idx = std::hash<K>{}(key) & mask;
+         size_t firstDeleted = tbl.size();
+         for (;;) {
+            auto& slot = tbl[idx];
+            if (slot.state == OAEntry<K, V>::State::Empty) {
+               size_t target = (firstDeleted != tbl.size()) ? firstDeleted : idx;
+               auto& dest = tbl[target];
+               dest.key = key;
+               dest.value = value;
+               dest.state = OAEntry<K, V>::State::Occupied;
+               return;
+            } else if (slot.state == OAEntry<K, V>::State::Deleted) {
+               if (firstDeleted == tbl.size())
+                  firstDeleted = idx;
+            } else if (slot.key == key) {
+               slot.value = value;
+               return;
+            }
+            idx = (idx + 1) & mask;
+         }
+      }
+
+      void insertOrAssign(const K& key, const V& value) {
+         ensureCapacity();
+         size_t mask = table.size() - 1;
+         size_t idx = std::hash<K>{}(key) & mask;
+         size_t firstDeleted = table.size();
+         for (;;) {
+            auto& slot = table[idx];
+            if (slot.state == OAEntry<K, V>::State::Empty) {
+               size_t target = (firstDeleted != table.size()) ? firstDeleted : idx;
+               auto& dest = table[target];
+               dest.key = key;
+               dest.value = value;
+               if (dest.state != OAEntry<K, V>::State::Occupied) {
+                  dest.state = OAEntry<K, V>::State::Occupied;
+                  size++;
+               }
+               return;
+            } else if (slot.state == OAEntry<K, V>::State::Deleted) {
+               if (firstDeleted == table.size())
+                  firstDeleted = idx;
+            } else if (slot.key == key) {
+               slot.value = value;
+               return;
+            }
+            idx = (idx + 1) & mask;
+            if (idx == (std::hash<K>{}(key) & mask)) {
+               rehash(table.size() * 2);
+               insertOrAssign(key, value);
+               return;
+            }
+         }
+      }
+
+      bool tryGet(const K& key, V& value) const {
+         if (table.empty())
+            return false;
+         size_t mask = table.size() - 1;
+         size_t idx = std::hash<K>{}(key) & mask;
+         for (;;) {
+            const auto& slot = table[idx];
+            if (slot.state == OAEntry<K, V>::State::Empty)
+               return false;
+            if (slot.state == OAEntry<K, V>::State::Occupied && slot.key == key) {
+               value = slot.value;
+               return true;
+            }
+            idx = (idx + 1) & mask;
+         }
+      }
+
+      bool erase(const K& key, V& value) {
+         if (table.empty())
+            return false;
+         size_t mask = table.size() - 1;
+         size_t idx = std::hash<K>{}(key) & mask;
+         for (;;) {
+            auto& slot = table[idx];
+            if (slot.state == OAEntry<K, V>::State::Empty)
+               return false;
+            if (slot.state == OAEntry<K, V>::State::Occupied && slot.key == key) {
+               value = slot.value;
+               slot.state = OAEntry<K, V>::State::Deleted;
+               size--;
+               return true;
+            }
+            idx = (idx + 1) & mask;
+         }
+      }
+   };
+
+   std::array<Shard, ShardCount> shards;
+
+   static constexpr size_t shardMask = ShardCount - 1;
+
+   static size_t shardFor(const K& key) {
+      return std::hash<K>{}(key) & shardMask;
+   }
+
+public:
+   void reserve(size_t entries) override {
+      size_t perShard = (entries + ShardCount - 1) / ShardCount;
+      for (auto& shard : shards) {
+         std::unique_lock lock(shard.mutex);
+         shard.rehash(Shard::nextPow2(perShard * 2));
+      }
+   }
+
+   void insertOrAssign(const K& key, const V& value) override {
       auto& shard = shards[shardFor(key)];
       std::unique_lock lock(shard.mutex);
-      return shard.map.erase(key) > 0;
+      shard.insertOrAssign(key, value);
+   }
+
+   bool tryGet(const K& key, V& value) const override {
+      auto& shard = shards[shardFor(key)];
+      std::shared_lock lock(shard.mutex);
+      return shard.tryGet(key, value);
+   }
+
+   bool erase(const K& key, V& value) override {
+      auto& shard = shards[shardFor(key)];
+      std::unique_lock lock(shard.mutex);
+      return shard.erase(key, value);
    }
 };
 
@@ -321,9 +507,11 @@ struct BufferManager {
    struct exmap_user_interface* exmapInterface[maxWorkerThreads];
    vector<LibaioInterface> libaioInterface;
 
+   enum class HashMode { Array = 0, Unordered = 1, OpenAddress = 2 };
+
    bool useTraditional;
-   bool useHashTranslation;
    bool useExmap;
+   HashMode hashMode;
    int blockfd;
    int exmapfd;
 
@@ -343,8 +531,8 @@ struct BufferManager {
    PageState* pageState;
    std::unique_ptr<std::atomic<u64>[]> pidToFrameArray;
    std::unique_ptr<std::atomic<PID>[]> frameToPidArray;
-   ShardedMap<PID, u32> pidToFrameMap;
-   ShardedMap<u32, PID> frameToPidMap;
+   std::unique_ptr<PartitionedMap<PID, u64>> pidToFrameHash;
+   std::unique_ptr<PartitionedMap<u64, PID>> frameToPidHash;
    std::array<FreePartition, freePartitionCount> freePartitions;
    u32 partitionFrameSpan;
    u64 batch;
@@ -703,8 +891,16 @@ BufferManager::BufferManager()
    }
 
    useTraditional = envOr("TRADITIONAL", 0);
-   useHashTranslation = useTraditional && envOr("TRADHASH", 0);
    useExmap = (!useTraditional) && envOr("EXMAP", 0);
+   u64 tradHashSetting = useTraditional ? envOr("TRADHASH", 0) : 0;
+   if (!useTraditional)
+      hashMode = HashMode::Array;
+   else if (tradHashSetting == 1)
+      hashMode = HashMode::Unordered;
+   else if (tradHashSetting == 2)
+      hashMode = HashMode::OpenAddress;
+   else
+      hashMode = HashMode::Array;
    virtMem = nullptr;
    frameMem = nullptr;
 
@@ -730,16 +926,26 @@ BufferManager::BufferManager()
             std::random_shuffle(partition.frames.begin(), partition.frames.end());
          partition.top = partition.frames.size();
       }
-      if (useHashTranslation) {
-         pidToFrameMap.reserve(virtCount);
-         frameToPidMap.reserve(physCount);
-      } else {
+      if (hashMode == HashMode::Array) {
          pidToFrameArray.reset(new std::atomic<u64>[virtCount]);
+         // use huge page for pidToFrameArray if possible
+         if (virtCount * sizeof(std::atomic<u64>) >= 2 * mb)
+            madvise(pidToFrameArray.get(), virtCount * sizeof(std::atomic<u64>), MADV_HUGEPAGE);
          frameToPidArray.reset(new std::atomic<PID>[physCount]);
          for (u64 i = 0; i < virtCount; i++)
             pidToFrameArray[i].store(invalidFrame, std::memory_order_relaxed);
          for (u64 i = 0; i < physCount; i++)
             frameToPidArray[i].store(invalidPID, std::memory_order_relaxed);
+      } else {
+         if (hashMode == HashMode::Unordered) {
+            pidToFrameHash = std::make_unique<ShardedUnorderedMap<PID, u64>>();
+            frameToPidHash = std::make_unique<ShardedUnorderedMap<u64, PID>>();
+         } else {
+            pidToFrameHash = std::make_unique<ShardedOpenAddressMap<PID, u64>>();
+            frameToPidHash = std::make_unique<ShardedOpenAddressMap<u64, PID>>();
+         }
+         pidToFrameHash->reserve(virtCount);
+         frameToPidHash->reserve(physCount);
       }
       // round robin cursors will skip empty partitions automatically
    } else {
@@ -790,7 +996,7 @@ BufferManager::BufferManager()
         << " virtgb:" << virtSize / gb
         << " physgb:" << physSize / gb
         << " traditional:" << useTraditional
-        << " trad_hash:" << useHashTranslation
+        << " trad_hash:" << static_cast<int>(hashMode)
         << " exmap:" << useExmap
         << endl;
 }
@@ -808,14 +1014,14 @@ PID BufferManager::toPID(void* page) {
    if (useTraditional) {
       auto idx = ptr - frameMem;
       assert(idx >= 0 && static_cast<u64>(idx) < physCount);
-      if (useHashTranslation) {
-         PID pid;
-         bool ok = frameToPidMap.tryGet(static_cast<u32>(idx), pid);
-         assert(ok);
-         return pid;
-      } else {
+      if (hashMode == HashMode::Array) {
          PID pid = frameToPidArray[static_cast<u32>(idx)].load(std::memory_order_acquire);
          assert(pid != invalidPID);
+         return pid;
+      } else {
+         PID pid;
+         bool ok = frameToPidHash->tryGet(static_cast<u32>(idx), pid);
+         assert(ok);
          return pid;
       }
    }
@@ -825,13 +1031,13 @@ PID BufferManager::toPID(void* page) {
 Page* BufferManager::residentPtr(PID pid) {
    assert(pid < virtCount);
    if (useTraditional) {
-      u32 frame;
-      if (useHashTranslation) {
-         bool ok = pidToFrameMap.tryGet(pid, frame);
-         assert(ok);
-      } else {
+      u64 frame;
+      if (hashMode == HashMode::Array) {
          frame = pidToFrameArray[pid].load(std::memory_order_acquire);
          assert(frame != invalidFrame);
+      } else {
+         bool ok = pidToFrameHash->tryGet(pid, frame);
+         assert(ok);
       }
       return frameMem + frame;
    }
@@ -873,12 +1079,12 @@ Page* BufferManager::acquireFrameForPid(PID pid) {
    if (!useTraditional)
       return virtMem + pid;
    u32 frame = popFreeFrame();
-   if (useHashTranslation) {
-      pidToFrameMap.insertOrAssign(pid, frame);
-      frameToPidMap.insertOrAssign(frame, pid);
-   } else {
+   if (hashMode == HashMode::Array) {
       pidToFrameArray[pid].store(frame, std::memory_order_release);
       frameToPidArray[frame].store(pid, std::memory_order_release);
+   } else {
+      pidToFrameHash->insertOrAssign(pid, frame);
+      frameToPidHash->insertOrAssign(frame, pid);
    }
    return frameMem + frame;
 }
@@ -886,16 +1092,17 @@ Page* BufferManager::acquireFrameForPid(PID pid) {
 void BufferManager::releaseFrame(PID pid) {
    if (!useTraditional)
       return;
-   u32 frame;
-   if (useHashTranslation) {
-      bool ok = pidToFrameMap.erase(pid, frame);
-      assert(ok);
-      bool ok2 = frameToPidMap.erase(frame);
-      assert(ok2);
-   } else {
+   u64 frame;
+   if (hashMode == HashMode::Array) {
       frame = pidToFrameArray[pid].exchange(invalidFrame, std::memory_order_acq_rel);
       assert(frame != invalidFrame);
       frameToPidArray[frame].store(invalidPID, std::memory_order_release);
+   } else {
+      bool ok = pidToFrameHash->erase(pid, frame);
+      assert(ok);
+      PID ignored;
+      bool ok2 = frameToPidHash->erase(frame, ignored);
+      assert(ok2);
    }
 
    u32 partition = partitionForFrame(frame);
@@ -2013,8 +2220,13 @@ int main(int argc, char** argv) {
    u64 statDiff = 1e8;
    atomic<u64> txProgress(0);
    atomic<bool> keepRunning(true);
+   const char* tradMode = "traditional-array";
+   if (bm.hashMode == BufferManager::HashMode::Unordered)
+      tradMode = "traditional-hash-unordered";
+   else if (bm.hashMode == BufferManager::HashMode::OpenAddress)
+      tradMode = "traditional-hash-open";
    const char* systemName = bm.useTraditional
-      ? (bm.useHashTranslation ? "traditional-hash" : "traditional-array")
+      ? tradMode
       : (bm.useExmap ? "exmap" : "vmcache");
 
    auto statFn = [&]() {
@@ -2039,8 +2251,14 @@ int main(int argc, char** argv) {
          parallel_for(0, n, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
             workerThreadId = worker;
             array<u8, 120> payload;
+            // std::vector<u64> keys;
+            // keys.reserve(end-begin);
+            // for (u64 i=begin; i<end; i++)
+            //    keys.push_back(i);
+            // std::random_shuffle(keys.begin(), keys.end());
             for (u64 i=begin; i<end; i++) {
                union { u64 v1; u8 k1[sizeof(u64)]; };
+               //v1 = __builtin_bswap64(keys[i-begin]);
                v1 = __builtin_bswap64(i);
                memcpy(payload.data(), k1, sizeof(u64));
                bt.insert({k1, sizeof(KeyType)}, payload);
