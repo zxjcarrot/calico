@@ -2579,7 +2579,7 @@ int main(int argc, char** argv) {
 
       statThread.join();
       if (enablePerf)
-         perf::Aggregator::instance().report(std::cout);
+         perf::Aggregator::instance().report(std::cout, txProgress.load());
       return 0;
    }
 
