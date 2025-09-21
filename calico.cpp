@@ -30,7 +30,7 @@
 #include <libaio.h>
 #include <sys/mman.h>
 
-#include "hash_tables.h"
+#include "hash_tables.hpp"
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/time.h>
