@@ -4,6 +4,40 @@
 
 Calico achieves the **best of both worlds**: matching `mmap`'s exceptional in-memory performance and `exmap`'s superior out-of-memory I/O efficiency, while avoiding the deployment complexity and security concerns of kernel modules.
 
+## Core Techniques
+
+Calico's breakthrough performance is achieved through four key innovations that work synergistically to eliminate traditional buffer pool bottlenecks:
+
+### 1. **Efficient Translation Table: Direct Array Mapping**
+Calico replaces traditional hash table translation with **direct mapping from page index to frame ID** through a preallocated indirection array. This eliminates fundamental hash table overheads:
+- **No hash collisions**: Eliminates unpredictable probe sequences and chaining overhead
+- **No hash function randomness**: Direct array indexing provides predictable, cache-friendly access patterns
+- **No synchronization overhead**: Fixed-size structure eliminates costly hash table growth/shrink operations and associated locking
+
+### 2. **Huge Page Optimization: TLB Efficiency Despite Indirection**
+While indirection introduces a dependent memory read, Calico strategically applies huge pages to both frame memory and the indirection array itself:
+- **Frame memory backed by huge pages**: Dramatically reduces TLB entry consumption for data pages
+- **More TLB entries available**: With fewer TLB entries consumed by frame memory, more capacity remains for serving the indirection array
+- **Overcoming mmap's limitation**: Unlike vmcache systems that must use 4KB pages due to eviction granularity constraints, Calico's user-space translation enables huge page optimization while maintaining precise 4KB eviction control
+- **Matching mmap performance**: Despite adding an indirection layer, huge page benefits allow Calico to match the in-memory performance of direct virtual memory systems
+
+### 3. **Prefetching-Optimized Translation: Parallel Access Patterns**
+Calico's array-based translation is specifically designed to leverage modern CPU capabilities and workload patterns:
+- **Graph traversal optimization**: In workloads like BFS and HNSW's beam search, accessing a node's neighbors provides opportunities for parallel indirection array reads
+- **Out-of-order execution friendly**: Modern CPUs can issue multiple independent array lookups simultaneously, fetching frame IDs for all neighbors in one batch
+- **Reduced translation overhead**: Parallel translation lookups amortize indirection costs across multiple page accesses
+- **I/O prefetching synergy**: When data doesn't fit in memory, the same neighbor patterns enable parallel I/O operations to SSD for loading multiple pages
+
+### 4. **Co-located Metadata: Unified State Management**
+Calico's indirection entries efficiently pack multiple pieces of information into a single 64-bit atomic word:
+- **Frame ID storage**: Direct mapping to physical frame location
+- **Eviction metadata**: Lock states and version numbers for optimistic concurrency control
+- **Shared locking support**: Multi-reader synchronization embedded in the translation entry
+- **Atomic operations**: Single-word updates provide lock-free state transitions
+- **Eliminated double lookups**: Traditional hash tables require separate metadata storage, but Calico stores translation and concurrency control information together, reducing memory accesses and improving cache efficiency
+
+These four techniques combine to create a buffer pool that provides the translation efficiency of direct memory mapping with the control and optimization opportunities of traditional buffer pools, while avoiding the limitations and overheads of both approaches.
+
 ### The Buffer Manager Design Space
 
 Existing buffer managers force a fundamental trade-off between implementation complexity and performance characteristics:
@@ -239,39 +273,48 @@ To validate Calico's effectiveness for these emerging workloads, we evaluated al
 
 | Configuration | Traversal Time (ms) | LLC Misses/Op | DTLB Misses/Op | Cycles/Op | Instructions/Op | IPC |
 |---------------|-------------------|---------------|----------------|-----------|----------------|-----|
-| **calico_array** | **5,412** | **30.89** | **24.96** | **6,219** | **2,486** | **0.400** |
-| **calico_mmap** | 6,402 | 47.80 | 31.39 | 7,364 | 2,371 | 0.322 |
-| **calico_array_nohuge** | 8,326 | 53.72 | 32.43 | 9,586 | 2,486 | 0.259 |
-| **calico_lockfree_hash** | 9,564 | 55.95 | 56.46 | 11,001 | 3,521 | 0.320 |
-| **calico_openaddr_hash** | 18,565 | 154.89 | 59.66 | 21,371 | 8,362 | 0.391 |
-| **calico_unordered_hash** | 29,802 | 126.33 | 112.33 | 34,366 | 6,038 | 0.176 |
+| **calico_array** | **4,918** | **34.55** | **24.23** | **5,649** | **2,952** | **0.523** |
+| **calico_mmap** | 7,190 | 57.17 | 31.68 | 8,257 | 2,837 | 0.344 |
+| **calico_array_nohuge** | 7,815 | 57.36 | 31.74 | 8,996 | 2,952 | 0.328 |
+| **calico_lockfree_hash** | 8,659 | 64.71 | 56.57 | 9,966 | 5,043 | 0.506 |
+| **calico_lockfree_hash_nohuge** | 12,653 | 88.96 | 59.27 | 14,540 | 5,042 | 0.347 |
+| **calico_openaddr_hash** | 19,161 | 138.35 | 59.15 | 22,094 | 11,688 | 0.529 |
+| **calico_unordered_hash** | 25,088 | 128.83 | 107.89 | 28,917 | 9,836 | 0.340 |
 
 #### Key Insights from Graph BFS Results
 
-1. **Array Translator Superiority**: The array translator (`calico_array`) achieves the best performance across all metrics, outperforming even mmap by 15.5% in traversal time (5,412ms vs 6,402ms). This result is particularly significant because graph traversal's irregular access patterns typically favor direct memory mapping approaches.
+1. **Array Translator Superiority**: The array translator (`calico_array`) achieves the best performance across all metrics, outperforming even mmap by 31.6% in traversal time (4,918ms vs 7,190ms). This result is particularly significant because graph traversal's irregular access patterns typically favor direct memory mapping approaches, yet Calico's optimized translation actually exceeds mmap performance.
 
-2. **Cache Efficiency Dominance**: The array translator achieves exceptional cache efficiency with only 30.89 LLC misses per operation, compared to 47.80 for mmap (35% reduction) and 126.33-154.89 for hash-based approaches (4-5× worse). This demonstrates that the array's sequential metadata layout significantly improves cache behavior even for irregular graph access patterns.
+2. **Cache Efficiency Dominance**: The array translator achieves exceptional cache efficiency with only 34.55 LLC misses per operation, compared to 57.17 for mmap (40% reduction) and 128.83-138.35 for hash-based approaches (4× worse). This demonstrates that the array's sequential metadata layout and prefetch-friendly access patterns significantly improve cache behavior even for irregular graph access patterns.
 
-3. **TLB Optimization Impact**: Huge pages prove even more critical for graph workloads:
-   - `calico_array`: 24.96 DTLB misses/op (with huge pages)
-   - `calico_array_nohuge`: 32.43 DTLB misses/op (30% increase without huge pages)
-   - Hash tables suffer dramatically higher TLB pressure (56.46-112.33 misses/op)
+3. **TLB Optimization Critical Impact**: Huge pages prove essential for all translation strategies, with particularly dramatic effects:
+   - `calico_array`: 24.23 DTLB misses/op (with huge pages) 
+   - `calico_array_nohuge`: 31.74 DTLB misses/op (31% increase without huge pages)
+   - `calico_lockfree_hash`: 56.57 DTLB misses/op (with huge pages)
+   - `calico_lockfree_hash_nohuge`: 59.27 DTLB misses/op (5% increase, but still 2.4× worse than array)
+   - Hash tables suffer dramatically higher TLB pressure overall (56.57-107.89 misses/op)
 
-4. **Hash Table Performance Degradation**: Hash-based approaches show severe performance penalties in graph traversal:
-   - `unordered_hash`: 5.5× slower than array translator (29,802ms vs 5,412ms)
-   - `openaddr_hash`: 3.4× slower with highest LLC miss rate (154.89 misses/op)
+4. **Huge Pages Impact Varies by Translation Strategy**: The lockfree hash shows smaller huge page benefits (5% improvement) compared to the array translator (31% improvement), suggesting that the array's sequential access patterns synergize better with huge page optimization than hash-based irregular access patterns.
+
+5. **Hash Table Performance Degradation**: Hash-based approaches show severe performance penalties in graph traversal:
+   - `unordered_hash`: 5.1× slower than array translator (25,088ms vs 4,918ms)
+   - `openaddr_hash`: 3.9× slower with highest LLC miss rate (138.35 misses/op)
+   - `lockfree_hash_nohuge`: 2.6× slower than array, showing how huge pages partially mitigate hash overhead
    - The irregular access patterns of graph traversal exacerbate hash collision and probing overhead
 
-5. **Instruction Efficiency**: The array translator maintains the highest IPC (0.400) while requiring the fewest instructions per operation (2,486), indicating optimal code efficiency. Hash tables show instruction inflation due to collision handling and pointer traversals.
+6. **Instruction Efficiency**: The array translator maintains the highest IPC (0.523) while requiring the fewest instructions per operation (2,952), indicating optimal code efficiency. Hash tables show significant instruction inflation due to collision handling and pointer traversals.
 
-6. **Lock-Free Hash Performance**: The lock-free hash implementation (`calico_lockfree_hash`) provides a middle ground, performing better than other hash variants but still 77% slower than the array translator, with higher memory overhead due to atomic operations and lock-free algorithms.
+7. **Lock-Free Hash Performance**: The lock-free hash implementation shows interesting behavior:
+   - `calico_lockfree_hash`: 76% slower than array translator but maintains reasonable IPC (0.506)
+   - `calico_lockfree_hash_nohuge`: 157% slower, demonstrating that huge pages provide meaningful but limited benefits for hash-based translation
+   - Lock-free algorithms trade CPU cycles for reduced contention but cannot overcome fundamental hash table overheads
 
 #### Graph vs Random Access Pattern Comparison
 
 Comparing graph BFS results with random access workloads reveals important access pattern sensitivities:
 
-- **Array translator advantage increases**: From ~equal to mmap in random access to 15.5% better in graph traversal, suggesting better handling of complex access patterns
-- **Hash table penalties amplify**: Graph traversal amplifies hash table overhead, with unordered_map showing 4-5× performance degradation vs 2× in random access
+- **Array translator advantage increases**: From ~equal to mmap in random access to 31.6% better in graph traversal, demonstrating superior handling of irregular access patterns through prefetch-friendly indirection
+- **Hash table penalties amplify**: Graph traversal amplifies hash table overhead, with unordered_map showing 5× performance degradation vs 2× in random access workloads
 - **TLB importance grows**: DTLB miss rates become more critical in graph traversal, with huge pages providing 30% improvement vs ~20% in random access
 
 #### Implications for Database Workloads

@@ -19,7 +19,7 @@ echo "Extracting graph BFS experiment results..."
 echo "Graph experiment directory: ${GRAPH_EXP_DIR}"
 
 # Configuration names
-CONFIGS=("calico_mmap" "calico_array" "calico_array_nohuge" "calico_unordered_hash" "calico_openaddr_hash" "calico_lockfree_hash")
+CONFIGS=("calico_mmap" "calico_array" "calico_array_nohuge" "calico_unordered_hash" "calico_openaddr_hash" "calico_lockfree_hash" "calico_lockfree_hash_nohuge")
 
 # Create summary CSV with headers
 SUMMARY_FILE="${GRAPH_EXP_DIR}/graph_results_summary.csv"
