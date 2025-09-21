@@ -1137,6 +1137,7 @@ static void runGraphBenchmark(u64 nodeCount, u64 startIndex) {
         << endl;
    visited[clampedStart] = 1;
    bool enablePerf = envOr("PERF", 0);
+   bool enablePrefetch = envOr("PREFETCH", 1);
    u64 visitCount = 0;
    u64 totalValue = 0;
    auto begin = std::chrono::steady_clock::now();
@@ -1162,7 +1163,8 @@ static void runGraphBenchmark(u64 nodeCount, u64 startIndex) {
          GuardS<GraphNodePage> node(current);
          GraphNodePage* page = node.ptr;
          const PID* neighbors = page->neighborData();
-         bm.prefetchPages(neighbors, page->neighborCount);
+         if (enablePrefetch)
+            bm.prefetchPages(neighbors, page->neighborCount);
          for (u32 i = 0; i < page->neighborCount; i++) {
             PID neighborPid = neighbors[i];
             // if (neighborPid < basePid || neighborPid > maxPid)
@@ -1413,7 +1415,10 @@ void BufferManager::evict() {
 
 void BufferManager::prefetchPages(const PID * pages, int n_pages) {
    if (n_pages == 0) return;
-   
+   // if (!useTraditional) {
+   //    // For mmap mode, all pages are always "resident"
+   //    return;
+   // }
    // Use unique_ptr to defer allocation until we know we have pages to read
    std::unique_ptr<vector<PID>> pidsToRead;
    std::unique_ptr<vector<Page*>> destinations;
@@ -1423,10 +1428,6 @@ void BufferManager::prefetchPages(const PID * pages, int n_pages) {
       PID pid = pages[i];
       assert(pid < virtCount);
       
-      // if (!useTraditional) {
-      //    // For mmap mode, all pages are always "resident"
-      //    continue;
-      // }
       
       PageState& ps = getPageState(pid);
       u64 stateAndVersion = ps.stateAndVersion.load(std::memory_order_acquire);
