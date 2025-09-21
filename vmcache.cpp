@@ -41,6 +41,7 @@ __thread uint16_t workerThreadId = 0;
 __thread int32_t tpcchistorycounter = 0;
 #include "tpcc/TPCCWorkload.hpp"
 #include "tpcc/ZipfianGenerator.hpp"
+#include "perf_util.hpp"
 
 using namespace std;
 using namespace tpcc;
@@ -2496,6 +2497,8 @@ int main(int argc, char** argv) {
    };
 
    if (isRndread) {
+      bool enablePerf = envOr("PERF", 0);
+
       // Print information about the key distribution being used
       if (skewFactor > 0.0) {
          cerr << "Using Zipfian key distribution with skew factor: " << skewFactor << endl;
@@ -2535,6 +2538,10 @@ int main(int argc, char** argv) {
          workerThreadId = worker;
          u64 cnt = 0;
          u64 start = rdtsc();
+
+         std::unique_ptr<perf::Scope> perfScope;
+         if (enablePerf)
+            perfScope = std::make_unique<perf::Scope>();
          
          // Initialize key generator based on skew factor
          std::unique_ptr<ScrambledZipfGenerator> zipfGen;
@@ -2571,6 +2578,8 @@ int main(int argc, char** argv) {
       });
 
       statThread.join();
+      if (enablePerf)
+         perf::Aggregator::instance().report(std::cout);
       return 0;
    }
 
