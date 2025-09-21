@@ -7,7 +7,7 @@ set -e
 
 # Base directory for experiments
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-EXP_BASE_DIR="${SCRIPT_DIR}/exps/in-memory"
+EXP_BASE_DIR="${SCRIPT_DIR}/exps/in-memory/btree_ycsbc"
 
 # Thread counts to process
 THREAD_COUNTS=(1 4 8 16 32)
@@ -62,7 +62,7 @@ extract_avg_throughput() {
 echo "thread_count,config_name,avg_throughput,llc_miss_per_op,dtlb_miss_per_op,cycles_per_op,insts_per_op,ipc" > "${EXP_BASE_DIR}/results_summary_all.csv"
 
 # List of configurations to process
-configs=("calico_mmap" "calico_array" "calico_array_nohuge" "calico_unordered_hash" "calico_openaddr_hash")
+configs=("calico_mmap" "calico_array" "calico_array_nohuge" "calico_unordered_hash" "calico_openaddr_hash" "calico_lockfree_hash")
 
 echo "Extracting results from experiment files for all thread counts..."
 echo "=================================================================="

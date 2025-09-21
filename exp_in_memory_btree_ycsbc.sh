@@ -7,14 +7,14 @@ set -e
 
 # Base directory for experiments
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-EXP_BASE_DIR="${SCRIPT_DIR}/exps/in-memory"
+EXP_BASE_DIR="${SCRIPT_DIR}/exps/in-memory/btree_ycsbc"
 
 # Thread counts to test
 THREAD_COUNTS=(1 4 8 16 32)
 
 # Common settings for all experiments (except THREADS which varies)
 export RNDREAD=1
-export BLOCK=/home/jmhu/calico/heapfile
+export BLOCK=/home/zxjcarrot/Workspace/calico/heapfile
 export VIRTGB=32G
 export PHYSGB=24G
 export DATASIZE=1e8
@@ -82,7 +82,7 @@ GLOBAL_SUMMARY_FILE="${EXP_BASE_DIR}/experiment_summary.txt"
 echo "In-Memory Experiment Summary - Multi-threaded" > "${GLOBAL_SUMMARY_FILE}"
 echo "Generated on: $(date)" >> "${GLOBAL_SUMMARY_FILE}"
 echo "Thread counts tested: ${THREAD_COUNTS[*]}" >> "${GLOBAL_SUMMARY_FILE}"
-echo "Common settings: RNDREAD=1 BLOCK=/home/jmhu/calico/heapfile VIRTGB=32G PHYSGB=24G DATASIZE=1e8 PERF=1" >> "${GLOBAL_SUMMARY_FILE}"
+echo "Common settings: RNDREAD=1 BLOCK=/home/zxjcarrot/Workspace/calico/heapfile VIRTGB=32G PHYSGB=24G DATASIZE=1e8 PERF=1" >> "${GLOBAL_SUMMARY_FILE}"
 echo "" >> "${GLOBAL_SUMMARY_FILE}"
 
 # Run experiments for each thread count
@@ -101,7 +101,7 @@ for threads in "${THREAD_COUNTS[@]}"; do
   "threads": ${threads},
   "common_settings": {
     "RNDREAD": 1,
-    "BLOCK": "/home/jmhu/calico/heapfile",
+    "BLOCK": "/home/zxjcarrot/Workspace/calico",
     "VIRTGB": "32G",
     "PHYSGB": "24G", 
     "THREADS": ${threads},
@@ -134,7 +134,7 @@ EOF
         "TRADITIONAL=1" "TRADHASH=2"
     
     # Experiment 6: Calico lockfree_hash (traditional buffer pool with lock free open addressing)
-    run_experiment ${threads} "calico_openaddr_hash" "Calico with traditional buffer pool using lock free open addressing hash translator" \
+    run_experiment ${threads} "calico_lockfree_hash" "Calico with traditional buffer pool using lock free open addressing hash translator" \
         "TRADITIONAL=1" "TRADHASH=4"
 
     echo "Completed experiments with ${threads} threads" >> "${GLOBAL_SUMMARY_FILE}"
@@ -163,7 +163,7 @@ done
 
 echo
 echo "Running results extraction for all thread counts..."
-./extract_results.sh
+./extract_results_btree_ycsbc.sh
 
 echo
 echo "Experiment completed! Check ${EXP_BASE_DIR} for all results."

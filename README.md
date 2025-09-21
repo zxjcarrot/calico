@@ -20,6 +20,27 @@ This script tests 5 configurations across 5 thread counts (1, 4, 8, 16, 32 threa
 
 Results are automatically organized in `exps/in-memory/` with subdirectories for each thread count and a comprehensive summary in `results_summary.txt`.
 
+### Graph BFS Benchmark Suite
+
+For graph workloads, a specialized benchmark is available:
+
+```bash
+# Run graph BFS experiment suite
+./exp_in_memory_graph_bfs.sh
+```
+
+This script evaluates all buffer management strategies using a breadth-first search workload on a large graph:
+- **calico_mmap**: Virtual memory cache using mmap
+- **calico_array**: Traditional buffer pool with array translator  
+- **calico_array_nohuge**: Array translator without huge pages
+- **calico_unordered_hash**: Traditional buffer pool with std::unordered_map
+- **calico_openaddr_hash**: Traditional buffer pool with open addressing hash
+- **calico_lockfree_hash**: Traditional buffer pool with lock-free hash table
+
+The graph BFS benchmark creates a synthetic graph with configurable size and performs breadth-first traversal, which exercises random memory access patterns typical of graph algorithms. Results include traversal time and detailed performance counters (LLC misses, DTLB misses, IPC).
+
+Results are stored in `exps/in-memory/graph_bfs/` with automatic extraction to `graph_results_summary.csv` and detailed analysis in `graph_analysis.txt`.
+
 ## Environment Variables
 
 * BLOCK: storage block device (e.g. /dev/nvme0n1 or /dev/md0); default=/tmp/bm
