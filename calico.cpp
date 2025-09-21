@@ -81,7 +81,8 @@ struct alignas(4096) Page {
    bool dirty;
 };
 
-struct GraphNodePage: public Page {
+struct GraphNodePage {
+   bool dirty;
    u32 neighborCount;
    u32 padding;
    u64 value;
@@ -356,7 +357,11 @@ struct LibaioInterface {
    LibaioInterface(int blockfd, BufferManager* bm);
 
    void writePages(const vector<PID>& pages);
+   void readPages(const vector<PID>& pages, const vector<Page*>& destinations);
 };
+
+// Define static member
+const u64 LibaioInterface::maxIOs;
 
 struct FreePartition {
    std::atomic_flag lock = ATOMIC_FLAG_INIT;
@@ -428,6 +433,7 @@ struct BufferManager {
    Page* handleFault(PID pid);
    void readPage(PID pid, Page* dest);
    void evict();
+   void prefetchPages(const PID* pages, int n_pages);
 
    Page* acquireFrameForPid(PID pid);
    void releaseFrame(PID pid);
@@ -467,6 +473,29 @@ void LibaioInterface::writePages(const vector<PID>& pages) {
    assert(cnt == pages.size());
    cnt = io_getevents(ctx, pages.size(), pages.size(), events, nullptr);
    assert(cnt == pages.size());
+}
+
+void LibaioInterface::readPages(const vector<PID>& pages, const vector<Page*>& destinations) {
+   assert(pages.size() == destinations.size());
+   assert(pages.size() < maxIOs);
+   
+   for (u64 i = 0; i < pages.size(); i++) {
+      PID pid = pages[i];
+      Page* dest = destinations[i];
+      cbPtr[i] = &cb[i];
+      io_prep_pread(cb + i, blockfd, dest, pageSize, pageSize * pid);
+   }
+   
+   int cnt = io_submit(ctx, pages.size(), cbPtr);
+   assert(cnt == pages.size());
+   cnt = io_getevents(ctx, pages.size(), pages.size(), events, nullptr);
+   assert(cnt == pages.size());
+   
+   // Mark pages as clean after successful read
+   for (u64 i = 0; i < pages.size(); i++) {
+      destinations[i]->dirty = false;
+      bm->readCount++;
+   }
 }
 
 
@@ -1078,6 +1107,7 @@ static void runGraphBenchmark(u64 nodeCount, u64 startIndex) {
       page->padding = 0;
       page->value = valueDist(rng);
       nodePids.push_back(pid);
+      page->dirty = true;
       bm.unfixX(pid);
    }
 
@@ -1088,6 +1118,7 @@ static void runGraphBenchmark(u64 nodeCount, u64 startIndex) {
       PID* neighbors = node->neighborData();
       for (u32 j = 0; j < desiredNeighbors; j++)
          neighbors[j] = nodePids[distNode(rng)];
+      node->dirty = true;
       bm.unfixX(nodePids[i]);
    }
 
@@ -1099,6 +1130,11 @@ static void runGraphBenchmark(u64 nodeCount, u64 startIndex) {
    std::vector<uint8_t> visited(nodeCount, 0);
    u64 clampedStart = std::min<u64>(startIndex, nodeCount - 1);
    PID startPid = nodePids[clampedStart];
+   cerr << "bfs nodes=" << nodeCount
+        << " neighbors_per_node=" << desiredNeighbors
+        << " start_index=" << clampedStart
+        << " start_pid=" << startPid
+        << endl;
    visited[clampedStart] = 1;
    bool enablePerf = envOr("PERF", 0);
    u64 visitCount = 0;
@@ -1126,6 +1162,7 @@ static void runGraphBenchmark(u64 nodeCount, u64 startIndex) {
          GuardS<GraphNodePage> node(current);
          GraphNodePage* page = node.ptr;
          const PID* neighbors = page->neighborData();
+         bm.prefetchPages(neighbors, page->neighborCount);
          for (u32 i = 0; i < page->neighborCount; i++) {
             PID neighborPid = neighbors[i];
             // if (neighborPid < basePid || neighborPid > maxPid)
@@ -1372,6 +1409,89 @@ void BufferManager::evict() {
    }
 
    physUsedCount -= toEvict.size();
+}
+
+void BufferManager::prefetchPages(const PID * pages, int n_pages) {
+   if (n_pages == 0) return;
+   
+   // Use unique_ptr to defer allocation until we know we have pages to read
+   std::unique_ptr<vector<PID>> pidsToRead;
+   std::unique_ptr<vector<Page*>> destinations;
+   
+   // Check which pages are not in memory and need to be loaded
+   for (int i = 0; i < n_pages; i++) {
+      PID pid = pages[i];
+      assert(pid < virtCount);
+      
+      // if (!useTraditional) {
+      //    // For mmap mode, all pages are always "resident"
+      //    continue;
+      // }
+      
+      PageState& ps = getPageState(pid);
+      u64 stateAndVersion = ps.stateAndVersion.load(std::memory_order_acquire);
+      u64 state = PageState::getState(stateAndVersion);
+      
+      if (hashMode == HashMode::Lockfree || hashMode == HashMode::Unordered || hashMode == HashMode::OpenAddress) {
+         // Double check that the page is still mapped
+         u64 frame;
+         if (pidToFrameHash->tryGet(pid, frame)) {
+            // Page is already mapped, skip
+            continue;
+         }
+      }
+
+      // Skip pages that are already in memory (not evicted)
+      if (state != PageState::Evicted) {
+         continue;
+      }
+      
+      // Lock the page first before allocating frame
+      if (ps.tryLockX(stateAndVersion)) {
+         ensureFreePages();
+         // Try to acquire a frame for this page
+         Page* frame = acquireFrameForPid(pid);
+         if (frame != nullptr) {
+            // Allocate vectors only when we have the first page to read
+            if (!pidsToRead) {
+               pidsToRead = std::make_unique<vector<PID>>();
+               destinations = std::make_unique<vector<Page*>>();
+               pidsToRead->reserve(n_pages);
+               destinations->reserve(n_pages);
+            }
+            
+            pidsToRead->push_back(pid);
+            destinations->push_back(frame);
+            physUsedCount++;
+         } else {
+            // Failed to acquire frame, unlock the page
+            ps.unlockX();
+         }
+      }
+   }
+   
+   // Batch read all pages that need to be loaded
+   if (pidsToRead && !pidsToRead->empty()) {
+      if (pidsToRead->size() >= LibaioInterface::maxIOs) {
+         // Split into multiple batches if too many pages
+         for (size_t i = 0; i < pidsToRead->size(); i += LibaioInterface::maxIOs) {
+            size_t batchSize = std::min(LibaioInterface::maxIOs, pidsToRead->size() - i);
+            vector<PID> batch(pidsToRead->begin() + i, pidsToRead->begin() + i + batchSize);
+            vector<Page*> batchDest(destinations->begin() + i, destinations->begin() + i + batchSize);
+            libaioInterface[workerThreadId].readPages(batch, batchDest);
+         }
+      } else {
+         libaioInterface[workerThreadId].readPages(*pidsToRead, *destinations);
+      }
+      
+      // Unlock all successfully loaded pages
+      for (PID pid : *pidsToRead) {
+         // Add to resident set
+         residentSet.insert(pid);
+         PageState& ps = getPageState(pid);
+         ps.unlockX();
+      }
+   }
 }
 
 //---------------------------------------------------------------------------
