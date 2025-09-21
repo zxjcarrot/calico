@@ -2,6 +2,24 @@
 
 Code repository for SIGMOD'23 paper [Virtual-Memory Assisted Buffer Management](https://www.cs.cit.tum.de/fileadmin/w00cfj/dis/_my_direct_uploads/vmcache.pdf). This is the buffer manager implementation. [exmap](https://github.com/tuhhosg/exmap) is in a separate repository.
 
+## Automated Experiments
+
+The repository includes a comprehensive experiment suite for evaluating different buffer management strategies:
+
+```bash
+# Run full multi-threaded experiment suite
+./exp_in_memory.sh
+```
+
+This script tests 5 configurations across 5 thread counts (1, 4, 8, 16, 32 threads):
+- **calico_mmap**: Virtual memory cache using mmap (`TRADITIONAL=0`)
+- **calico_array**: Traditional buffer pool with array translator (`TRADITIONAL=1 TRADHASH=0`)
+- **calico_array_nohuge**: Array translator without huge pages for frame memory
+- **calico_unordered_hash**: Traditional buffer pool with std::unordered_map (`TRADHASH=1`)
+- **calico_openaddr_hash**: Traditional buffer pool with open addressing hash (`TRADHASH=2`)
+
+Results are automatically organized in `exps/in-memory/` with subdirectories for each thread count and a comprehensive summary in `results_summary.txt`.
+
 ## Environment Variables
 
 * BLOCK: storage block device (e.g. /dev/nvme0n1 or /dev/md0); default=/tmp/bm
@@ -13,6 +31,8 @@ Code repository for SIGMOD'23 paper [Virtual-Memory Assisted Buffer Management](
 * RNDREAD: if non-zero, run random read benchmark, otherwise TPC-C; default=0
 * THREADS: number of threads; default=1
 * DATASIZE: number of warehouses for TPC-C, number of tuples for random read benchmark; default=10
+* **PERF_CSV**: if set to a filename, outputs performance counters to CSV file
+* **TX_CSV**: if set to a filename, outputs transaction details to CSV file
 
 ## More buffer pool knobs
 
