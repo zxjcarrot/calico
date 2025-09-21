@@ -14,7 +14,7 @@ THREAD_COUNTS=(1 4 8 16 32)
 
 # Common settings for all experiments (except THREADS which varies)
 export RNDREAD=1
-export BLOCK=/home/zxjcarrot/Workspace/calico/heapfile
+export BLOCK=/home/jmhu/calico/heapfile
 export VIRTGB=32G
 export PHYSGB=24G
 export DATASIZE=1e8
@@ -82,7 +82,7 @@ GLOBAL_SUMMARY_FILE="${EXP_BASE_DIR}/experiment_summary.txt"
 echo "In-Memory Experiment Summary - Multi-threaded" > "${GLOBAL_SUMMARY_FILE}"
 echo "Generated on: $(date)" >> "${GLOBAL_SUMMARY_FILE}"
 echo "Thread counts tested: ${THREAD_COUNTS[*]}" >> "${GLOBAL_SUMMARY_FILE}"
-echo "Common settings: RNDREAD=1 BLOCK=/home/zxjcarrot/Workspace/calico/heapfile VIRTGB=32G PHYSGB=24G DATASIZE=1e8 PERF=1" >> "${GLOBAL_SUMMARY_FILE}"
+echo "Common settings: RNDREAD=1 BLOCK=/home/jmhu/calico/heapfile VIRTGB=32G PHYSGB=24G DATASIZE=1e8 PERF=1" >> "${GLOBAL_SUMMARY_FILE}"
 echo "" >> "${GLOBAL_SUMMARY_FILE}"
 
 # Run experiments for each thread count
@@ -101,7 +101,7 @@ for threads in "${THREAD_COUNTS[@]}"; do
   "threads": ${threads},
   "common_settings": {
     "RNDREAD": 1,
-    "BLOCK": "/home/zxjcarrot/Workspace/calico/heapfile",
+    "BLOCK": "/home/jmhu/calico/heapfile",
     "VIRTGB": "32G",
     "PHYSGB": "24G", 
     "THREADS": ${threads},
@@ -133,6 +133,10 @@ EOF
     run_experiment ${threads} "calico_openaddr_hash" "Calico with traditional buffer pool using open addressing hash translator" \
         "TRADITIONAL=1" "TRADHASH=2"
     
+    # Experiment 6: Calico lockfree_hash (traditional buffer pool with lock free open addressing)
+    run_experiment ${threads} "calico_openaddr_hash" "Calico with traditional buffer pool using lock free open addressing hash translator" \
+        "TRADITIONAL=1" "TRADHASH=4"
+
     echo "Completed experiments with ${threads} threads" >> "${GLOBAL_SUMMARY_FILE}"
     echo "" >> "${GLOBAL_SUMMARY_FILE}"
     
