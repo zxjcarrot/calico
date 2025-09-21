@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <functional>
 #include <iostream>
+#include <fstream>
 #include <mutex>
 #include <numeric>
 #include <set>
@@ -35,6 +36,13 @@
 #include <unistd.h>
 #include <immintrin.h>
 
+// --- Intrinsics Headers ---
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
+#include <nmmintrin.h> // For CRC32 and prefetch
+
+
 #include "exmap.h"
 
 __thread uint16_t workerThreadId = 0;
@@ -53,6 +61,19 @@ typedef uint64_t u64;
 typedef u64 PID; // page id type
 
 static const u64 pageSize = 4096;
+
+
+__attribute__((target("sse4.2")))
+uint64_t hash64(uint64_t key, uint32_t seed) {
+    uint64_t k = 0x8648DBDB;
+    uint64_t crc = _mm_crc32_u64(seed, key);
+    return crc * ((k << 32) + 1);
+}
+
+template<typename KeyType>
+struct Hasher {
+    uint64_t operator()(const KeyType& key) const { return hash64(key, 0xAAAAAAAA); }
+};
 
 struct alignas(4096) Page {
    bool dirty;
@@ -332,16 +353,17 @@ class ShardedUnorderedMap : public PartitionedMap<K, V> {
    static_assert((ShardCount & (ShardCount - 1)) == 0, "ShardCount must be a power of two");
 
    struct Shard {
-      std::unordered_map<K, V> map;
+      std::unordered_map<K, V, Hasher<K>> map;
       mutable std::shared_mutex mutex;
    };
 
    std::array<Shard, ShardCount> shards;
+   Hasher<K> hasher;
 
    static constexpr size_t shardMask = ShardCount - 1;
 
-   static size_t shardFor(const K& key) {
-      return std::hash<K>{}(key) & shardMask;
+   size_t shardFor(const K& key) const {
+      return hasher(key) & shardMask;
    }
 
 public:
@@ -395,6 +417,7 @@ class ShardedOpenAddressMap : public PartitionedMap<K, V> {
       mutable std::shared_mutex mutex;
       std::vector<OAEntry<K, V>> table;
       size_t size = 0;
+      Hasher<K> hasher;
 
       static size_t nextPow2(size_t v) {
          if (v < 8)
@@ -425,16 +448,16 @@ class ShardedOpenAddressMap : public PartitionedMap<K, V> {
          size = 0;
          for (auto& entry : table) {
             if (entry.state == OAEntry<K, V>::State::Occupied)
-               insertInto(newTable, entry.key, entry.value);
+               insertInto(newTable, entry.key, entry.value, hasher);
          }
          table.swap(newTable);
          size = oldSize;
          madvise(table.data(), table.size() * sizeof(OAEntry<K, V>), MADV_HUGEPAGE);
       }
 
-      static void insertInto(std::vector<OAEntry<K, V>>& tbl, const K& key, const V& value) {
+      static void insertInto(std::vector<OAEntry<K, V>>& tbl, const K& key, const V& value, const Hasher<K>& hasher) {
          size_t mask = tbl.size() - 1;
-         size_t idx = std::hash<K>{}(key) & mask;
+         size_t idx = hasher(key) & mask;
          size_t firstDeleted = tbl.size();
          for (;;) {
             auto& slot = tbl[idx];
@@ -459,7 +482,7 @@ class ShardedOpenAddressMap : public PartitionedMap<K, V> {
       void insertOrAssign(const K& key, const V& value) {
          ensureCapacity();
          size_t mask = table.size() - 1;
-         size_t idx = std::hash<K>{}(key) & mask;
+         size_t idx = hasher(key) & mask;
          size_t firstDeleted = table.size();
          for (;;) {
             auto& slot = table[idx];
@@ -481,7 +504,7 @@ class ShardedOpenAddressMap : public PartitionedMap<K, V> {
                return;
             }
             idx = (idx + 1) & mask;
-            if (idx == (std::hash<K>{}(key) & mask)) {
+            if (idx == (hasher(key) & mask)) {
                rehash(table.size() * 2);
                insertOrAssign(key, value);
                return;
@@ -493,7 +516,7 @@ class ShardedOpenAddressMap : public PartitionedMap<K, V> {
          if (table.empty())
             return false;
          size_t mask = table.size() - 1;
-         size_t idx = std::hash<K>{}(key) & mask;
+         size_t idx = hasher(key) & mask;
          for (;;) {
             const auto& slot = table[idx];
             if (slot.state == OAEntry<K, V>::State::Empty)
@@ -510,7 +533,7 @@ class ShardedOpenAddressMap : public PartitionedMap<K, V> {
          if (table.empty())
             return false;
          size_t mask = table.size() - 1;
-         size_t idx = std::hash<K>{}(key) & mask;
+         size_t idx = hasher(key) & mask;
          for (;;) {
             auto& slot = table[idx];
             if (slot.state == OAEntry<K, V>::State::Empty)
@@ -527,11 +550,12 @@ class ShardedOpenAddressMap : public PartitionedMap<K, V> {
    };
 
    std::array<Shard, ShardCount> shards;
+   Hasher<K> hasher;
 
    static constexpr size_t shardMask = ShardCount - 1;
 
-   static size_t shardFor(const K& key) {
-      return std::hash<K>{}(key) & shardMask;
+   size_t shardFor(const K& key) const {
+      return hasher(key) & shardMask;
    }
 
 public:
@@ -596,7 +620,7 @@ struct BufferManager {
    struct exmap_user_interface* exmapInterface[maxWorkerThreads];
    vector<LibaioInterface> libaioInterface;
 
-   enum class HashMode { Array = 0, Unordered = 1, OpenAddress = 2, Array1Access = 3 };
+   enum class HashMode { Array1Access = 0, Unordered = 1, OpenAddress = 2, Array = 3 };
 
    bool useTraditional;
    bool useExmap;
@@ -990,18 +1014,20 @@ BufferManager::BufferManager()
    useExmap = (!useTraditional) && envOr("EXMAP", 0);
    u64 tradHashSetting = useTraditional ? envOr("TRADHASH", 0) : 0;
    if (!useTraditional)
-      hashMode = HashMode::Array;
+      hashMode = HashMode::Array1Access;
    else if (tradHashSetting == 1)
       hashMode = HashMode::Unordered;
    else if (tradHashSetting == 2)
       hashMode = HashMode::OpenAddress;
    else if (tradHashSetting == 3)
-      hashMode = HashMode::Array1Access;
-   else
       hashMode = HashMode::Array;
+   else
+      hashMode = HashMode::Array1Access;
    PageState::setPackedMode(hashMode == HashMode::Array1Access);
    virtMem = nullptr;
    frameMem = nullptr;
+   bool disableHugePageForFrameMem = envOr("NOHUGEPAGE_FRAME_MEM", 0);
+
 
    u64 virtAllocSize = virtSize + (1 << 16); // guard space for optimistic reads
 
@@ -1009,6 +1035,9 @@ BufferManager::BufferManager()
       frameMem = static_cast<Page*>(allocHuge(physCount * sizeof(Page)));
       if (frameMem == MAP_FAILED)
          die("allocHuge frameMem");
+      if (disableHugePageForFrameMem) {
+         madvise(frameMem, physCount * sizeof(Page), MADV_NOHUGEPAGE);
+      }
       partitionFrameSpan = std::max<u32>(1, static_cast<u32>((physCount + freePartitionCount - 1) / freePartitionCount));
       for (u32 i = 0; i < freePartitionCount; i++) {
          auto& partition = freePartitions[i];
@@ -2462,7 +2491,6 @@ int main(int argc, char** argv) {
    double skewFactor = envOrDouble("SKEW", 0.0); // Zipfian skew factor, 0.0 = uniform
 
 
-
    if (envOr("GRAPH", 0)) {
       u64 nodeCount = n;
       u64 startIndex = envOr("GRAPHSTART", 0);
@@ -2471,6 +2499,7 @@ int main(int argc, char** argv) {
    }
    u64 statDiff = 1e8;
    atomic<u64> txProgress(0);
+   atomic<u64> txTotal(0);
    atomic<bool> keepRunning(true);
    const char* tradMode = "traditional-array";
    if (bm.hashMode == BufferManager::HashMode::Array1Access)
@@ -2484,15 +2513,33 @@ int main(int argc, char** argv) {
       : (bm.useExmap ? "exmap" : "vmcache");
 
    auto statFn = [&]() {
-      cout << "ts,tx,rmb,wmb,system,threads,datasize,workload,batch,skew" << endl;
+      const char* txCsvPath = getenv("TX_CSV");
+      std::ofstream file;
+      std::ostream* out = &cout;
+      
+      if (txCsvPath) {
+         file.open(txCsvPath);
+         if (file.is_open()) {
+            out = &file;
+         } else {
+            cerr << "Error: Could not open TX_CSV file: " << txCsvPath << endl;
+         }
+      }
+      
+      *out << "ts,tx,rmb,wmb,system,threads,datasize,workload,batch,skew" << endl;
       u64 cnt = 0;
+      u64 totalTx = 0;
       for (uint64_t i=0; i<runForSec; i++) {
          sleep(1);
          float rmb = (bm.readCount.exchange(0)*pageSize)/(1024.0*1024);
          float wmb = (bm.writeCount.exchange(0)*pageSize)/(1024.0*1024);
          u64 prog = txProgress.exchange(0);
-         cout << cnt++ << "," << prog << "," << rmb << "," << wmb << "," << systemName << "," << nthreads << "," << n << "," << (isRndread?"rndread":"tpcc") << "," << bm.batch << "," << skewFactor << endl;
+         totalTx += prog;
+         *out << cnt++ << "," << prog << "," << rmb << "," << wmb << "," << systemName << "," << nthreads << "," << n << "," << (isRndread?"rndread":"tpcc") << "," << bm.batch << "," << skewFactor << endl;
       }
+      // Record average throughput
+      double avgThroughput = (runForSec > 0) ? (double)totalTx / runForSec : 0.0;
+      *out << "avg_throughput," << avgThroughput << ",0,0," << systemName << "," << nthreads << "," << n << "," << (isRndread?"rndread":"tpcc") << "," << bm.batch << "," << skewFactor << endl;
       keepRunning = false;
    };
 
@@ -2570,16 +2617,18 @@ int main(int argc, char** argv) {
             u64 stop = rdtsc();
             if ((stop-start) > statDiff) {
                txProgress += cnt;
+               txTotal += cnt;
                start = stop;
                cnt = 0;
             }
          }
+         txTotal += cnt;
          txProgress += cnt;
       });
 
       statThread.join();
       if (enablePerf)
-         perf::Aggregator::instance().report(std::cout, txProgress.load());
+         perf::Aggregator::instance().report(txTotal.load());
       return 0;
    }
 

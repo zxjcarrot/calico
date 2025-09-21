@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <fstream>
+#include <cstdlib>
 #include <errno.h>
 #include <linux/perf_event.h>
 #include <sys/ioctl.h>
@@ -62,6 +64,23 @@ public:
       for (std::size_t i = 0; i < kNumEvents; i++)
          if (availability[i].load(std::memory_order_relaxed))
             totals[i].fetch_add(values[i], std::memory_order_relaxed);
+   }
+
+   void report(std::uint64_t opsSampled, bool resetTotals = true)
+   {
+      const char* perfCsvPath = std::getenv("PERF_CSV");
+      if (perfCsvPath) {
+         std::ofstream file(perfCsvPath);
+         if (file.is_open()) {
+            report(file, opsSampled, resetTotals);
+            file.close();
+         } else {
+            std::cerr << "Error: Could not open PERF_CSV file: " << perfCsvPath << std::endl;
+            report(std::cout, opsSampled, resetTotals);
+         }
+      } else {
+         report(std::cout, opsSampled, resetTotals);
+      }
    }
 
    void report(std::ostream& os, std::uint64_t opsSampled, bool resetTotals = true)

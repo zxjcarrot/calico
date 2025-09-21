@@ -22,25 +22,25 @@ Code repository for SIGMOD'23 paper [Virtual-Memory Assisted Buffer Management](
 * `TRADHASH=3` selects the single-access array translator, embedding the frame id directly into the page state to minimize metadata fetches.
 * Leave both knobs unset to keep the original vmcache behaviour (`TRADITIONAL=0`, `EXMAP=0`), or combine `EXMAP=1` with `TRADITIONAL=0` to exercise the kernel-assisted variant.
 
-vmcache mmap: `TRADITIONAL=0 TRADHASH=0 RNDREAD=1 BLOCK=/mnt/data/vmcache/heapfile THREADS=1 DATASIZE=2e7 ./vmcache`
+calico mmap: `TRADITIONAL=0 TRADHASH=0 RNDREAD=1 BLOCK=/home/zxjcarrot/Workspace/calico/heapfile THREADS=1 DATASIZE=2e7 ./calico`
 
-vmcache array: `TRADITIONAL=1 TRADHASH=0 RNDREAD=1 BLOCK=/mnt/data/vmcache/heapfile THREADS=1 DATASIZE=2e7 ./vmcache`
+calico array (single access): `TRADITIONAL=1 TRADHASH=0 RNDREAD=1 BLOCK=/home/zxjcarrot/Workspace/calico/heapfile THREADS=1 DATASIZE=2e7 ./calico`
 
-vmcache hash (unordered): `TRADITIONAL=1 TRADHASH=1 RNDREAD=1 BLOCK=/mnt/data/vmcache/heapfile THREADS=1 DATASIZE=2e7 ./vmcache`
+calico hash (unordered): `TRADITIONAL=1 TRADHASH=1 RNDREAD=1 BLOCK=/home/zxjcarrot/Workspace/calico/heapfile THREADS=1 DATASIZE=2e7 ./calico`
 
-vmcache hash (open addressing): `TRADITIONAL=1 TRADHASH=2 RNDREAD=1 BLOCK=/mnt/data/vmcache/heapfile THREADS=1 DATASIZE=2e7 ./vmcache`
+calico hash (open addressing): `TRADITIONAL=1 TRADHASH=2 RNDREAD=1 BLOCK=/home/zxjcarrot/Workspace/calico/heapfile THREADS=1 DATASIZE=2e7 ./calico`
 
-vmcache array (single access): `TRADITIONAL=1 TRADHASH=3 RNDREAD=1 BLOCK=/mnt/data/vmcache/heapfile THREADS=1 DATASIZE=2e7 ./vmcache`
+calico array (double access): `TRADITIONAL=1 TRADHASH=3 RNDREAD=1 BLOCK=/home/zxjcarrot/Workspace/calico/heapfile THREADS=1 DATASIZE=2e7 ./calico`
 
-Graph BFS benchmark: `GRAPH=1 GRAPHN=10000 GRAPHSTART=0 ./vmcache`
+Graph BFS benchmark: `GRAPH=1 GRAPHN=10000 GRAPHSTART=0 ./calico`
 
 * `GRAPHN` controls the number of nodes/pages in the graph (default 1024).
 * `GRAPHSTART` selects the starting node index for the breadth-first search (default 0).
 
 ## Example Command Lines
 
-* TPC-C, 4 threads, 2 warehouses: `BLOCK=/dev/nvme0n1 THREADS=4 DATASIZE=2 ./vmcache`
-* random read, 10 threads, 1 million tuples: `RNDREAD=1 BLOCK=/dev/md0 THREADS=10 DATASIZE=1e6 ./vmcache`
+* TPC-C, 4 threads, 2 warehouses: `BLOCK=/dev/nvme0n1 THREADS=4 DATASIZE=2 ./calico`
+* random read, 10 threads, 1 million tuples: `RNDREAD=1 BLOCK=/dev/md0 THREADS=10 DATASIZE=1e6 ./calico`
 
 ## Dependencies and Configuration
 
