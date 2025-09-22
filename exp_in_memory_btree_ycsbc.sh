@@ -137,6 +137,10 @@ EOF
     run_experiment ${threads} "calico_lockfree_hash" "Calico with traditional buffer pool using lock free open addressing hash translator" \
         "TRADITIONAL=1" "TRADHASH=4"
 
+    # Experiment 7: Calico lockfree_hash + nohuge (lock free open addressing without huge pages)
+    run_experiment ${threads} "calico_lockfree_hash_nohuge" "Calico lockfree hash translator without huge pages for frame memory" \
+        "TRADITIONAL=1" "TRADHASH=4" "NOHUGEPAGE_FRAME_MEM=1"
+
     echo "Completed experiments with ${threads} threads" >> "${GLOBAL_SUMMARY_FILE}"
     echo "" >> "${GLOBAL_SUMMARY_FILE}"
     

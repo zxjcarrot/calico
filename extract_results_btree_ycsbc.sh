@@ -62,7 +62,7 @@ extract_avg_throughput() {
 echo "thread_count,config_name,avg_throughput,llc_miss_per_op,dtlb_miss_per_op,cycles_per_op,insts_per_op,ipc" > "${EXP_BASE_DIR}/results_summary_all.csv"
 
 # List of configurations to process
-configs=("calico_mmap" "calico_array" "calico_array_nohuge" "calico_unordered_hash" "calico_openaddr_hash" "calico_lockfree_hash")
+configs=("calico_mmap" "calico_array" "calico_array_nohuge" "calico_unordered_hash" "calico_openaddr_hash" "calico_lockfree_hash" "calico_lockfree_hash_nohuge")
 
 echo "Extracting results from experiment files for all thread counts..."
 echo "=================================================================="
