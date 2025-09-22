@@ -242,9 +242,9 @@ The result is a buffer pool that delivers mmap-like performance for in-memory wo
 
 ## Related Work
 
-Enhancing Transaction Processing through Indirection Skipping: https://dl.acm.org/doi/pdf/10.14778/3749646.3749680
-VMCache
-libdbos
+* Enhancing Transaction Processing through Indirection Skipping: https://dl.acm.org/doi/pdf/10.14778/3749646.3749680  limitations: https://chatgpt.com/share/68d1ac43-1990-800b-821b-ffea0450e4c0
+* VMCache
+* libdbos
 
 ## Future Work
 
