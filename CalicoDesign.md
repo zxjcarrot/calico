@@ -240,6 +240,12 @@ The key insights are:
 
 The result is a buffer pool that delivers mmap-like performance for in-memory workloads while providing the control and I/O efficiency needed for complex database systems. Experimental validation across random access, B-tree index operations, and graph traversal workloads consistently demonstrates that Calico's array translator matches or exceeds direct memory mapping performance while maintaining full user-space control over buffer management.
 
+## Related Work
+
+Enhancing Transaction Processing through Indirection Skipping: https://dl.acm.org/doi/pdf/10.14778/3749646.3749680
+VMCache
+libdbos
+
 ## Future Work
 
 While Calico's array translator achieves excellent performance, there are opportunities to further optimize memory usage through advanced OS integration techniques:
