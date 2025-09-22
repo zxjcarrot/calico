@@ -1383,6 +1383,7 @@ void handleSEGFAULT(int signo, siginfo_t* info, void* extra) {
 }
 
 int main(int argc, char** argv) {
+    bm_ptr = new BufferManager();
     if (bm.useExmap) {
         struct sigaction action;
         action.sa_flags = SA_SIGINFO;
