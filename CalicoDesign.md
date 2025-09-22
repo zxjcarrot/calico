@@ -26,7 +26,7 @@ Modern database systems face a fundamental trade-off when choosing buffer pool i
 - ❌ **Translation overhead**: Hash collisions and pointer chasing hurt in-memory performance
 - ❌ **Concurrency complexity**: Fine-grained locking and resize operations create bottlenecks
 
-### Kernel Solutions (`exmap`/libdbos)
+### Kernel Solutions (`exmap`/`libdbos`)
 - ✅ **Best of both worlds**: Fast in-memory and I/O performance through kernel optimizations
 - ❌ **Deployment complexity**: Requires custom kernel modules and security considerations
 - ❌ **Limited huge page support**: Still constrained by mmap's granularity issues
