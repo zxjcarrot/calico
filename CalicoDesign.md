@@ -239,3 +239,40 @@ The key insights are:
 4. **No kernel dependencies** simplify deployment compared to kernel module solutions
 
 The result is a buffer pool that delivers mmap-like performance for in-memory workloads while providing the control and I/O efficiency needed for complex database systems. Experimental validation across random access, B-tree index operations, and graph traversal workloads consistently demonstrates that Calico's array translator matches or exceeds direct memory mapping performance while maintaining full user-space control over buffer management.
+
+## Future Work
+
+While Calico's array translator achieves excellent performance, there are opportunities to further optimize memory usage through advanced OS integration techniques:
+
+### Memory-Efficient Indirection Array
+
+**Current Space Overhead**: Like vmcache systems, Calico's indirection array introduces memory overhead:
+- **vmcache**: 16 bytes per 4KB storage page  
+- **Calico**: 8 bytes per 4KB storage page (PageState entry)
+
+For large storage capacities, this overhead can be significant. A 2TB SSD requires a 4GB indirection array, even if the actual database is much smaller.
+
+**Proposed Optimization: Copy-on-Write Hole Punching**
+
+The key insight is leveraging OS copy-on-write zero pages to reduce physical memory consumption for unused indirection array regions:
+
+1. **Initial Allocation**: Allocate the full indirection array but rely on OS zero pages
+2. **Hole Punching**: Use `madvise(MADV_DONTNEED)` to return unused array regions to zero pages
+3. **Demand Allocation**: Physical memory is only consumed when PageState entries are actually written
+
+**Memory Savings Scenarios**:
+- **Sparse Databases**: A 100GB database on a 2TB SSD would consume only 200MB of indirection array memory instead of 4GB
+- **Cold Data**: Inactive database regions can have their indirection entries returned to zero pages
+- **Page ID Clustering**: Databases with clustered page ID allocation patterns benefit most from hole punching
+
+**Implementation Considerations**:
+- **Page ID Distribution**: Effectiveness depends on database page allocation patterns
+- **Active Working Set**: Only frequently accessed regions maintain physical memory in the indirection array
+- **Dynamic Adaptation**: The system could monitor access patterns and dynamically punch holes in cold regions
+
+**Potential Benefits**:
+- **Reduced Memory Footprint**: Dramatic reduction in indirection array memory consumption for sparse workloads
+- **Better Cache Utilization**: Smaller physical memory footprint improves overall system cache efficiency
+- **Scalability**: Enables Calico to handle much larger storage capacities without proportional memory overhead
+
+This optimization would maintain Calico's performance characteristics while addressing the primary limitation of array-based translation: memory overhead for large, sparsely-accessed storage systems.
