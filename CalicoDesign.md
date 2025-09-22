@@ -14,7 +14,7 @@ The key insight is that **user-space indirection with huge page optimization** c
 
 Modern database systems face a fundamental trade-off when choosing buffer pool implementations:
 
-### Direct Memory Mapping (`mmap`)
+### Virtual Memory Accelerated Mapping (`mmap`)
 - ✅ **Fast in-memory access**: Direct page table translation with minimal CPU overhead
 - ❌ **Poor I/O performance**: Per-page TLB shootdowns during eviction create bottlenecks  
 - ❌ **No huge page support**: 4KB eviction granularity conflicts with 2MB huge page boundaries
