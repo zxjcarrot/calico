@@ -41,6 +41,13 @@ The graph BFS benchmark creates a synthetic graph with configurable size and per
 
 Results are stored in `exps/in-memory/graph_bfs/` with automatic extraction to `graph_results_summary.csv` and detailed analysis in `graph_analysis.txt`.
 
+## Pybind
+```bash
+git submodule update --init --recursive
+python setup.py build_ext --inplace
+python test.py
+```
+
 ## Environment Variables
 
 * BLOCK: storage block device (e.g. /dev/nvme0n1 or /dev/md0); default=/tmp/bm
