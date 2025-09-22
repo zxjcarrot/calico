@@ -6,6 +6,7 @@
 #include <shared_mutex>
 #include <atomic>
 #include <sys/mman.h>
+#include <mutex>
 
 // Forward declaration of Hasher template
 template<typename K>
