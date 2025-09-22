@@ -4,7 +4,7 @@
 
 Calico is a high-performance buffer pool that combines the best aspects of different memory management approaches:
 
-- **In-memory performance** that matches `mmap`'s direct virtual memory access
+- **In-memory performance** that matches or exceeds `mmap`'s direct virtual memory access
 - **Out-of-memory efficiency** that rivals specialized kernel solutions like `exmap` 
 - **User-space control** without requiring custom kernel modules or complex deployment
 
