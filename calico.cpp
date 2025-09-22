@@ -1167,25 +1167,15 @@ static void runGraphBenchmark(u64 nodeCount, u64 startIndex) {
             bm.prefetchPages(neighbors, page->neighborCount);
          for (u32 i = 0; i < page->neighborCount; i++) {
             PID neighborPid = neighbors[i];
-            // if (neighborPid < basePid || neighborPid > maxPid)
-            //    continue;
             u64 idx64 = neighborPid - basePid;
-            // if (idx64 >= nodeCount)
-            //    continue;
             u32 idx = static_cast<u32>(idx64);
-            // if (!visited[idx]) {
-            //    visited[idx] = 1;
-               {
-                  GuardS<GraphNodePage> neighborNode(neighborPid);
-                  // compute something
-                  totalValue += neighborNode->value;
-                  if (!visited[idx]) {
-                     visited[idx] = 1;
-                     frontier.push(neighborPid);      
-                  }
-               }
-               
-            // }
+            GuardS<GraphNodePage> neighborNode(neighborPid);
+            // compute something
+            totalValue += neighborNode->value;
+            if (!visited[idx]) {
+               visited[idx] = 1;
+               frontier.push(neighborPid);      
+            }
          }
       }
 
