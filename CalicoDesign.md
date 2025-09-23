@@ -242,10 +242,10 @@ The result is a buffer pool that delivers mmap-like performance for in-memory wo
 
 ## Related Work
 
-* Enhancing Transaction Processing through Indirection Skipping: https://dl.acm.org/doi/pdf/10.14778/3749646.3749680  limitations: https://chatgpt.com/share/68d1ac43-1990-800b-821b-ffea0450e4c0
+* Enhancing Transaction Processing through Indirection Skipping: https://dl.acm.org/doi/pdf/10.14778/3749646.3749680  Limitations: https://chatgpt.com/share/68d1ac43-1990-800b-821b-ffea0450e4c0
 * VMCache
-* libdbos
-
+* libdbos/Tabby
+* ScaleCache: https://www.vldb.org/pvldb/vol18/p5073-liu.pdf  Limitations: https://chatgpt.com/share/68d1f201-d5b0-800b-af53-806a24df4dc1
 ## Future Work
 
 While Calico's array translator achieves excellent performance, there are opportunities to further optimize memory usage through advanced OS integration techniques:
