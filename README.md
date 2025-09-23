@@ -1,6 +1,11 @@
-# vmcache
+# Calico
+Calico is a high-performance buffer pool that combines the best aspects of different memory management approaches:
 
-Code repository for SIGMOD'23 paper [Virtual-Memory Assisted Buffer Management](https://www.cs.cit.tum.de/fileadmin/w00cfj/dis/_my_direct_uploads/vmcache.pdf). This is the buffer manager implementation. [exmap](https://github.com/tuhhosg/exmap) is in a separate repository.
+* In-memory performance that matches or exceeds mmap's direct virtual memory access
+* Out-of-memory efficiency that rivals specialized kernel solutions like exmap
+* User-space control without requiring custom kernel modules or complex deployment
+
+The key insight is that user-space indirection with huge page optimization can eliminate the traditional performance trade-offs between direct memory mapping and flexible buffer pool management.
 
 ## Automated Experiments
 
