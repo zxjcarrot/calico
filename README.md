@@ -53,6 +53,19 @@ python setup.py build_ext --inplace
 python test.py
 ```
 
+### HNSW sift1m and sift10m benchmark
+We compare HNSW implemented in calico with HNSWLib.
+
+First you need to download sift1m and sift10m datasets. You can choose to download from the official website, but I failed so I chose to download from the other websites.
+
+sift1m: Download from here: https://huggingface.co/datasets/qbo-odp/sift1m
+sift10m: Download from here: https://www.kaggle.com/datasets/sheikhomar/sift10m Please note that you only need the .mat file, so ignore the image subfolders.
+
+Then, config the dataset path in the python file and run:
+```bash
+TRADITIONAL=1 TRADHASH=0 python benchmark_hnsw.py
+```
+
 ## Environment Variables
 
 * BLOCK: storage block device (e.g. /dev/nvme0n1 or /dev/md0); default=/tmp/bm
