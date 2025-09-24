@@ -814,7 +814,7 @@ void BufferManager::prefetchPages(const PID* pages, int n_pages, const u32* offs
         if (state != PageState::Evicted) {
             if (offsets_within_pages != nullptr) {
                   // Touch the page to bring it into cache
-                  char *tmp = (((char*)residentPtr(pid)) + offsets_within_pages[i]);
+                  char *tmp = (((char*)residentPtr(pid, ps, stateAndVersion)) + offsets_within_pages[i]);
                   _mm_prefetch(reinterpret_cast<const char*>(tmp), _MM_HINT_T0);
             }
             continue;

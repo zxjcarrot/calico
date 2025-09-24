@@ -54,7 +54,7 @@ def calculate_recall(ground_truth, result_labels, k):
     return correct / (total_queries * k)
 
 
-def benchmark_calico(X_base, X_query, ground_truth, params):
+def benchmark_calico(X_base, X_query, ground_truth, params, num_threads):
     """
     Benchmarks your calico_py HNSW implementation.
     """
@@ -84,7 +84,7 @@ def benchmark_calico(X_base, X_query, ground_truth, params):
 
     start_time = time.time()
 
-    labels, distances = index_calico.search_knn_parallel(X_query_float32, k, ef_search, 1)
+    labels, distances = index_calico.search_knn_parallel(X_query_float32, k, ef_search, num_threads)
 
     search_time = time.time() - start_time
     qps = len(X_query) / search_time
@@ -98,7 +98,7 @@ def benchmark_calico(X_base, X_query, ground_truth, params):
     return build_time, search_time, recall
 
 
-def benchmark_hnswlib(X_base, X_query, ground_truth, params):
+def benchmark_hnswlib(X_base, X_query, ground_truth, params, num_threads):
     """
     Benchmarks the hnswlib library for comparison.
     """
@@ -121,6 +121,8 @@ def benchmark_hnswlib(X_base, X_query, ground_truth, params):
         M=params["M"],
     )
 
+    if num_threads == 0:
+        num_threads = -1
     p.add_items(X_base_float32, num_threads=-1)
 
     build_time = time.time() - start_time
@@ -132,7 +134,7 @@ def benchmark_hnswlib(X_base, X_query, ground_truth, params):
 
     start_time = time.time()
 
-    labels, distances = p.knn_query(X_query_float32, k=k, num_threads=1)
+    labels, distances = p.knn_query(X_query_float32, k=k, num_threads=num_threads)
 
     search_time = time.time() - start_time
     qps = len(X_query) / search_time
@@ -169,9 +171,9 @@ if __name__ == "__main__":
         X_query = read_fvecs(QUERY_FILE)
         ground_truth = read_ivecs(GT_FILE)
         
-        # Duplicate X_query 10 times
-        X_query = np.tile(X_query, (10, 1))
-        ground_truth = np.tile(ground_truth, (10, 1))
+        # # Duplicate X_query 10 times
+        # X_query = np.tile(X_query, (10, 1))
+        # ground_truth = np.tile(ground_truth, (10, 1))
         
         print(f"Base vectors shape: {X_base.shape}")
         print(f"Query vectors shape: {X_query.shape}")
@@ -203,12 +205,13 @@ if __name__ == "__main__":
         end_time = time.time()
         print(f"Flat search took: {end_time - start_time:.4f} seconds")
         
-
+    num_threads = 1
+    print(f"Using {num_threads} threads for benchmarking.\n")
     calico_build, calico_search, calico_recall = benchmark_calico(
-        X_base, X_query, ground_truth, hnsw_params
+        X_base, X_query, ground_truth, hnsw_params, num_threads
     )
     hnswlib_build, hnswlib_search, hnswlib_recall = benchmark_hnswlib(
-        X_base, X_query, ground_truth, hnsw_params
+        X_base, X_query, ground_truth, hnsw_params, num_threads
     )
 
     print("\n\n--- Benchmark Summary ---")

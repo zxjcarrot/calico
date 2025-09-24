@@ -276,6 +276,7 @@ std::vector<std::pair<float, u32>> HNSW<Dim, DistanceMetric>::searchLayer(
                     _mm_prefetch(reinterpret_cast<const char*>(&visited_array[neighbor_id]), _MM_HINT_T0);
                 }
                 pages_to_prefetch.clear();
+                offsets_within_pages.clear();
                 for (const u32& neighbor_id : neighbors) {
                     PID page_id = getNodePID(neighbor_id);
                     pages_to_prefetch.push_back(page_id);
@@ -310,10 +311,10 @@ std::vector<std::pair<float, u32>> HNSW<Dim, DistanceMetric>::searchLayer(
         }
 
         // --- Prefetch the next best candidate from the queue (this part was correct) ---
-        if (!candidate_queue.empty()) {
-            PID next_candidate_pid = getNodePID(candidate_queue.top().second);
-            bm.prefetchPages(&next_candidate_pid, 1);
-        }
+        // if (!candidate_queue.empty()) {
+        //     PID next_candidate_pid = getNodePID(candidate_queue.top().second);
+        //     bm.prefetchPages(&next_candidate_pid, 1);
+        // }
     }
 
     std::vector<std::pair<float, u32>> results;
