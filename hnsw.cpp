@@ -247,7 +247,10 @@ std::vector<std::pair<float, u32>> HNSW<Dim, DistanceMetric>::searchLayer(
     } catch (const OLCRestartException&) {
         return {};
     }
-
+    std::vector<PID> pages_to_prefetch;
+    std::vector<u32> offsets_within_pages;
+    pages_to_prefetch.reserve(24);
+    offsets_within_pages.reserve(24);
     while (!candidate_queue.empty()) {
         auto current_pair = candidate_queue.top();
         candidate_queue.pop();
@@ -257,8 +260,6 @@ std::vector<std::pair<float, u32>> HNSW<Dim, DistanceMetric>::searchLayer(
         }
 
         // Collect unique pages and prefetch them all at once
-        std::vector<PID> pages_to_prefetch;
-        pages_to_prefetch.reserve(24);
         u32 current_id = current_pair.second;
         try {
             GuardO<HNSWPage> current_page_guard(getNodePID(current_id));
@@ -278,10 +279,11 @@ std::vector<std::pair<float, u32>> HNSW<Dim, DistanceMetric>::searchLayer(
                 for (const u32& neighbor_id : neighbors) {
                     PID page_id = getNodePID(neighbor_id);
                     pages_to_prefetch.push_back(page_id);
+                    offsets_within_pages.push_back(NodeAccessor::getVectorOffset(this, neighbor_id));
                 }
                 
                 if (!pages_to_prefetch.empty()) {
-                    bm.prefetchPages(pages_to_prefetch.data(), pages_to_prefetch.size());
+                    bm.prefetchPages(pages_to_prefetch.data(), pages_to_prefetch.size(), offsets_within_pages.data());
                 }
             }
             

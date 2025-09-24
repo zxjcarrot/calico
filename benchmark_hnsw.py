@@ -168,6 +168,11 @@ if __name__ == "__main__":
         X_base = read_fvecs(BASE_FILE)
         X_query = read_fvecs(QUERY_FILE)
         ground_truth = read_ivecs(GT_FILE)
+        
+        # Duplicate X_query 10 times
+        X_query = np.tile(X_query, (10, 1))
+        ground_truth = np.tile(ground_truth, (10, 1))
+        
         print(f"Base vectors shape: {X_base.shape}")
         print(f"Query vectors shape: {X_query.shape}")
         print(f"Ground truth shape: {ground_truth.shape}")

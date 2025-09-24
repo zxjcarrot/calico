@@ -213,9 +213,9 @@ class HNSW {
             const u8* node_start = page->getNodeData() + node_index * hnsw->FixedNodeSize;
             return reinterpret_cast<const float*>(node_start);
         }
-        
-        u32 getVectorOffset() const {
-            return HNSWPage::HeaderSize + node_index * hnsw->FixedNodeSize;
+
+        static u32 getVectorOffset(HNSW* hnsw, u32 graph_node_id) {
+            return HNSWPage::HeaderSize + hnsw->getNodeIndexInPage(graph_node_id) * hnsw->FixedNodeSize;
         }
         
         const u16* getLevelCounts() const {

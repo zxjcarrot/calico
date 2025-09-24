@@ -325,7 +325,7 @@ struct BufferManager {
     Page* handleFault(PID pid);
     void readPage(PID pid, Page* dest);
     void evict();
-    void prefetchPages(const PID* pages, int n_pages);
+    void prefetchPages(const PID* pages, int n_pages, const u32* offsets_within_pages = nullptr);
 
     Page* acquireFrameForPid(PID pid);
     void releaseFrame(PID pid);

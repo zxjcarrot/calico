@@ -782,7 +782,7 @@ void BufferManager::evict() {
     physUsedCount -= toEvict.size();
 }
 
-void BufferManager::prefetchPages(const PID* pages, int n_pages) {
+void BufferManager::prefetchPages(const PID* pages, int n_pages, const u32* offsets_within_pages) {
     if (n_pages == 0) return;
     // if (!useTraditional) {
     //    // For mmap mode, all pages are always "resident"
@@ -812,6 +812,11 @@ void BufferManager::prefetchPages(const PID* pages, int n_pages) {
 
         // Skip pages that are already in memory (not evicted)
         if (state != PageState::Evicted) {
+            if (offsets_within_pages != nullptr) {
+                  // Touch the page to bring it into cache
+                  char *tmp = (((char*)residentPtr(pid)) + offsets_within_pages[i]);
+                  _mm_prefetch(reinterpret_cast<const char*>(tmp), _MM_HINT_T0);
+            }
             continue;
         }
 
