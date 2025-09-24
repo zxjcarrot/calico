@@ -52,6 +52,6 @@ calico_module = Extension(
 setup(
     name='calico_py',
     version='0.1',
-    description='Python bindings for Calico Index(B-Tree, HNSW)',
+    description='Python bindings for Calico Index HNSW',
     ext_modules=[calico_module],
 )

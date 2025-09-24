@@ -26,7 +26,7 @@ Modern database systems face a fundamental trade-off when choosing buffer pool i
 - ❌ **Translation overhead**: Hash collisions and pointer chasing hurt in-memory performance
 - ❌ **Concurrency complexity**: Fine-grained locking and resize operations create bottlenecks
 
-### Kernel Solutions (`exmap`)
+### Kernel Solutions (`exmap`/`libdbos`)
 - ✅ **Best of both worlds**: Fast in-memory and I/O performance through kernel optimizations
 - ❌ **Deployment complexity**: Requires custom kernel modules and security considerations
 - ❌ **Limited huge page support**: Still constrained by mmap's granularity issues
@@ -240,6 +240,12 @@ The key insights are:
 
 The result is a buffer pool that delivers mmap-like performance for in-memory workloads while providing the control and I/O efficiency needed for complex database systems. Experimental validation across random access, B-tree index operations, and graph traversal workloads consistently demonstrates that Calico's array translator matches or exceeds direct memory mapping performance while maintaining full user-space control over buffer management.
 
+## Related Work
+
+* Enhancing Transaction Processing through Indirection Skipping: https://dl.acm.org/doi/pdf/10.14778/3749646.3749680  Limitations: https://chatgpt.com/share/68d1ac43-1990-800b-821b-ffea0450e4c0
+* VMCache
+* libdbos/Tabby
+* ScaleCache: https://www.vldb.org/pvldb/vol18/p5073-liu.pdf  Limitations: https://chatgpt.com/share/68d1f201-d5b0-800b-af53-806a24df4dc1
 ## Future Work
 
 While Calico's array translator achieves excellent performance, there are opportunities to further optimize memory usage through advanced OS integration techniques:

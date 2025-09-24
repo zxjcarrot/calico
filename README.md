@@ -1,6 +1,11 @@
-# vmcache
+# Calico
+Calico is a high-performance buffer pool that combines the best aspects of different memory management approaches:
 
-Code repository for SIGMOD'23 paper [Virtual-Memory Assisted Buffer Management](https://www.cs.cit.tum.de/fileadmin/w00cfj/dis/_my_direct_uploads/vmcache.pdf). This is the buffer manager implementation. [exmap](https://github.com/tuhhosg/exmap) is in a separate repository.
+* In-memory performance that matches or exceeds mmap's direct virtual memory access
+* Out-of-memory efficiency that rivals specialized kernel solutions like exmap
+* User-space control without requiring custom kernel modules or complex deployment
+
+The key insight is that user-space indirection with huge page optimization can eliminate the traditional performance trade-offs between direct memory mapping and flexible buffer pool management.
 
 ## Automated Experiments
 
@@ -40,6 +45,13 @@ This script evaluates all buffer management strategies using a breadth-first sea
 The graph BFS benchmark creates a synthetic graph with configurable size and performs breadth-first traversal, which exercises random memory access patterns typical of graph algorithms. Results include traversal time and detailed performance counters (LLC misses, DTLB misses, IPC).
 
 Results are stored in `exps/in-memory/graph_bfs/` with automatic extraction to `graph_results_summary.csv` and detailed analysis in `graph_analysis.txt`.
+
+## Pybind
+```bash
+git submodule update --init --recursive
+python setup.py build_ext --inplace
+python test.py
+```
 
 ## Environment Variables
 
