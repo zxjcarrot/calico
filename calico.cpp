@@ -1619,13 +1619,6 @@ void initialize_system() {
         setenv("PHYSGB", "16", 0);
         
         bm_ptr = new BufferManager();
-        
-        try {
-            GuardX<MetaDataPage> page(metadataPageId);
-        } catch (...) {
-            // Handle cases where the file might be new or corrupt
-            std::cerr << "Metadata page initialization might be needed." << std::endl;
-        }
     }
 }
 
