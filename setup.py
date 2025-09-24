@@ -1,7 +1,11 @@
 import sys
+import os
 from setuptools import setup, Extension
-import pybind11
 import glob # Used to find all source files in a directory
+
+# Get pybind11 include directory
+import pybind11
+pybind11_include = pybind11.get_include()
 
 # Find all C++ source files in the tpcc directory
 tpcc_sources = glob.glob('tpcc/*.pp')
@@ -34,7 +38,7 @@ calico_module = Extension(
     
     # Include directories for header files.
     include_dirs=[
-        pybind11.get_include(),
+        pybind11_include,
         '.',      # Current directory for calico.hpp
         'tpcc'    # Directory for tpcc headers
     ],

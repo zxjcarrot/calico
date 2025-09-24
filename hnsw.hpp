@@ -101,11 +101,7 @@ struct HNSWMetadataPage {
 // --- HNSW Main Class ---
 
 template <size_t Dim,  // Vector dimension.
-          typename DistanceMetric = hnsw_distance::SIMDAcceleratedL2,
-          size_t M = 16,                // Max number of neighbors for layers > 0.
-          size_t M0 = 32,               // Max number of neighbors for layer 0.
-          size_t efConstruction = 200,  // Number of neighbors to search during index construction.
-          size_t MaxLevel = 16          // Pre-estimated max level for random level generation.
+          typename DistanceMetric = hnsw_distance::SIMDAcceleratedL2
           >
 class HNSW {
    public:
@@ -116,12 +112,18 @@ class HNSW {
         u32 level;             // The actual highest level of this node.
     };
 
-    // --- Worst-case size calculation for a single node ---
-    static constexpr size_t MaxNeighborsHeaderSize = MaxLevel * sizeof(u16);
-    static constexpr size_t MaxNeighborsListSize = (M0 + (MaxLevel - 1) * M) * sizeof(PID);
+    // --- Runtime parameters (formerly template parameters) ---
+    const size_t M;                    // Max number of neighbors for layers > 0
+    const size_t M0;                   // Max number of neighbors for layer 0 (computed as 2*M)
+    const size_t efConstruction;       // Number of neighbors to search during index construction
+    const size_t MaxLevel;             // Pre-estimated max level for random level generation
+    
+    // --- Runtime size calculations for a single node ---
+    const size_t MaxNeighborsHeaderSize;  // MaxLevel * sizeof(u16)
+    const size_t MaxNeighborsListSize;    // (M0 + (MaxLevel - 1) * M) * sizeof(u32)
     static constexpr size_t VectorSize = Dim * sizeof(float);
-    static constexpr size_t MaxNodeHeapSize = VectorSize + MaxNeighborsHeaderSize + MaxNeighborsListSize;
-    static constexpr size_t MaxNodeTotalSize = sizeof(HNSWNodeSlot) + MaxNodeHeapSize;
+    const size_t MaxNodeHeapSize;         // VectorSize + MaxNeighborsHeaderSize + MaxNeighborsListSize
+    const size_t MaxNodeTotalSize;        // sizeof(HNSWNodeSlot) + MaxNodeHeapSize
 
     // HNSW data page: uses a slot/heap layout for high space efficiency.
     struct HNSWPage {
@@ -131,12 +133,19 @@ class HNSW {
         u32 padding;
 
         static constexpr size_t HeaderSize = sizeof(dirty) + sizeof(node_count) + sizeof(data_offset) + sizeof(padding);
-        static constexpr size_t MaxNodesPerPage = (pageSize - HeaderSize) / MaxNodeTotalSize;
-        static_assert(MaxNodesPerPage > 0, "Page size is too small to fit even one node in the worst case.");
-        HNSWNodeSlot slots[MaxNodesPerPage];
+        
+        // Get slots array (dynamic based on runtime parameters)
+        HNSWNodeSlot* getSlots() {
+            return reinterpret_cast<HNSWNodeSlot*>(reinterpret_cast<u8*>(this) + HeaderSize);
+        }
+        
+        const HNSWNodeSlot* getSlots() const {
+            return reinterpret_cast<const HNSWNodeSlot*>(reinterpret_cast<const u8*>(this) + HeaderSize);
+        }
     };
-
-    static constexpr size_t NodesPerPage = HNSWPage::MaxNodesPerPage;
+    
+    const size_t MaxNodesPerPage;  // Runtime computed: (pageSize - HNSWPage::HeaderSize) / MaxNodeTotalSize
+    const size_t NodesPerPage;     // Same as MaxNodesPerPage
 
    private:
     PID metadata_pid;
@@ -146,9 +155,15 @@ class HNSW {
     std::unique_ptr<VisitedListPool> visited_list_pool_{nullptr};
 
    public:
-    // Constructor
-    HNSW(u64 max_elements);
+    // Constructor with runtime parameters
+    HNSW(u64 max_elements, size_t M = 16, size_t ef_construction = 200);
     ~HNSW() { visited_list_pool_.reset(nullptr); }
+    
+   private:
+    // Helper function to estimate MaxLevel from max_elements
+    static size_t estimateMaxLevel(u64 max_elements, size_t M);
+    
+   public:
 
     // Add a point to the index.
     void addPoint(const float* point, u32& node_id_out);
@@ -167,11 +182,17 @@ class HNSW {
     HNSW(HNSW&&) = delete;
     HNSW& operator=(HNSW&&) = delete;
     PID getMetadataPid() const { return metadata_pid; }
+    
+    // Get buffer manager statistics
+    u64 getBufferManagerAllocCount() const;
+    
+    // Print comprehensive index information
+    std::string getIndexInfo() const;
 
    private:
     // --- Internal Helper Classes & Functions ---
-    PID getNodePID(u32 node_id) const;
-    u32 getSlotIndexInPage(u32 node_id) const;
+    inline PID getNodePID(u32 node_id) const;
+    inline u32 getSlotIndexInPage(u32 node_id) const;
 
     class NodeAccessor {
        private:
@@ -179,28 +200,31 @@ class HNSW {
         const HNSWNodeSlot* slot;
 
        public:
-        NodeAccessor(const HNSWPage* p, u32 slot_index) : page(p), slot(&p->slots[slot_index]) {}
+        NodeAccessor(const HNSWPage* p, u32 slot_index) : page(p), slot(&p->getSlots()[slot_index]) {}
         u32 getLevel() const { return slot->level; }
         const float* getVector() const {
             return reinterpret_cast<const float*>(reinterpret_cast<const u8*>(page) + slot->vector_offset);
         }
+        u32 getVectorOffset() const {
+            return slot->vector_offset;
+        }
 
-        std::span<const PID> getNeighbors(u32 level) const {
+        std::span<const u32> getNeighbors(u32 level, const HNSW* hnsw_instance) const {
             const u8* base_ptr = reinterpret_cast<const u8*>(page) + slot->neighbors_offset;
             const u16* counts_per_level = reinterpret_cast<const u16*>(base_ptr);
-            if (level >= MaxLevel || level > slot->level) return {};
+            if (level >= hnsw_instance->MaxLevel || level > slot->level) return {};
 
-            u32 pids_start_offset = MaxLevel * sizeof(u16);
-            u32 level_pid_offset_count = 0;
+            u32 neighbor_ids_start_offset = hnsw_instance->MaxLevel * sizeof(u16);
+            u32 level_neighbor_offset_count = 0;
             if (level > 0) {
-                level_pid_offset_count += M0;
+                level_neighbor_offset_count += hnsw_instance->M0;
                 for (u32 i = 1; i < level; ++i) {
-                    level_pid_offset_count += M;
+                    level_neighbor_offset_count += hnsw_instance->M;
                 }
             }
 
-            const PID* level_start_ptr =
-                reinterpret_cast<const PID*>(base_ptr + pids_start_offset) + level_pid_offset_count;
+            const u32* level_start_ptr =
+                reinterpret_cast<const u32*>(base_ptr + neighbor_ids_start_offset) + level_neighbor_offset_count;
             u16 count_for_level = counts_per_level[level];
             return {level_start_ptr, count_for_level};
         }
@@ -213,45 +237,45 @@ class HNSW {
         const HNSWNodeSlot* slot;
 
        public:
-        MutableNodeAccessor(HNSWPage* p, u32 slot_index) : page(p), slot(&p->slots[slot_index]) {}
+        MutableNodeAccessor(HNSWPage* p, u32 slot_index) : page(p), slot(&p->getSlots()[slot_index]) {}
         const float* getVector() const {
             return reinterpret_cast<const float*>(reinterpret_cast<const u8*>(page) + slot->vector_offset);
         }
-        std::span<const PID> getNeighbors(u32 level) const {
+        std::span<const u32> getNeighbors(u32 level, const HNSW* hnsw_instance) const {
             const u8* base_ptr = reinterpret_cast<const u8*>(page) + slot->neighbors_offset;
             const u16* counts_per_level = reinterpret_cast<const u16*>(base_ptr);
-            if (level >= MaxLevel || level > slot->level) return {};
+            if (level >= hnsw_instance->MaxLevel || level > slot->level) return {};
 
-            u32 pids_start_offset = MaxLevel * sizeof(u16);
-            u32 level_pid_offset_count = 0;
+            u32 neighbor_ids_start_offset = hnsw_instance->MaxLevel * sizeof(u16);
+            u32 level_neighbor_offset_count = 0;
             if (level > 0) {
-                level_pid_offset_count += M0;
+                level_neighbor_offset_count += hnsw_instance->M0;
                 for (u32 i = 1; i < level; ++i) {
-                    level_pid_offset_count += M;
+                    level_neighbor_offset_count += hnsw_instance->M;
                 }
             }
 
-            const PID* level_start_ptr =
-                reinterpret_cast<const PID*>(base_ptr + pids_start_offset) + level_pid_offset_count;
+            const u32* level_start_ptr =
+                reinterpret_cast<const u32*>(base_ptr + neighbor_ids_start_offset) + level_neighbor_offset_count;
             u16 count_for_level = counts_per_level[level];
             return {level_start_ptr, count_for_level};
         }
-        void setNeighbors(u32 level, const std::vector<PID>& new_neighbors) {
+        void setNeighbors(u32 level, const std::vector<u32>& new_neighbors, const HNSW* hnsw_instance) {
             u8* base_ptr = reinterpret_cast<u8*>(page) + slot->neighbors_offset;
             u16* counts_per_level = reinterpret_cast<u16*>(base_ptr);
-            if (level >= MaxLevel) return;
+            if (level >= hnsw_instance->MaxLevel) return;
 
-            u32 pids_start_offset = MaxLevel * sizeof(u16);
-            u32 level_pid_offset_count = 0;
+            u32 neighbor_ids_start_offset = hnsw_instance->MaxLevel * sizeof(u16);
+            u32 level_neighbor_offset_count = 0;
             if (level > 0) {
-                level_pid_offset_count += M0;
+                level_neighbor_offset_count += hnsw_instance->M0;
                 for (u32 i = 1; i < level; ++i) {
-                    level_pid_offset_count += M;
+                    level_neighbor_offset_count += hnsw_instance->M;
                 }
             }
 
-            PID* level_start_ptr = reinterpret_cast<PID*>(base_ptr + pids_start_offset) + level_pid_offset_count;
-            size_t M_level = (level == 0) ? M0 : M;
+            u32* level_start_ptr = reinterpret_cast<u32*>(base_ptr + neighbor_ids_start_offset) + level_neighbor_offset_count;
+            size_t M_level = (level == 0) ? hnsw_instance->M0 : hnsw_instance->M;
 
             size_t count_to_copy = std::min(new_neighbors.size(), M_level);
             std::copy(new_neighbors.begin(), new_neighbors.begin() + count_to_copy, level_start_ptr);

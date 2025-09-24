@@ -57,8 +57,8 @@ PYBIND11_MODULE(calico_py, m) {
     });
 
     py::class_<HnswIndexType>(m, "HnswIndex")
-        .def(py::init<u64>(), py::arg("max_elements"),
-             "Initializes a new, empty HNSW index with a given maximum capacity.")
+        .def(py::init<u64, size_t, size_t>(), py::arg("max_elements"), py::arg("M") = 16, py::arg("ef_construction") = 200,
+             "Initializes a new, empty HNSW index with runtime parameters.")
 
         .def(
             "add_points",
@@ -237,5 +237,11 @@ PYBIND11_MODULE(calico_py, m) {
     num_threads : int, optional
         The number of threads to use for adding items. If 0, it defaults to the
         number of hardware cores. (default: 0)
-    )doc");
+    )doc")
+
+        .def("get_buffer_manager_alloc_count", &HnswIndexType::getBufferManagerAllocCount,
+             "Returns the current allocation count from the buffer manager.")
+
+        .def("get_index_info", &HnswIndexType::getIndexInfo,
+             "Returns comprehensive information about the HNSW index including configuration, metadata, and statistics.");
 }

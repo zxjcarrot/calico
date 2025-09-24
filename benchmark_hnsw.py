@@ -73,13 +73,18 @@ def benchmark_calico(X_base, X_query, ground_truth, params):
     index_calico.add_items(X_base_float32)
 
     build_time = time.time() - start_time
+    # print buffer pool allocated pages
+    alloc_count = index_calico.get_buffer_manager_alloc_count()
+    index_info = index_calico.get_index_info()
+    print(f"Buffer Manager Alloc Count: {alloc_count}")
+    
     print(f"Build time: {build_time:.4f} seconds")
     ef_search = params.get("ef_search", 50)
     print(f"Querying for k={k} nearest neighbors with ef_search={ef_search}...")
 
     start_time = time.time()
 
-    labels, distances = index_calico.search_knn_parallel(X_query_float32, k, ef_search, 0)
+    labels, distances = index_calico.search_knn_parallel(X_query_float32, k, ef_search, 1)
 
     search_time = time.time() - start_time
     qps = len(X_query) / search_time
@@ -127,7 +132,7 @@ def benchmark_hnswlib(X_base, X_query, ground_truth, params):
 
     start_time = time.time()
 
-    labels, distances = p.knn_query(X_query_float32, k=k, num_threads=-1)
+    labels, distances = p.knn_query(X_query_float32, k=k, num_threads=1)
 
     search_time = time.time() - start_time
     qps = len(X_query) / search_time
@@ -143,7 +148,7 @@ def benchmark_hnswlib(X_base, X_query, ground_truth, params):
 
 if __name__ == "__main__":
     
-    dataset_name = "sift10m"
+    dataset_name = "sift1m"
     
     if dataset_name == "sift1m":
     
