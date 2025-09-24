@@ -579,7 +579,7 @@ HNSW<Dim, DistanceMetric, M, M0, efConstruction, MaxLevel>::searchKnn_parallel(s
         std::vector<std::future<void>> futures;
         futures.reserve(num_queries);
         for (size_t i = 0; i < num_queries; ++i) {
-            futures.emplace_back(pool.enqueue([this, &all_results, queries_data = queries.data(), i, k]() {
+            futures.emplace_back(pool.enqueue([this, &all_results, queries_data = queries.data(), i, k, ef_search_param]() {
                 all_results[i] = this->searchKnn(queries_data + i * Dim, k, ef_search_param);
             }));
         }
