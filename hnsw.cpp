@@ -572,7 +572,7 @@ HNSW<Dim, DistanceMetric, M, M0, efConstruction, MaxLevel>::searchKnn_parallel(s
     std::vector<std::vector<std::pair<float, u32>>> all_results(num_queries);
     if (threads_to_use <= 1) {
         for (size_t i = 0; i < num_queries; ++i) {
-            all_results[i] = searchKnn(queries.data() + i * Dim, k);
+            all_results[i] = searchKnn(queries.data() + i * Dim, k, ef_search_param);
         }
     } else {
         ThreadPool pool(threads_to_use);
