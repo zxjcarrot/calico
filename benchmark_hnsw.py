@@ -77,7 +77,7 @@ def benchmark_calico(X_base, X_query, ground_truth, params):
     alloc_count = index_calico.get_buffer_manager_alloc_count()
     index_info = index_calico.get_index_info()
     print(f"Buffer Manager Alloc Count: {alloc_count}")
-    
+    print(index_info)
     print(f"Build time: {build_time:.4f} seconds")
     ef_search = params.get("ef_search", 50)
     print(f"Querying for k={k} nearest neighbors with ef_search={ef_search}...")

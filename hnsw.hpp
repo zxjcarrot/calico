@@ -105,12 +105,9 @@ template <size_t Dim,  // Vector dimension.
           >
 class HNSW {
    public:
-    // Node slot within a page: a small, fixed-size metadata structure.
-    struct HNSWNodeSlot {
-        u16 vector_offset;     // Offset to the vector data in the page's heap area.
-        u16 neighbors_offset;  // Offset to the neighbor list in the page's heap area.
-        u32 level;             // The actual highest level of this node.
-    };
+    // Fixed-size node layout (no more slots/indirection):
+    // Each node has: [Vector Data][Level Counts][Neighbor IDs]
+    // Node size is constant and computed at runtime
 
     // --- Runtime parameters (formerly template parameters) ---
     const size_t M;                    // Max number of neighbors for layers > 0
@@ -118,33 +115,31 @@ class HNSW {
     const size_t efConstruction;       // Number of neighbors to search during index construction
     const size_t MaxLevel;             // Pre-estimated max level for random level generation
     
-    // --- Runtime size calculations for a single node ---
-    const size_t MaxNeighborsHeaderSize;  // MaxLevel * sizeof(u16)
-    const size_t MaxNeighborsListSize;    // (M0 + (MaxLevel - 1) * M) * sizeof(u32)
+    // --- Runtime size calculations for fixed-size nodes ---
+    const size_t MaxNeighborsHeaderSize;  // MaxLevel * sizeof(u16) - level counts
+    const size_t MaxNeighborsListSize;    // (M0 + (MaxLevel - 1) * M) * sizeof(u32) - neighbor IDs
     static constexpr size_t VectorSize = Dim * sizeof(float);
-    const size_t MaxNodeHeapSize;         // VectorSize + MaxNeighborsHeaderSize + MaxNeighborsListSize
-    const size_t MaxNodeTotalSize;        // sizeof(HNSWNodeSlot) + MaxNodeHeapSize
+    const size_t FixedNodeSize;           // VectorSize + MaxNeighborsHeaderSize + MaxNeighborsListSize
 
-    // HNSW data page: uses a slot/heap layout for high space efficiency.
+    // HNSW data page: uses fixed-size node grid layout for direct access.
     struct HNSWPage {
         bool dirty;
         u16 node_count;
-        u16 data_offset;
-        u32 padding;
+        u16 padding[3];  // Align to 8 bytes
 
-        static constexpr size_t HeaderSize = sizeof(dirty) + sizeof(node_count) + sizeof(data_offset) + sizeof(padding);
+        static constexpr size_t HeaderSize = sizeof(dirty) + sizeof(node_count) + sizeof(padding);
         
-        // Get slots array (dynamic based on runtime parameters)
-        HNSWNodeSlot* getSlots() {
-            return reinterpret_cast<HNSWNodeSlot*>(reinterpret_cast<u8*>(this) + HeaderSize);
+        // Get node data area (nodes start immediately after header)
+        u8* getNodeData() {
+            return reinterpret_cast<u8*>(this) + HeaderSize;
         }
         
-        const HNSWNodeSlot* getSlots() const {
-            return reinterpret_cast<const HNSWNodeSlot*>(reinterpret_cast<const u8*>(this) + HeaderSize);
+        const u8* getNodeData() const {
+            return reinterpret_cast<const u8*>(this) + HeaderSize;
         }
     };
     
-    const size_t MaxNodesPerPage;  // Runtime computed: (pageSize - HNSWPage::HeaderSize) / MaxNodeTotalSize
+    const size_t MaxNodesPerPage;  // Runtime computed: (pageSize - HNSWPage::HeaderSize) / FixedNodeSize
     const size_t NodesPerPage;     // Same as MaxNodesPerPage
 
    private:
@@ -192,29 +187,46 @@ class HNSW {
    private:
     // --- Internal Helper Classes & Functions ---
     inline PID getNodePID(u32 node_id) const;
-    inline u32 getSlotIndexInPage(u32 node_id) const;
+    inline u32 getNodeIndexInPage(u32 node_id) const;
 
     class NodeAccessor {
        private:
         const HNSWPage* page;
-        const HNSWNodeSlot* slot;
+        u32 node_index;
+        const HNSW* hnsw;
 
        public:
-        NodeAccessor(const HNSWPage* p, u32 slot_index) : page(p), slot(&p->getSlots()[slot_index]) {}
-        u32 getLevel() const { return slot->level; }
-        const float* getVector() const {
-            return reinterpret_cast<const float*>(reinterpret_cast<const u8*>(page) + slot->vector_offset);
+        NodeAccessor(const HNSWPage* p, u32 node_idx, const HNSW* hnsw_instance) 
+            : page(p), node_index(node_idx), hnsw(hnsw_instance) {}
+            
+        u32 getLevel() const { 
+            // Level is stored as the maximum non-zero count in the level counts array
+            const u16* counts = getLevelCounts();
+            u32 max_level = 0;
+            for (u32 i = 0; i < hnsw->MaxLevel; ++i) {
+                if (counts[i] > 0) max_level = i;
+            }
+            return max_level;
         }
+        
+        const float* getVector() const {
+            const u8* node_start = page->getNodeData() + node_index * hnsw->FixedNodeSize;
+            return reinterpret_cast<const float*>(node_start);
+        }
+        
         u32 getVectorOffset() const {
-            return slot->vector_offset;
+            return HNSWPage::HeaderSize + node_index * hnsw->FixedNodeSize;
+        }
+        
+        const u16* getLevelCounts() const {
+            const u8* node_start = page->getNodeData() + node_index * hnsw->FixedNodeSize;
+            return reinterpret_cast<const u16*>(node_start + VectorSize);
         }
 
         std::span<const u32> getNeighbors(u32 level, const HNSW* hnsw_instance) const {
-            const u8* base_ptr = reinterpret_cast<const u8*>(page) + slot->neighbors_offset;
-            const u16* counts_per_level = reinterpret_cast<const u16*>(base_ptr);
-            if (level >= hnsw_instance->MaxLevel || level > slot->level) return {};
+            const u16* counts_per_level = getLevelCounts();
+            if (level >= hnsw_instance->MaxLevel) return {};
 
-            u32 neighbor_ids_start_offset = hnsw_instance->MaxLevel * sizeof(u16);
             u32 level_neighbor_offset_count = 0;
             if (level > 0) {
                 level_neighbor_offset_count += hnsw_instance->M0;
@@ -223,8 +235,10 @@ class HNSW {
                 }
             }
 
-            const u32* level_start_ptr =
-                reinterpret_cast<const u32*>(base_ptr + neighbor_ids_start_offset) + level_neighbor_offset_count;
+            const u8* node_start = page->getNodeData() + node_index * hnsw->FixedNodeSize;
+            const u32* neighbor_ids_start = reinterpret_cast<const u32*>(
+                node_start + VectorSize + hnsw_instance->MaxNeighborsHeaderSize);
+            const u32* level_start_ptr = neighbor_ids_start + level_neighbor_offset_count;
             u16 count_for_level = counts_per_level[level];
             return {level_start_ptr, count_for_level};
         }
@@ -234,19 +248,37 @@ class HNSW {
     class MutableNodeAccessor {
        private:
         HNSWPage* page;
-        const HNSWNodeSlot* slot;
+        u32 node_index;
+        const HNSW* hnsw;
 
        public:
-        MutableNodeAccessor(HNSWPage* p, u32 slot_index) : page(p), slot(&p->getSlots()[slot_index]) {}
+        MutableNodeAccessor(HNSWPage* p, u32 node_idx, const HNSW* hnsw_instance) 
+            : page(p), node_index(node_idx), hnsw(hnsw_instance) {}
+            
         const float* getVector() const {
-            return reinterpret_cast<const float*>(reinterpret_cast<const u8*>(page) + slot->vector_offset);
+            const u8* node_start = page->getNodeData() + node_index * hnsw->FixedNodeSize;
+            return reinterpret_cast<const float*>(node_start);
         }
+        
+        float* getVector() {
+            u8* node_start = page->getNodeData() + node_index * hnsw->FixedNodeSize;
+            return reinterpret_cast<float*>(node_start);
+        }
+        
+        u16* getLevelCounts() {
+            u8* node_start = page->getNodeData() + node_index * hnsw->FixedNodeSize;
+            return reinterpret_cast<u16*>(node_start + VectorSize);
+        }
+        
+        const u16* getLevelCounts() const {
+            const u8* node_start = page->getNodeData() + node_index * hnsw->FixedNodeSize;
+            return reinterpret_cast<const u16*>(node_start + VectorSize);
+        }
+        
         std::span<const u32> getNeighbors(u32 level, const HNSW* hnsw_instance) const {
-            const u8* base_ptr = reinterpret_cast<const u8*>(page) + slot->neighbors_offset;
-            const u16* counts_per_level = reinterpret_cast<const u16*>(base_ptr);
-            if (level >= hnsw_instance->MaxLevel || level > slot->level) return {};
+            const u16* counts_per_level = getLevelCounts();
+            if (level >= hnsw_instance->MaxLevel) return {};
 
-            u32 neighbor_ids_start_offset = hnsw_instance->MaxLevel * sizeof(u16);
             u32 level_neighbor_offset_count = 0;
             if (level > 0) {
                 level_neighbor_offset_count += hnsw_instance->M0;
@@ -255,17 +287,18 @@ class HNSW {
                 }
             }
 
-            const u32* level_start_ptr =
-                reinterpret_cast<const u32*>(base_ptr + neighbor_ids_start_offset) + level_neighbor_offset_count;
+            const u8* node_start = page->getNodeData() + node_index * hnsw->FixedNodeSize;
+            const u32* neighbor_ids_start = reinterpret_cast<const u32*>(
+                node_start + VectorSize + hnsw_instance->MaxNeighborsHeaderSize);
+            const u32* level_start_ptr = neighbor_ids_start + level_neighbor_offset_count;
             u16 count_for_level = counts_per_level[level];
             return {level_start_ptr, count_for_level};
         }
+        
         void setNeighbors(u32 level, const std::vector<u32>& new_neighbors, const HNSW* hnsw_instance) {
-            u8* base_ptr = reinterpret_cast<u8*>(page) + slot->neighbors_offset;
-            u16* counts_per_level = reinterpret_cast<u16*>(base_ptr);
+            u16* counts_per_level = getLevelCounts();
             if (level >= hnsw_instance->MaxLevel) return;
 
-            u32 neighbor_ids_start_offset = hnsw_instance->MaxLevel * sizeof(u16);
             u32 level_neighbor_offset_count = 0;
             if (level > 0) {
                 level_neighbor_offset_count += hnsw_instance->M0;
@@ -274,7 +307,10 @@ class HNSW {
                 }
             }
 
-            u32* level_start_ptr = reinterpret_cast<u32*>(base_ptr + neighbor_ids_start_offset) + level_neighbor_offset_count;
+            u8* node_start = page->getNodeData() + node_index * hnsw->FixedNodeSize;
+            u32* neighbor_ids_start = reinterpret_cast<u32*>(
+                node_start + VectorSize + hnsw_instance->MaxNeighborsHeaderSize);
+            u32* level_start_ptr = neighbor_ids_start + level_neighbor_offset_count;
             size_t M_level = (level == 0) ? hnsw_instance->M0 : hnsw_instance->M;
 
             size_t count_to_copy = std::min(new_neighbors.size(), M_level);
