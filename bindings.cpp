@@ -12,6 +12,59 @@
 #include "distance.hpp"
 #include "hnsw.hpp"
 
+#if defined(_WIN32)
+#include <psapi.h>
+#include <windows.h>
+
+size_t getCurrentRSS() {
+    PROCESS_MEMORY_COUNTERS pmc;
+    if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) {
+        return pmc.WorkingSetSize;
+    }
+    return 0;
+}
+
+#elif defined(__APPLE__)
+#include <mach/mach.h>
+
+size_t getCurrentRSS() {
+    mach_task_basic_info info;
+    mach_msg_type_number_t infoCount = MACH_TASK_BASIC_INFO_COUNT;
+    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t)&info, &infoCount) != KERN_SUCCESS) {
+        return 0;
+    }
+    return info.resident_size;
+}
+
+#else  // Assuming Linux
+#include <unistd.h>
+
+#include <fstream>
+#include <ios>
+#include <iostream>
+#include <string>
+
+size_t getCurrentRSS() {
+    std::ifstream status_file("/proc/self/status");
+    if (!status_file) {
+        return 0;
+    }
+    std::string line;
+    while (std::getline(status_file, line)) {
+        if (line.rfind("VmRSS:", 0) == 0) {
+            try {
+                // Format is "VmRSS:     12345 kB"
+                size_t rss_kb = std::stoul(line.substr(line.find_first_of("0123456789")));
+                return rss_kb * 1024;  // Convert kB to bytes
+            } catch (...) {
+                return 0;
+            }
+        }
+    }
+    return 0;
+}
+#endif
+
 namespace py = pybind11;
 
 // --- Forward declare init/shutdown functions from calico.cpp ---
@@ -57,8 +110,8 @@ PYBIND11_MODULE(calico_py, m) {
     });
 
     py::class_<HnswIndexType>(m, "HnswIndex")
-        .def(py::init<u64, size_t, size_t>(), py::arg("max_elements"), py::arg("M") = 16, py::arg("ef_construction") = 200,
-             "Initializes a new, empty HNSW index with runtime parameters.")
+        .def(py::init<u64, size_t, size_t>(), py::arg("max_elements"), py::arg("M") = 16,
+             py::arg("ef_construction") = 200, "Initializes a new, empty HNSW index with runtime parameters.")
 
         .def(
             "add_points",
@@ -91,7 +144,7 @@ PYBIND11_MODULE(calico_py, m) {
         .def(
             "search_knn",
             [](HnswIndexType& self, py::array_t<float, py::array::c_style | py::array::forcecast> query, size_t k,
-               size_t ef_search_param) -> py::object {
+               size_t ef_search_param, bool stats = false) -> py::object {
                 // Check input query vector dimensions
                 if (query.ndim() != 1) {
                     throw std::runtime_error("Query must be a 1-dimensional NumPy array");
@@ -102,7 +155,13 @@ PYBIND11_MODULE(calico_py, m) {
                 }
 
                 const float* query_ptr = query.data();
-                auto result_vec = self.searchKnn(query_ptr, k, ef_search_param);
+                std::vector<std::pair<float, u32>> result_vec;
+                if (stats) {
+                    result_vec = self.searchKnn<true>(query_ptr, k, ef_search_param);
+                }
+                else {
+                    result_vec = self.searchKnn<false>(query_ptr, k, ef_search_param);
+                }
 
                 // Create two Python lists to hold labels and distances
                 py::list labels;
@@ -116,13 +175,13 @@ PYBIND11_MODULE(calico_py, m) {
                 // Return a tuple of two NumPy arrays, similar to hnswlib
                 return py::make_tuple(py::array(labels), py::array(distances));
             },
-            py::arg("query"), py::arg("k"), py::arg("ef_search"),
+            py::arg("query"), py::arg("k"), py::arg("ef_search"), py::arg("stats") = false,
             "Searches for the k-nearest neighbors for a given query vector. Returns (labels, distances).")
 
         .def(
             "search_knn_parallel",
             [](HnswIndexType& self, py::array_t<float, py::array::c_style | py::array::forcecast> queries, size_t k,
-               size_t ef_search_param, size_t num_threads = 0) -> py::object {
+               size_t ef_search_param, size_t num_threads = 0, bool stats = false) -> py::object {
                 // --- 1. Validate Input ---
                 if (queries.ndim() != 2) {
                     throw std::runtime_error("Queries must be a 2-dimensional NumPy array of shape (num_queries, dim)");
@@ -148,7 +207,13 @@ PYBIND11_MODULE(calico_py, m) {
 
                 // --- 2. Prepare C++ data and call the parallel search function ---
                 std::span<const float> query_span(queries.data(), queries.size());
-                auto all_results_vec = self.searchKnn_parallel(query_span, k, ef_search_param, num_threads);
+                std::vector<std::vector<std::pair<float, u32>>> all_results_vec;
+                if (stats) {
+                    all_results_vec = self.searchKnn_parallel<true>(query_span, k, ef_search_param, num_threads);
+                }
+                else {
+                    all_results_vec = self.searchKnn_parallel(query_span, k, ef_search_param, num_threads);
+                }
 
                 // --- 3. Create output NumPy arrays ---
                 // Use int64_t for labels to be consistent with hnswlib and allow -1 as a sentinel
@@ -179,7 +244,7 @@ PYBIND11_MODULE(calico_py, m) {
                 // --- 5. Return a tuple of the two NumPy arrays ---
                 return py::make_tuple(labels_arr, distances_arr);
             },
-            py::arg("queries"), py::arg("k"), py::arg("ef_search"), py::arg("num_threads") = 0,
+            py::arg("queries"), py::arg("k"), py::arg("ef_search"), py::arg("num_threads") = 0, py::arg("stats") = false,
             R"doc(
     Searches for the k-nearest neighbors for a batch of query vectors in parallel.
 
@@ -195,7 +260,9 @@ PYBIND11_MODULE(calico_py, m) {
 
     num_threads : int, optional
         The number of threads to use for the search. If 0, it defaults to the
-        number of hardware cores. (default: 0)
+        number of hardware cores. (default: 0).
+    
+    stats: bool, optional
 
     Returns:
     --------
@@ -242,6 +309,62 @@ PYBIND11_MODULE(calico_py, m) {
         .def("get_buffer_manager_alloc_count", &HnswIndexType::getBufferManagerAllocCount,
              "Returns the current allocation count from the buffer manager.")
 
-        .def("get_index_info", &HnswIndexType::getIndexInfo,
-             "Returns comprehensive information about the HNSW index including configuration, metadata, and statistics.");
+        .def(
+            "get_index_info", &HnswIndexType::getIndexInfo,
+            "Returns comprehensive information about the HNSW index including configuration, metadata, and statistics.")
+
+        .def("reset_stats", &HnswIndexType::resetStats,
+             "Resets live statistics counters like distance computations and search hops.")
+
+        .def(
+            "get_stats_string", [](HnswIndexType& self) { return self.getStats().toString(); },
+            "Returns a formatted string of the current performance and graph structure statistics.")
+
+        .def(
+            "get_stats",
+            [](HnswIndexType& self) -> py::dict {
+                HNSWStats stats = self.getStats();
+                py::dict result;
+
+                result["dist_comps"] = stats.dist_comps.load();
+                result["search_hops"] = stats.search_hops.load();
+                result["num_levels"] = stats.num_levels;
+                result["nodes_per_level"] = py::cast(stats.nodes_per_level);
+                result["links_per_level"] = py::cast(stats.links_per_level);
+                result["avg_neighbors_per_level"] = py::cast(stats.avg_neighbors_per_level);
+                result["avg_neighbors_total"] = stats.avg_neighbors_total;
+
+                return result;
+            },
+            R"doc(
+    Returns a dictionary containing detailed performance and graph statistics.
+
+    Returns:
+    --------
+    dict:
+        A dictionary with the following keys:
+        - 'dist_comps': Total number of distance computations.
+        - 'search_hops': Total number of nodes visited during searches.
+        - 'num_levels': The number of levels in the graph.
+        - 'nodes_per_level': A list with the count of nodes on each level.
+        - 'links_per_level': A list with the total count of links on each level.
+        - 'avg_neighbors_per_level': A list with the average number of neighbors per node for each level.
+        - 'avg_neighbors_total': The average number of neighbors per node across the entire graph.
+    )doc")
+        .def(
+            "get_memory_usage",
+            [](HnswIndexType& self) -> py::dict {
+                py::dict result;
+                result["process_rss_bytes"] = getCurrentRSS();
+                return result;
+            },
+            R"doc(
+    Returns a dictionary with current memory usage statistics.
+
+    Returns:
+    --------
+    dict:
+        A dictionary with the following keys:
+        - 'process_rss_bytes': Total physical memory (RSS) used by the Python process.
+    )doc");
 }
