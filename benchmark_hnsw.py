@@ -194,16 +194,18 @@ if __name__ == "__main__":
         
         X_base_float32 = np.ascontiguousarray(X_base, dtype=np.float32)
         X_query_float32 = np.ascontiguousarray(X_query, dtype=np.float32)
-        import faiss
-        index_flat = faiss.IndexFlatL2(X_base_float32.shape[1]) 
+        
+        ground_truth = np.load("./data/SIFT10M/ground_truth_indices.npy")
+        # import faiss
+        # index_flat = faiss.IndexFlatL2(X_base_float32.shape[1]) 
 
-        index_flat.add(X_base_float32)
+        # index_flat.add(X_base_float32)
 
-        k = 10
-        start_time = time.time()
-        D_flat, ground_truth = index_flat.search(X_query_float32, k) 
-        end_time = time.time()
-        print(f"Flat search took: {end_time - start_time:.4f} seconds")
+        # k = 10
+        # start_time = time.time()
+        # D_flat, ground_truth = index_flat.search(X_query_float32, k) 
+        # end_time = time.time()
+        # print(f"Flat search took: {end_time - start_time:.4f} seconds")
         
     num_threads = 1
     print(f"Using {num_threads} threads for benchmarking.\n")
