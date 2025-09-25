@@ -1,5 +1,7 @@
 #include "hnsw.hpp"
 
+#include <immintrin.h>
+
 #include <algorithm>
 #include <condition_variable>
 #include <functional>
@@ -15,8 +17,7 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
-
-#include <immintrin.h>
+#include <optional>
 
 // --- A Simple Thread Pool Implementation (unchanged) ---
 class ThreadPool {
@@ -77,11 +78,11 @@ size_t HNSW<Dim, DistanceMetric>::estimateMaxLevel(u64 max_elements, size_t M) {
     // The random level generation uses: level = -log(uniform_random) / log(M)
     // For max_elements, the expected maximum level is approximately log(max_elements) / log(M)
     if (max_elements <= 1) return 1;
-    
+
     // Correct formula based on the actual random level generation algorithm
     double expected_max_level = std::log(static_cast<double>(max_elements)) / std::log(static_cast<double>(M));
-    size_t estimated_max_level = static_cast<size_t>(std::ceil(expected_max_level + 1)); // +2 for safety margin
-    
+    size_t estimated_max_level = static_cast<size_t>(std::ceil(expected_max_level + 1));  // +2 for safety margin
+
     // Ensure reasonable bounds: at least 3 levels, at most 16 levels
     return std::max(static_cast<size_t>(3), std::min(static_cast<size_t>(16), estimated_max_level));
 }
@@ -98,11 +99,11 @@ HNSW<Dim, DistanceMetric>::HNSW(u64 max_elements, size_t M_param, size_t ef_cons
       FixedNodeSize(VectorSize + MaxNeighborsHeaderSize + MaxNeighborsListSize),
       MaxNodesPerPage((pageSize - HNSWPage::HeaderSize) / FixedNodeSize),
       NodesPerPage(MaxNodesPerPage) {
-      
     // Validate that we can fit at least one node per page
     if (MaxNodesPerPage == 0) {
-        throw std::runtime_error("Page size is too small to fit even one node with the given parameters. "
-                               "Consider reducing M or vector dimension.");
+        throw std::runtime_error(
+            "Page size is too small to fit even one node with the given parameters. "
+            "Consider reducing M or vector dimension.");
     }
     visited_list_pool_ = std::unique_ptr<VisitedListPool>(new VisitedListPool(1, max_elements));
 
@@ -149,10 +150,9 @@ u32 HNSW<Dim, DistanceMetric>::getRandomLevel() {
 }
 
 template <size_t Dim, typename DistanceMetric>
-u32 HNSW<Dim, DistanceMetric>::findBestEntryPointForLevel(const float* query,
-                                                          u32 entry_point_id,
-                                                          int level) {
+std::pair<float, u32> HNSW<Dim, DistanceMetric>::findBestEntryPointForLevel(const float* query, u32 entry_point_id, int level, float entry_point_dist) {
     u32 current_node_id = entry_point_id;
+    float min_dist = entry_point_dist; // Use the pre-calculated distance
 
     VisitedList* visited_nodes = visited_list_pool_->getFreeVisitedList();
     std::unique_ptr<VisitedList, std::function<void(VisitedList*)>> visited_guard(
@@ -165,17 +165,18 @@ u32 HNSW<Dim, DistanceMetric>::findBestEntryPointForLevel(const float* query,
     while (changed) {
         changed = false;
         u32 best_neighbor_id = current_node_id;
-        float min_dist;
 
         try {
             GuardO<HNSWPage> current_page_guard(getNodePID(current_node_id));
             NodeAccessor current_acc(current_page_guard.ptr, getNodeIndexInPage(current_node_id), this);
 
+            // The first node is marked as visited here.
+            // Note: We don't need to re-calculate its distance as it's passed in.
             visited_array[current_node_id] = visited_array_tag;
-            min_dist = DistanceMetric::compare(query, current_acc.getVector(), Dim);
 
             auto neighbors_span = current_acc.getNeighbors(level, this);
 
+            // Prefetch the first neighbor's data to improve pipeline efficiency.
             if (!neighbors_span.empty()) {
                 u32 first_neighbor_id = neighbors_span[0];
                 _mm_prefetch(reinterpret_cast<const char*>(&visited_array[first_neighbor_id]), _MM_HINT_T0);
@@ -185,8 +186,8 @@ u32 HNSW<Dim, DistanceMetric>::findBestEntryPointForLevel(const float* query,
 
             for (size_t i = 0; i < neighbors_span.size(); ++i) {
                 const u32& neighbor_id = neighbors_span[i];
-                
-                // --- In-loop prefetch for the *next* neighbor to keep the pipeline full ---
+
+                // In-loop prefetch for the *next* neighbor to keep the pipeline full.
                 if (i + 1 < neighbors_span.size()) {
                     u32 next_neighbor_id = neighbors_span[i + 1];
                     _mm_prefetch(reinterpret_cast<const char*>(&visited_array[next_neighbor_id]), _MM_HINT_T0);
@@ -210,56 +211,89 @@ u32 HNSW<Dim, DistanceMetric>::findBestEntryPointForLevel(const float* query,
             }
             current_node_id = best_neighbor_id;
         } catch (const OLCRestartException&) {
+            // If a concurrent modification happens, stop the greedy search at this level
+            // and proceed with the best node found so far.
             changed = false;
         }
     }
 
-    return current_node_id;
+    return {min_dist, current_node_id};
 }
 
 template <size_t Dim, typename DistanceMetric>
-u32 HNSW<Dim, DistanceMetric>::searchBaseLayer(const float* query, u32 entry_point_id,
-                                                                                int start_level, int end_level) {
-    u32 current_entry_point = entry_point_id;
-    for (int level = start_level; level >= end_level; --level) {
-        current_entry_point = findBestEntryPointForLevel(query, current_entry_point, level);
+std::pair<float, u32> HNSW<Dim, DistanceMetric>::searchBaseLayer(const float* query, u32 entry_point_id, int start_level, int end_level) {
+    u32 current_entry_point_id = entry_point_id;
+    float current_dist;
+    
+    // Calculate the distance for the initial entry point only ONCE.
+    try {
+        GuardO<HNSWPage> initial_guard(getNodePID(current_entry_point_id));
+        NodeAccessor initial_acc(initial_guard.ptr, getNodeIndexInPage(current_entry_point_id), this);
+        current_dist = DistanceMetric::compare(query, initial_acc.getVector(), Dim);
+    } catch (const OLCRestartException&) {
+        // If the initial node cannot be read, return a sentinel value.
+        // The caller (searchKnn) can then decide how to proceed.
+        return {std::numeric_limits<float>::max(), entry_point_id};
     }
-    return current_entry_point;
+    
+    for (int level = start_level; level >= end_level; --level) {
+        // Pass the current best distance to the next level's search function.
+        auto result = findBestEntryPointForLevel(query, current_entry_point_id, level, current_dist);
+        current_dist = result.first;
+        current_entry_point_id = result.second;
+    }
+    return {current_dist, current_entry_point_id};
 }
 
 template <size_t Dim, typename DistanceMetric>
 std::vector<std::pair<float, u32>> HNSW<Dim, DistanceMetric>::searchLayer(
-    const float* query, u32 entry_point_id, u32 level, size_t ef) {
+    const float* query, u32 entry_point_id, u32 level, size_t ef,
+    std::optional<std::pair<float, u32>> initial_entry_dist_pair) { // Added optional parameter
+    
     VisitedList* visited_nodes = visited_list_pool_->getFreeVisitedList();
     vl_type* visited_array = visited_nodes->mass;
     vl_type visited_array_tag = visited_nodes->curV;
-    std::priority_queue<std::pair<float, u32>> top_candidates;
+    
+    std::priority_queue<std::pair<float, u32>> top_candidates; // Max-heap to keep the best results
     std::priority_queue<std::pair<float, u32>, std::vector<std::pair<float, u32>>, std::greater<std::pair<float, u32>>>
-        candidate_queue;
+        candidate_queue; // Min-heap to explore candidates
 
-    try {
-        GuardO<HNSWPage> page_guard(getNodePID(entry_point_id));
-        NodeAccessor acc(page_guard.ptr, getNodeIndexInPage(entry_point_id), this);
-        float dist = DistanceMetric::compare(query, acc.getVector(), Dim);
+    // --- Use pre-calculated distance if available ---
+    if (initial_entry_dist_pair && initial_entry_dist_pair->second == entry_point_id) {
+        float dist = initial_entry_dist_pair->first;
         top_candidates.push({dist, entry_point_id});
         candidate_queue.push({dist, entry_point_id});
         visited_array[entry_point_id] = visited_array_tag;
-    } catch (const OLCRestartException&) {
-        return {};
+    } else {
+        // Fallback: calculate distance if not provided or if IDs don't match
+        try {
+            GuardO<HNSWPage> page_guard(getNodePID(entry_point_id));
+            NodeAccessor acc(page_guard.ptr, getNodeIndexInPage(entry_point_id), this);
+            float dist = DistanceMetric::compare(query, acc.getVector(), Dim);
+            top_candidates.push({dist, entry_point_id});
+            candidate_queue.push({dist, entry_point_id});
+            visited_array[entry_point_id] = visited_array_tag;
+        } catch (const OLCRestartException&) {
+            // Cannot even start the search, return empty.
+            visited_list_pool_->releaseVisitedList(visited_nodes);
+            return {};
+        }
     }
+    
+    // The rest of the beam search logic remains the same.
     std::vector<PID> pages_to_prefetch;
     std::vector<u32> offsets_within_pages;
     pages_to_prefetch.reserve(24);
     offsets_within_pages.reserve(24);
+    
     while (!candidate_queue.empty()) {
         auto current_pair = candidate_queue.top();
         candidate_queue.pop();
 
         if (top_candidates.size() >= ef && current_pair.first > top_candidates.top().first) {
-            break;
+            break; // All further candidates are worse than the worst in our result set.
         }
 
-        // Collect unique pages and prefetch them all at once
         u32 current_id = current_pair.second;
         try {
             GuardO<HNSWPage> current_page_guard(getNodePID(current_id));
@@ -269,28 +303,21 @@ std::vector<std::pair<float, u32>> HNSW<Dim, DistanceMetric>::searchLayer(
 
             auto neighbors = current_acc.getNeighbors(level, this);
 
-            // --- Prefetch all neighbors at once before processing ---
+            // Prefetch all neighbors' data at once before processing
             if (!neighbors.empty()) {
-                // Prefetch visited array entries for all neighbors
                 for (const u32& neighbor_id : neighbors) {
                     _mm_prefetch(reinterpret_cast<const char*>(&visited_array[neighbor_id]), _MM_HINT_T0);
                 }
                 pages_to_prefetch.clear();
                 offsets_within_pages.clear();
                 for (const u32& neighbor_id : neighbors) {
-                    PID page_id = getNodePID(neighbor_id);
-                    pages_to_prefetch.push_back(page_id);
+                    pages_to_prefetch.push_back(getNodePID(neighbor_id));
                     offsets_within_pages.push_back(NodeAccessor::getVectorOffset(this, neighbor_id));
                 }
-                
-                if (!pages_to_prefetch.empty()) {
-                    bm.prefetchPages(pages_to_prefetch.data(), pages_to_prefetch.size(), offsets_within_pages.data());
-                }
+                bm.prefetchPages(pages_to_prefetch.data(), pages_to_prefetch.size(), offsets_within_pages.data());
             }
-            
-            for (size_t i = 0; i < neighbors.size(); ++i) {
-                const u32& neighbor_id = neighbors[i];
 
+            for (const u32& neighbor_id : neighbors) {
                 if (!(visited_array[neighbor_id] == visited_array_tag)) {
                     visited_array[neighbor_id] = visited_array_tag;
                     GuardO<HNSWPage> neighbor_page_guard(getNodePID(neighbor_id));
@@ -307,14 +334,8 @@ std::vector<std::pair<float, u32>> HNSW<Dim, DistanceMetric>::searchLayer(
                 }
             }
         } catch (const OLCRestartException&) {
-            continue;
+            continue; // Skip this node if it was modified concurrently.
         }
-
-        // --- Prefetch the next best candidate from the queue (this part was correct) ---
-        // if (!candidate_queue.empty()) {
-        //     PID next_candidate_pid = getNodePID(candidate_queue.top().second);
-        //     bm.prefetchPages(&next_candidate_pid, 1);
-        // }
     }
 
     std::vector<std::pair<float, u32>> results;
@@ -327,7 +348,6 @@ std::vector<std::pair<float, u32>> HNSW<Dim, DistanceMetric>::searchLayer(
     visited_list_pool_->releaseVisitedList(visited_nodes);
     return results;
 }
-
 
 template <size_t Dim, typename DistanceMetric>
 inline PID HNSW<Dim, DistanceMetric>::getNodePID(u32 node_id) const {
@@ -361,7 +381,8 @@ std::vector<std::pair<float, u32>> HNSW<Dim, DistanceMetric>::selectNeighborsHeu
         for (const auto& selected : result) {
             try {
                 GuardO<HNSWPage> candidate_page_guard(getNodePID(current_candidate.second));
-                NodeAccessor candidate_acc(candidate_page_guard.ptr, getNodeIndexInPage(current_candidate.second), this);
+                NodeAccessor candidate_acc(candidate_page_guard.ptr, getNodeIndexInPage(current_candidate.second),
+                                           this);
                 const float* candidate_vector = candidate_acc.getVector();
 
                 GuardO<HNSWPage> selected_page_guard(getNodePID(selected.second));
@@ -386,35 +407,32 @@ std::vector<std::pair<float, u32>> HNSW<Dim, DistanceMetric>::selectNeighborsHeu
     return result;
 }
 
+
 template <size_t Dim, typename DistanceMetric>
-void HNSW<Dim, DistanceMetric>::addPoint_internal(const float* point,
-                                                                                   u32 new_node_id) {
+void HNSW<Dim, DistanceMetric>::addPoint_internal(const float* point, u32 new_node_id) {
     const u32 new_node_level = getRandomLevel();
     PID new_node_pid = getNodePID(new_node_id);
 
-    // --- 1. Allocate space for the new node on its page ---
-    // Fixed-size node allocation: direct placement in node grid.
+    // --- 1. Allocate space and initialize data for the new node on its page ---
     {
         GuardX<HNSWPage> page_guard(new_node_pid);
         HNSWPage* page = page_guard.ptr;
         u32 node_idx = getNodeIndexInPage(new_node_id);
 
-        // Check if page has room for this node
         if (node_idx >= MaxNodesPerPage) {
             throw std::runtime_error("Node index exceeds page capacity. This should not happen with pre-calculation.");
         }
 
         // Calculate direct offset to this node's data
         u8* node_start = page->getNodeData() + node_idx * FixedNodeSize;
-        
+
         // Initialize node: [Vector][Level Counts][Neighbor IDs]
         float* vector_ptr = reinterpret_cast<float*>(node_start);
         u16* level_counts_ptr = reinterpret_cast<u16*>(node_start + VectorSize);
-        u32* neighbor_ids_ptr = reinterpret_cast<u32*>(node_start + VectorSize + MaxNeighborsHeaderSize);
-
+        
         // Copy vector data
         memcpy(vector_ptr, point, VectorSize);
-        
+
         // Zero-initialize level counts and neighbor IDs
         memset(level_counts_ptr, 0, MaxNeighborsHeaderSize + MaxNeighborsListSize);
 
@@ -423,18 +441,17 @@ void HNSW<Dim, DistanceMetric>::addPoint_internal(const float* point,
         page->dirty = true;
     }
 
-    // --- 2. Find entry point for the search ---
+    // --- 2. Find the global entry point for the search ---
     u32 enter_point_id;
     u32 max_l;
-
-    for (;;) { // Add retry loop
+    for (;;) {  // OLC retry loop for reading metadata
         try {
             GuardO<HNSWMetadataPage> meta_guard(metadata_pid);
             enter_point_id = meta_guard->enter_point_node_id;
             max_l = meta_guard->max_level.load(std::memory_order_acquire);
-            break; // Success
+            break;
         } catch (const OLCRestartException&) {
-            continue; // Retry
+            continue;
         }
     }
 
@@ -449,19 +466,29 @@ void HNSW<Dim, DistanceMetric>::addPoint_internal(const float* point,
         return;
     }
 
-    // --- 3. Search from top layer down to the new node's level ---
-    // Find the closest node to the query point on the upper layers.
+    // --- 3. Search from top layers down to find the best entry point for the new node's level ---
+    std::optional<std::pair<float, u32>> entry_point_with_dist_opt = std::nullopt;
     if (new_node_level < max_l) {
-        enter_point_id = searchBaseLayer(point, enter_point_id, max_l, new_node_level + 1);
+        auto result = searchBaseLayer(point, enter_point_id, max_l, new_node_level + 1);
+        enter_point_id = result.second;
+        entry_point_with_dist_opt = result; // Store the pair for the first searchLayer call.
+    } else {
+        entry_point_with_dist_opt = std::nullopt;
     }
 
     // --- 4. Connection phase: from new_node_level down to 0 ---
-    for (int level = std::min(new_node_level, max_l); level >= 0; --level) {
+    for (int level = std::min(static_cast<u32>(new_node_level), max_l); level >= 0; --level) {
         // Find the best neighbors for the new node at the current level.
-        auto candidates = searchLayer(point, enter_point_id, level, efConstruction);
+        // Pass the pre-calculated distance on the FIRST iteration.
+        auto candidates = searchLayer(point, enter_point_id, level, efConstruction, entry_point_with_dist_opt);
+        
+        // The pre-calculated distance is only valid for the first iteration.
+        // Clear it for all subsequent iterations of this loop.
+        if (entry_point_with_dist_opt.has_value()) {
+            entry_point_with_dist_opt = std::nullopt;
+        }
+
         if (candidates.empty()) {
-            // This can happen in rare concurrent scenarios. If so, we can't connect
-            // to anything at this level, so we just continue to the next level down.
             continue;
         }
 
@@ -469,13 +496,8 @@ void HNSW<Dim, DistanceMetric>::addPoint_internal(const float* point,
         auto neighbors_to_link_pairs = selectNeighborsHeuristic(point, candidates, M_level);
 
         // *** FINE-GRAINED LOCKING ***
-        // We perform two separate steps to avoid deadlocks:
-        // 1. Link the new node TO its neighbors (one lock on the new node's page).
-        // 2. Link the neighbors BACK TO the new node (one lock per neighbor, sequentially).
-
         // Step 4a: Link the new node TO its chosen neighbors.
         {
-            // Lock only the new node's page to update its own neighbor list.
             GuardX<HNSWPage> new_node_page_guard(new_node_pid);
             MutableNodeAccessor new_node_acc(new_node_page_guard.ptr, getNodeIndexInPage(new_node_id), this);
             std::vector<u32> neighbor_ids;
@@ -484,41 +506,37 @@ void HNSW<Dim, DistanceMetric>::addPoint_internal(const float* point,
                 neighbor_ids.push_back(p.second);
             }
             new_node_acc.setNeighbors(level, neighbor_ids, this);
-        }  // Lock on new_node_pid is released here.
+        }
 
         // Step 4b: Link neighbors BACK to the new node, one by one.
-        for (const auto& neighbor_pair : neighbors_to_link_pairs) {
-            u32 neighbor_id = neighbor_pair.second;
+        for (const std::pair<float, u32>& neighbor_pair : neighbors_to_link_pairs) {
+            const float dist_point_to_neighbor = neighbor_pair.first;
+            const u32 neighbor_id = neighbor_pair.second;
             PID neighbor_pid = getNodePID(neighbor_id);
 
-            // This loop ensures that the entire read-and-write operation is atomic.
-            // If any data is changed by another thread during our read phase, we restart.
-            for (;;) {  // OLC retry loop
+            for (;;) {  // OLC retry loop for updating a single neighbor
                 try {
                     // --- PHASE 1: READ EVERYTHING NEEDED, WITHOUT ANY EXCLUSIVE LOCKS ---
                     std::vector<float> neighbor_vector_copy(Dim);
-                    std::vector<u32> current_neighbors;
-                    std::unordered_map<PID, std::vector<float>> connection_vectors;  // Stores vectors for pruning
+                    std::vector<u32> current_neighbors_ids; // Using vector for potential modification.
+                    std::unordered_map<u32, std::vector<float>> connection_vectors;
                     bool needs_pruning;
 
-                    // Step 1.1: Optimistically read the neighbor's primary data (its vector and its neighbor list).
                     {
                         GuardO<HNSWPage> neighbor_page_guard(neighbor_pid);
                         NodeAccessor neighbor_acc(neighbor_page_guard.ptr, getNodeIndexInPage(neighbor_id), this);
-
+                        
                         const float* neighbor_vec_ptr = neighbor_acc.getVector();
                         std::copy(neighbor_vec_ptr, neighbor_vec_ptr + Dim, neighbor_vector_copy.begin());
 
                         auto neighbors_span = neighbor_acc.getNeighbors(level, this);
-                        current_neighbors.assign(neighbors_span.begin(), neighbors_span.end());
+                        current_neighbors_ids.assign(neighbors_span.begin(), neighbors_span.end());
                     }
 
-                    needs_pruning = (current_neighbors.size() >= M_level);
+                    needs_pruning = (current_neighbors_ids.size() >= M_level);
 
-                    // Step 1.2: If pruning is necessary, we must also read the vectors of all its connections.
-                    // This is the crucial step to avoid needing to read them inside the write lock.
                     if (needs_pruning) {
-                        for (PID conn_id : current_neighbors) {
+                        for (u32 conn_id : current_neighbors_ids) {
                             GuardO<HNSWPage> conn_page_guard(getNodePID(conn_id));
                             NodeAccessor conn_acc(conn_page_guard.ptr, getNodeIndexInPage(conn_id), this);
                             const float* conn_vec_ptr = conn_acc.getVector();
@@ -527,37 +545,22 @@ void HNSW<Dim, DistanceMetric>::addPoint_internal(const float* point,
                     }
 
                     // --- PHASE 2: ACQUIRE A SINGLE LOCK AND WRITE ---
-                    // If Phase 1 completed without an exception, we have a consistent snapshot of all needed data.
-                    // Now, we can acquire the single exclusive lock and perform our modifications.
                     {
                         GuardX<HNSWPage> neighbor_page_guard(neighbor_pid);
-
-                        // Inside the X-Lock, we must re-read the neighbor list ONE LAST TIME to prevent a race
-                        // condition. This read is safe and does not require another lock.
                         NodeAccessor locked_reader(neighbor_page_guard.ptr, getNodeIndexInPage(neighbor_id), this);
                         auto latest_neighbors_span = locked_reader.getNeighbors(level, this);
-                        std::vector<u32> latest_neighbors(latest_neighbors_span.begin(), latest_neighbors_span.end());
 
-                        // Now, perform all logic using ONLY our local data copies. NO MORE GuardO calls!
-                        if (latest_neighbors.size() >= M_level) {
-                            std::priority_queue<std::pair<float, PID>> connections_to_prune;
+                        if (latest_neighbors_span.size() >= M_level) {
+                            // --- Pruning Path ---
+                            std::priority_queue<std::pair<float, u32>> connections_to_prune;
+                            
+                            connections_to_prune.push({dist_point_to_neighbor, new_node_id});
 
-                            // Add the new node as a candidate, using the query vector `point`.
-                            float new_node_dist = DistanceMetric::compare(neighbor_vector_copy.data(), point, Dim);
-                            connections_to_prune.push({new_node_dist, new_node_id});
-
-                            // Add existing neighbors, using the vectors we copied in Phase 1.
-                            for (PID conn_id : latest_neighbors) {
+                            for (u32 conn_id : latest_neighbors_span) {
                                 auto it = connection_vectors.find(conn_id);
-
-                                // Check if we successfully read this connection's vector during Phase 1.
-                                // If not, it means the neighbor list changed between our read and write phases.
-                                // It's safest to just skip this new, unknown connection in this iteration.
-                                // It will be properly linked in other nodes' update operations.
                                 if (it != connection_vectors.end()) {
                                     const std::vector<float>& conn_vector = it->second;
-                                    float dist =
-                                        DistanceMetric::compare(neighbor_vector_copy.data(), conn_vector.data(), Dim);
+                                    float dist = DistanceMetric::compare(neighbor_vector_copy.data(), conn_vector.data(), Dim);
                                     connections_to_prune.push({dist, conn_id});
                                 }
                             }
@@ -567,6 +570,7 @@ void HNSW<Dim, DistanceMetric>::addPoint_internal(const float* point,
                             }
 
                             std::vector<u32> new_neighbor_list;
+                            new_neighbor_list.reserve(M_level);
                             while (!connections_to_prune.empty()) {
                                 new_neighbor_list.push_back(connections_to_prune.top().second);
                                 connections_to_prune.pop();
@@ -575,24 +579,19 @@ void HNSW<Dim, DistanceMetric>::addPoint_internal(const float* point,
                             MutableNodeAccessor neighbor_acc(neighbor_page_guard.ptr, getNodeIndexInPage(neighbor_id), this);
                             neighbor_acc.setNeighbors(level, new_neighbor_list, this);
                         } else {
-                            latest_neighbors.push_back(new_node_id);
+                            // --- Non-Pruning Path ---
                             MutableNodeAccessor neighbor_acc(neighbor_page_guard.ptr, getNodeIndexInPage(neighbor_id), this);
-                            neighbor_acc.setNeighbors(level, latest_neighbors, this);
+                            neighbor_acc.addNeighbor(level, new_node_id, this);
                         }
-                    }  // Single X-Lock is released here.
-
-                    // If the entire try block completes, the operation was successful. Break the retry loop.
-                    break;
-
+                    }
+                    break; // Success, exit retry loop
                 } catch (const OLCRestartException&) {
-                    // An optimistic lock failed during Phase 1. Another thread modified the data.
-                    // We simply `continue` to restart the entire read-then-write process.
-                    continue;
+                    continue; // An optimistic lock failed, restart the process for this neighbor.
                 }
-            }  // End of retry loop
-        }  // End of for-each neighbor loop
+            } // End of retry loop
+        } // End of for-each neighbor loop
 
-        // Update the entry point for the next level down.
+        // Update the entry point for the next level down
         if (!neighbors_to_link_pairs.empty()) {
             enter_point_id = neighbors_to_link_pairs.front().second;
         }
@@ -601,7 +600,6 @@ void HNSW<Dim, DistanceMetric>::addPoint_internal(const float* point,
     // --- 5. Update global entry point if the new node is the highest ---
     if (new_node_level > max_l) {
         GuardX<HNSWMetadataPage> meta_guard(metadata_pid);
-        // Re-check inside the lock to handle race conditions.
         if (new_node_level > meta_guard->max_level.load(std::memory_order_acquire)) {
             meta_guard->enter_point_node_id = new_node_id;
             meta_guard->max_level = new_node_level;
@@ -612,8 +610,7 @@ void HNSW<Dim, DistanceMetric>::addPoint_internal(const float* point,
 
 // --- Parallel and Single Add/Search Functions (unchanged) ---
 template <size_t Dim, typename DistanceMetric>
-void HNSW<Dim, DistanceMetric>::addPoint_parallel(std::span<const float> points,
-                                                                                   size_t num_threads) {
+void HNSW<Dim, DistanceMetric>::addPoint_parallel(std::span<const float> points, size_t num_threads) {
     if (points.empty()) return;
     if (points.size() % Dim != 0) {
         throw std::invalid_argument("Total number of floats in points span is not a multiple of the vector dimension.");
@@ -669,8 +666,9 @@ void HNSW<Dim, DistanceMetric>::addPoint(const float* point, u32& node_id_out) {
 }
 
 template <size_t Dim, typename DistanceMetric>
-std::vector<std::pair<float, u32>> HNSW<Dim, DistanceMetric>::searchKnn(
-    const float* query, size_t k, size_t ef_search_param) {
+std::vector<std::pair<float, u32>> HNSW<Dim, DistanceMetric>::searchKnn(const float* query, size_t k,
+                                                                        size_t ef_search_param) {
+    // --- 1. Get the global entry point ---
     u32 enter_point_id;
     u32 max_l;
     for (;;) {
@@ -678,31 +676,42 @@ std::vector<std::pair<float, u32>> HNSW<Dim, DistanceMetric>::searchKnn(
             GuardO<HNSWMetadataPage> meta_guard(metadata_pid);
             enter_point_id = meta_guard->enter_point_node_id;
             max_l = meta_guard->max_level.load(std::memory_order_acquire);
-            break; // Success
+            break;
         } catch (const OLCRestartException&) {
-            continue; // Retry
+            continue; // Retry if metadata is being updated
         }
     }
-    if (enter_point_id == HNSWMetadataPage::invalid_node_id) return {};
-    if (max_l > 0) enter_point_id = searchBaseLayer(query, enter_point_id, max_l, 1);
 
-    // Use the new parameter for ef_search
-    size_t ef_search = ef_search_param;
-    if (ef_search == 0) {  // If not provided, use the old default logic
-        ef_search = std::max(static_cast<size_t>(efConstruction), k);
+    if (enter_point_id == HNSWMetadataPage::invalid_node_id) {
+        return {}; // Index is empty
     }
-    ef_search = std::max(ef_search, k);  // ef must be at least k
 
-    auto candidates = searchLayer(query, enter_point_id, 0, ef_search);
-    if (candidates.size() > k) candidates.resize(k);
+    // --- 2. Greedily search upper layers to find the best entry point for layer 0 ---
+    std::pair<float, u32> entry_point_for_layer0 = {0.0f, enter_point_id};
+    
+    if (max_l > 0) {
+        // This call will find the best entry for layer 1 and return its ID and distance.
+        entry_point_for_layer0 = searchBaseLayer(query, enter_point_id, max_l, 1);
+    }
+    
+    // --- 3. Set search parameters ---
+    size_t ef_search = (ef_search_param == 0) ? std::max(static_cast<size_t>(efConstruction), k) : ef_search_param;
+    ef_search = std::max(ef_search, k);
+
+    // --- 4. Perform beam search on the base layer (layer 0) ---
+    // Pass the pre-calculated distance and ID to searchLayer to avoid redundant computation.
+    auto candidates = searchLayer(query, entry_point_for_layer0.second, 0, ef_search, entry_point_for_layer0);
+
+    // --- 5. Finalize and return results ---
+    if (candidates.size() > k) {
+        candidates.resize(k);
+    }
     return candidates;
 }
 
 template <size_t Dim, typename DistanceMetric>
-std::vector<std::vector<std::pair<float, u32>>>
-HNSW<Dim, DistanceMetric>::searchKnn_parallel(std::span<const float> queries, size_t k,
-                                                                               size_t ef_search_param,
-                                                                               size_t num_threads) {
+std::vector<std::vector<std::pair<float, u32>>> HNSW<Dim, DistanceMetric>::searchKnn_parallel(
+    std::span<const float> queries, size_t k, size_t ef_search_param, size_t num_threads) {
     if (queries.empty()) return {};
     if (queries.size() % Dim != 0) {
         throw std::invalid_argument("Total number of floats in query span is not a multiple of the vector dimension.");
@@ -740,9 +749,9 @@ u64 HNSW<Dim, DistanceMetric>::getBufferManagerAllocCount() const {
 template <size_t Dim, typename DistanceMetric>
 std::string HNSW<Dim, DistanceMetric>::getIndexInfo() const {
     std::ostringstream info;
-    
+
     info << "=== HNSW Index Information ===\n";
-    
+
     // Template parameters (compile-time configuration)
     info << "Configuration Parameters:\n";
     info << "  Vector Dimension: " << Dim << "\n";
@@ -750,7 +759,7 @@ std::string HNSW<Dim, DistanceMetric>::getIndexInfo() const {
     info << "  Max Neighbors (M0): " << M0 << " (layer 0)\n";
     info << "  Construction ef: " << efConstruction << "\n";
     info << "  Max Levels: " << MaxLevel << "\n";
-    
+
     // Memory layout information
     info << "\nMemory Layout:\n";
     info << "  Node Vector Size: " << VectorSize << " bytes\n";
@@ -759,14 +768,14 @@ std::string HNSW<Dim, DistanceMetric>::getIndexInfo() const {
     info << "  Fixed Node Size: " << FixedNodeSize << " bytes\n";
     info << "  Nodes Per Page: " << NodesPerPage << "\n";
     info << "  Page Size: " << pageSize << " bytes\n";
-    
+
     // Runtime metadata from HNSWMetadataPage
     u32 enter_point_id = HNSWMetadataPage::invalid_node_id;
     u32 max_level = 0;
     u64 node_count = 0;
     u64 max_elements = 0;
     PID base_pid_value = 0;
-    
+
     // Read metadata with retry loop for OLC
     for (;;) {
         try {
@@ -781,7 +790,7 @@ std::string HNSW<Dim, DistanceMetric>::getIndexInfo() const {
             continue;
         }
     }
-    
+
     info << "\nIndex Metadata:\n";
     info << "  Metadata PID: " << metadata_pid << "\n";
     info << "  Base PID: " << base_pid_value << "\n";
@@ -794,18 +803,18 @@ std::string HNSW<Dim, DistanceMetric>::getIndexInfo() const {
     } else {
         info << enter_point_id << "\n";
     }
-    
+
     // Entry point node information (if exists)
     if (enter_point_id != HNSWMetadataPage::invalid_node_id) {
         try {
             GuardO<HNSWPage> entry_page_guard(getNodePID(enter_point_id));
             NodeAccessor entry_acc(entry_page_guard.ptr, getNodeIndexInPage(enter_point_id), this);
-            
+
             info << "\nEntry Point Node Details:\n";
             info << "  Node Level: " << entry_acc.getLevel() << "\n";
             info << "  Node PID: " << getNodePID(enter_point_id) << "\n";
             info << "  Node Index: " << getNodeIndexInPage(enter_point_id) << "\n";
-            
+
             // Show neighbor counts per level
             for (u32 level = 0; level <= entry_acc.getLevel() && level < MaxLevel; ++level) {
                 auto neighbors = entry_acc.getNeighbors(level, this);
@@ -815,14 +824,14 @@ std::string HNSW<Dim, DistanceMetric>::getIndexInfo() const {
             info << "\nEntry Point Node Details: (could not read due to concurrent access)\n";
         }
     }
-    
+
     // Buffer manager statistics
     info << "\nBuffer Manager Statistics:\n";
     info << "  Total Allocations: " << bm.allocCount.load() << "\n";
     info << "  Physical Pages Used: " << bm.physUsedCount.load() << "\n";
     info << "  Read Operations: " << bm.readCount.load() << "\n";
     info << "  Write Operations: " << bm.writeCount.load() << "\n";
-    
+
     // Calculate storage efficiency
     double storage_utilization = 0.0;
     if (max_elements > 0) {
@@ -830,15 +839,16 @@ std::string HNSW<Dim, DistanceMetric>::getIndexInfo() const {
     }
     info << "\nStorage Utilization:\n";
     info << "  Index Capacity Usage: " << std::fixed << std::setprecision(2) << storage_utilization << "%\n";
-    
+
     u64 total_allocated_pages = (max_elements + NodesPerPage - 1) / NodesPerPage;
     if (total_allocated_pages > 0) {
-        double page_utilization = (double)((node_count + NodesPerPage - 1) / NodesPerPage) / total_allocated_pages * 100.0;
+        double page_utilization =
+            (double)((node_count + NodesPerPage - 1) / NodesPerPage) / total_allocated_pages * 100.0;
         info << "  Page Utilization: " << std::fixed << std::setprecision(2) << page_utilization << "%\n";
     }
-    
+
     info << "\n=== End Index Information ===\n";
-    
+
     return info.str();
 }
 

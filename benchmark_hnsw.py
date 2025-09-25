@@ -70,7 +70,8 @@ def benchmark_calico(X_base, X_query, ground_truth, params, num_threads):
     )
     start_time = time.time()
     index_calico = calico_py.HnswIndex(max_elements=num_elements)
-    index_calico.add_items(X_base_float32)
+    print("Start building graph")
+    index_calico.add_items(X_base_float32, 0)
 
     build_time = time.time() - start_time
     # print buffer pool allocated pages
@@ -80,6 +81,7 @@ def benchmark_calico(X_base, X_query, ground_truth, params, num_threads):
     print(index_info)
     print(f"Build time: {build_time:.4f} seconds")
     ef_search = params.get("ef_search", 50)
+    ef_search = 50
     print(f"Querying for k={k} nearest neighbors with ef_search={ef_search}...")
 
     start_time = time.time()
@@ -164,8 +166,6 @@ if __name__ == "__main__":
             print(f"Please download and place them in the '{DATA_DIR}' directory.")
             exit(1)
 
-        hnsw_params = {"M": 16, "ef_construction": 200, "k": 10, "ef_search": 50}
-
         print("Loading SIFT1M dataset...")
         X_base = read_fvecs(BASE_FILE)
         X_query = read_fvecs(QUERY_FILE)
@@ -206,7 +206,8 @@ if __name__ == "__main__":
         # D_flat, ground_truth = index_flat.search(X_query_float32, k) 
         # end_time = time.time()
         # print(f"Flat search took: {end_time - start_time:.4f} seconds")
-        
+
+    hnsw_params = {"M": 16, "ef_construction": 200, "k": 10, "ef_search": 50}
     num_threads = 1
     print(f"Using {num_threads} threads for benchmarking.\n")
     calico_build, calico_search, calico_recall = benchmark_calico(
