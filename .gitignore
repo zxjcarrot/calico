@@ -4,3 +4,5 @@ calico
 *~
 exps/in-memory
 data/
+*.so
+build/*
