@@ -673,16 +673,34 @@ void HNSW<Dim, DistanceMetric>::addPoint_parallel(std::span<const float> points,
             addPoint_internal(points.data() + i * Dim, start_id + i);
         }
     } else {
+        // Batch size: process 16 points per task to reduce future overhead
+        constexpr size_t BATCH_SIZE = 32;
+        size_t num_batches = (num_points + BATCH_SIZE - 1) / BATCH_SIZE;
+        
         ThreadPool pool(threads_to_use);
         std::vector<std::future<void>> futures;
-        futures.reserve(num_points);
-        for (size_t i = 0; i < num_points; ++i) {
-            futures.emplace_back(pool.enqueue([this, points_data = points.data(), i, start_id]() {
-                const float* point_vector = points_data + i * Dim;
-                u32 node_id = start_id + i;
-                this->addPoint_internal(point_vector, node_id);
+        futures.reserve(num_batches);
+        
+        // Atomic counter for work distribution
+        std::atomic<size_t> batch_counter{0};
+        
+        for (size_t thread_idx = 0; thread_idx < threads_to_use; ++thread_idx) {
+            futures.emplace_back(pool.enqueue([this, points_data = points.data(), start_id, num_points, &batch_counter]() {
+                size_t batch_idx;
+                while ((batch_idx = batch_counter.fetch_add(1, std::memory_order_relaxed)) * BATCH_SIZE < num_points) {
+                    size_t start_idx = batch_idx * BATCH_SIZE;
+                    size_t end_idx = std::min(start_idx + BATCH_SIZE, num_points);
+                    
+                    // Process this batch of points
+                    for (size_t i = start_idx; i < end_idx; ++i) {
+                        const float* point_vector = points_data + i * Dim;
+                        u32 node_id = start_id + i;
+                        this->addPoint_internal(point_vector, node_id);
+                    }
+                }
             }));
         }
+        
         for (auto& future : futures) {
             future.get();
         }
