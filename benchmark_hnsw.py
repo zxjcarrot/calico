@@ -1,7 +1,12 @@
 import numpy as np
 import time
 import os
+import sys
+
+# Add local hnswlib directory to Python path
+sys.path.insert(0, './hnswlib')
 import hnswlib
+
 import re
 from itertools import zip_longest
 import signal
@@ -30,8 +35,11 @@ class CacheProfiler:
             raise RuntimeError("CacheProfiler requires a Linux operating system.")
         if not shutil.which("perf"):
             raise RuntimeError("The 'perf' command-line tool is not installed or not in PATH.")
-            
+        
+        
         self.events = events or ['cache-misses', 'cache-references', 'L1-dcache-load-misses', 'LLC-load-misses']
+        
+        print(f"CacheProfiler initialized with events: {self.events}")
         self.pid = os.getpid()
         self.proc = None
         self.raw_output = ""
@@ -221,7 +229,7 @@ def benchmark_calico(X_base, X_query, ground_truth, params, num_threads):
         if 'cache-misses' in cache_stats and 'cache-references' in cache_stats:
             misses = cache_stats['cache-misses']
             refs = cache_stats['cache-references']
-            if refs > 0 and isinstance(misses, int):
+            if isinstance(refs, int) and refs > 0 and isinstance(misses, int):
                 results['cache_miss_rate_pct'] = (misses / refs) * 100
     except RuntimeError as e:
         print(f"Warning: Could not run CacheProfiler. Error: {e}")
@@ -310,7 +318,7 @@ def benchmark_hnswlib(X_base, X_query, ground_truth, params, num_threads):
         if 'cache-misses' in cache_stats and 'cache-references' in cache_stats:
             misses = cache_stats['cache-misses']
             refs = cache_stats['cache-references']
-            if refs > 0 and isinstance(misses, int):
+            if isinstance(refs, int) and refs > 0 and isinstance(misses, int):
                 results['cache_miss_rate_pct'] = (misses / refs) * 100
     except RuntimeError as e:
         print(f"Warning: Could not run CacheProfiler. Error: {e}")
