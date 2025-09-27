@@ -201,6 +201,11 @@ struct PageState {
     }
 
     void operator=(PageState&) = delete;
+
+    static u64 extractVersion(u64 v) {
+        if (!packedMode) return 0;
+        return (v & versionMaskPacked) >> 32;
+    }
 };
 
 struct ResidentPageSet {
@@ -435,6 +440,139 @@ struct GuardO {
 
     // destructor
     ~GuardO() noexcept(false) { checkVersionAndRestart(); }
+
+    T* operator->() {
+        assert(pid != moved);
+        return ptr;
+    }
+
+    void release() {
+        checkVersionAndRestart();
+        pid = moved;
+        ptr = nullptr;
+    }
+};
+
+// Guard that allows relaxed checking of version changes.
+// Useful the data structures can tolerate inconsistent reads, e.g. graph nodes in ANNS index.
+template <class T>
+struct GuardORelaxed {
+    PID pid;
+    T* ptr;
+    u64 version;
+    static const u64 moved = ~0ull;
+
+    // constructor
+    explicit GuardORelaxed(u64 pid) : pid(pid), ptr(nullptr) { init(); }
+
+    template <class T2>
+    GuardORelaxed(u64 pid, GuardO<T2>& parent) {
+        // we do not need to check the parent's version here, as we are relaxed
+        //parent.checkVersionAndRestart();
+        this->pid = pid;
+        ptr = nullptr;
+        init();
+    }
+
+    template <class T2>
+    GuardORelaxed(GuardO<T2>&& other) {
+        pid = other.pid;
+        ptr = other.ptr;
+        version = other.version;
+    }
+
+
+    template <class T2>
+    GuardORelaxed(u64 pid, GuardORelaxed<T2>& parent) {
+        this->pid = pid;
+        ptr = nullptr;
+        init();
+    }
+
+    GuardORelaxed(GuardORelaxed&& other) {
+        pid = other.pid;
+        ptr = other.ptr;
+        version = other.version;
+    }
+
+
+    void init() {
+        assert(pid != moved);
+        PageState& ps = bm.getPageState(pid);
+        for (u64 repeatCounter = 0;; repeatCounter++) {
+            u64 v = ps.stateAndVersion.load();
+            switch (PageState::getState(v)) {
+                case PageState::Marked: {
+                    u64 newV = PageState::sameVersion(v, PageState::Unlocked);
+                    if (ps.stateAndVersion.compare_exchange_weak(v, newV)) {
+                        ptr = reinterpret_cast<T*>(bm.residentPtr(pid, ps, newV));
+                        version = newV;
+                        return;
+                    }
+                    break;
+                }
+                case PageState::Evicted:
+                    if (ps.tryLockX(v)) {
+                        ptr = reinterpret_cast<T*>(bm.handleFault(pid));
+                        bm.unfixX(pid);
+                    }
+                    break;
+                case PageState::Locked:// we can live with stale data here, fallthrough
+                default:
+                    ptr = reinterpret_cast<T*>(bm.residentPtr(pid, ps, v));
+                    version = v;
+                    return;
+            }
+            yield(repeatCounter);
+        }
+    }
+
+    // move assignment operator
+    GuardORelaxed& operator=(GuardORelaxed&& other) {
+        if (pid != moved) checkVersionAndRestart();
+        pid = other.pid;
+        ptr = other.ptr;
+        version = other.version;
+        other.pid = moved;
+        other.ptr = nullptr;
+        return *this;
+    }
+
+    // assignment operator
+    GuardORelaxed& operator=(const GuardORelaxed&) = delete;
+
+    // copy constructor
+    GuardORelaxed(const GuardORelaxed&) = delete;
+
+    void checkVersionAndRestart() {
+        if (pid != moved) {
+            PageState& ps = bm.getPageState(pid);
+            u64 stateAndVersion = ps.stateAndVersion.load();
+            if (version == stateAndVersion)  // fast path, nothing changed
+                return;
+            u64 oldOCCVersion = PageState::extractVersion(version);
+            u64 currentOCCVersion = PageState::extractVersion(stateAndVersion);
+            u64 oldFrameValue = PageState::getFrameValue(version);
+            u64 currentFrameValue = PageState::getFrameValue(stateAndVersion);
+            if (oldFrameValue != currentFrameValue) {
+                // frame changed, must restart. 
+                // This is because we might be reading data that is from a different pages which suggests a significant change.
+                if (std::uncaught_exceptions() == 0) throw OLCRestartException();
+            }
+            if (oldOCCVersion == currentOCCVersion) {  // same version
+                u64 state = PageState::getState(stateAndVersion);
+                if (state <= PageState::MaxShared) return;  // ignore shared locks
+                if (state == PageState::Marked)
+                    if (ps.stateAndVersion.compare_exchange_weak(
+                            stateAndVersion, PageState::sameVersion(stateAndVersion, PageState::Unlocked)))
+                        return;  // mark cleared
+            }
+            // it is fine if the version changed, we are relaxed
+        }
+    }
+
+    // destructor
+    ~GuardORelaxed() noexcept(false) { checkVersionAndRestart(); }
 
     T* operator->() {
         assert(pid != moved);
