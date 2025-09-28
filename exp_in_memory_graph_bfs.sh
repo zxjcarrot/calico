@@ -65,6 +65,38 @@ run_graph_experiment() {
     done
 }
 
+# Function to run experiments for a specific base configuration with all combinations
+run_config_combinations() {
+    local base_name="$1"
+    local base_description="$2"
+    shift 2
+    local base_env_vars=("$@")
+    
+    echo "=================================================================="
+    echo "Running all combinations for: ${base_name}"
+    echo "=================================================================="
+    
+    # Combination 1: No prefetch, No huge pages
+    run_graph_experiment "${base_name}_noprefetch_nohuge" \
+        "${base_description} (no prefetch, no huge pages)" \
+        "${base_env_vars[@]}" "PREFETCH=0" "NOHUGEPAGE_FRAME_MEM=1"
+    
+    # Combination 2: No prefetch, With huge pages
+    run_graph_experiment "${base_name}_noprefetch_huge" \
+        "${base_description} (no prefetch, with huge pages)" \
+        "${base_env_vars[@]}" "PREFETCH=0" "NOHUGEPAGE_FRAME_MEM=0"
+    
+    # Combination 3: With prefetch, No huge pages
+    run_graph_experiment "${base_name}_prefetch_nohuge" \
+        "${base_description} (with prefetch, no huge pages)" \
+        "${base_env_vars[@]}" "PREFETCH=1" "NOHUGEPAGE_FRAME_MEM=1"
+    
+    # Combination 4: With prefetch, With huge pages
+    run_graph_experiment "${base_name}_prefetch_huge" \
+        "${base_description} (with prefetch, with huge pages)" \
+        "${base_env_vars[@]}" "PREFETCH=1" "NOHUGEPAGE_FRAME_MEM=0"
+}
+
 # Create main experiment directory
 mkdir -p "${EXP_BASE_DIR}"
 
@@ -72,7 +104,8 @@ mkdir -p "${EXP_BASE_DIR}"
 GLOBAL_SUMMARY_FILE="${EXP_BASE_DIR}/experiment_summary.txt"
 echo "Graph BFS Experiment Summary" > "${GLOBAL_SUMMARY_FILE}"
 echo "Generated on: $(date)" >> "${GLOBAL_SUMMARY_FILE}"
-echo "Common settings: GRAPH=1 RNDREAD=0 BLOCK=/home/zxjcarrot/Workspace/calico/heapfile VIRTGB=28G PHYSGB=24G DATASIZE=5e6 PERF=1 THREADS=1" >> "${GLOBAL_SUMMARY_FILE}"
+echo "Common settings: GRAPH=1 RNDREAD=0 BLOCK=/home/zxjcarrot/Workspace/calico/heapfile VIRTGB=48G PHYSGB=24G DATASIZE=5e6 PERF=1 THREADS=1" >> "${GLOBAL_SUMMARY_FILE}"
+echo "Testing combinations: PREFETCH=0|1, NOHUGEPAGE_FRAME_MEM=0|1 for each configuration" >> "${GLOBAL_SUMMARY_FILE}"
 echo "" >> "${GLOBAL_SUMMARY_FILE}"
 
 echo "######################################################################"
@@ -81,33 +114,25 @@ echo "######################################################################"
 
 echo "Running graph BFS experiments..." >> "${GLOBAL_SUMMARY_FILE}"
 
-# Experiment 1: Calico mmap (virtual memory cache)
-run_graph_experiment "calico_mmap" "Calico with mmap (virtual memory cache)" \
-    "TRADITIONAL=0" "TRADHASH=0"
-
-# Experiment 2: Calico array (traditional buffer pool with array translator)
-run_graph_experiment "calico_array" "Calico with traditional buffer pool using array translator" \
+# Configuration 1: Calico array (traditional buffer pool with array translator)
+run_config_combinations "calico_array" "Calico with traditional buffer pool using array translator" \
     "TRADITIONAL=1" "TRADHASH=0"
 
-# Experiment 3: Calico array + nohuge (array translator without huge pages)
-run_graph_experiment "calico_array_nohuge" "Calico array translator without huge pages for frame memory" \
-    "TRADITIONAL=1" "TRADHASH=0" "NOHUGEPAGE_FRAME_MEM=1"
+# Configuration 2: Calico mmap (virtual memory cache)
+run_config_combinations "calico_mmap" "Calico with mmap (virtual memory cache)" \
+    "TRADITIONAL=0" "TRADHASH=0"
 
-# Experiment 4: Calico unordered_hash (traditional buffer pool with unordered_map)
-run_graph_experiment "calico_unordered_hash" "Calico with traditional buffer pool using unordered_map translator" \
+# Configuration 3: Calico chained_hash (traditional buffer pool with unordered_map)
+run_config_combinations "calico_chained_hash" "Calico with traditional buffer pool using chained hash (unordered_map) translator" \
     "TRADITIONAL=1" "TRADHASH=1"
 
-# Experiment 5: Calico openaddr_hash (traditional buffer pool with open addressing)
-run_graph_experiment "calico_openaddr_hash" "Calico with traditional buffer pool using open addressing hash translator" \
+# Configuration 4: Calico openaddr_hash (traditional buffer pool with open addressing)
+run_config_combinations "calico_openaddr_hash" "Calico with traditional buffer pool using open addressing hash translator" \
     "TRADITIONAL=1" "TRADHASH=2"
 
-# Experiment 6: Calico lockfree_hash (traditional buffer pool with lock free open addressing)
-run_graph_experiment "calico_lockfree_hash" "Calico with traditional buffer pool using lock free open addressing hash translator" \
+# Configuration 5: Calico lockfree_hash (traditional buffer pool with lock free open addressing)
+run_config_combinations "calico_lockfree_hash" "Calico with traditional buffer pool using lock free open addressing hash translator" \
     "TRADITIONAL=1" "TRADHASH=4"
-
-# Experiment 7: Calico lockfree_hash + nohuge (lock free hash translator without huge pages)
-run_graph_experiment "calico_lockfree_hash_nohuge" "Calico lockfree hash translator without huge pages for frame memory" \
-    "TRADITIONAL=1" "TRADHASH=4" "NOHUGEPAGE_FRAME_MEM=1"
 
 echo "Completed all graph experiments" >> "${GLOBAL_SUMMARY_FILE}"
 echo "" >> "${GLOBAL_SUMMARY_FILE}"
@@ -124,6 +149,14 @@ echo "Global summary file: ${GLOBAL_SUMMARY_FILE}"
 echo
 echo "Generated CSV files:"
 ls -la "${EXP_BASE_DIR}"/*.csv 2>/dev/null || echo "No CSV files found"
+echo
+echo "Configuration combinations tested:"
+echo "  - calico_array: 4 combinations (noprefetch_nohuge, noprefetch_huge, prefetch_nohuge, prefetch_huge)"
+echo "  - calico_mmap: 4 combinations (noprefetch_nohuge, noprefetch_huge, prefetch_nohuge, prefetch_huge)"
+echo "  - calico_chained_hash: 4 combinations (noprefetch_nohuge, noprefetch_huge, prefetch_nohuge, prefetch_huge)"
+echo "  - calico_openaddr_hash: 4 combinations (noprefetch_nohuge, noprefetch_huge, prefetch_nohuge, prefetch_huge)"
+echo "  - calico_lockfree_hash: 4 combinations (noprefetch_nohuge, noprefetch_huge, prefetch_nohuge, prefetch_huge)"
+echo "  Total: 20 experiment configurations"
 
 echo
 echo "Running results extraction for graph experiments..."

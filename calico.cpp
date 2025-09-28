@@ -487,7 +487,7 @@ static void runGraphBenchmark(u64 nodeCount, u64 startIndex) {
         return;
     }
 
-    u32 desiredNeighbors = static_cast<u32>(std::log(static_cast<double>(std::max<u64>(2, nodeCount))) / std::log(2.0));
+    u32 desiredNeighbors = 2 * static_cast<u32>(std::log(static_cast<double>(std::max<u64>(2, nodeCount))) / std::log(2.0));
     desiredNeighbors = std::max<u32>(1, desiredNeighbors);
     u32 maxNeighbors = GraphNodePage::maxNeighbors();
     desiredNeighbors = std::min(desiredNeighbors, maxNeighbors);
@@ -550,15 +550,16 @@ static void runGraphBenchmark(u64 nodeCount, u64 startIndex) {
             frontier.pop();
             visitCount++;
 
-            GuardS<GraphNodePage> node(current);
+            GuardO<GraphNodePage> node(current);
             GraphNodePage* page = node.ptr;
             const PID* neighbors = page->neighborData();
             if (enablePrefetch) bm.prefetchPages(neighbors, page->neighborCount);
             for (u32 i = 0; i < page->neighborCount; i++) {
+                // if (enablePrefetch) bm.prefetchPages(&neighbors[i], 1);
                 PID neighborPid = neighbors[i];
                 u64 idx64 = neighborPid - basePid;
                 u32 idx = static_cast<u32>(idx64);
-                GuardS<GraphNodePage> neighborNode(neighborPid);
+                GuardO<GraphNodePage> neighborNode(neighborPid);
                 // compute something
                 totalValue += neighborNode->value;
                 if (!visited[idx]) {
