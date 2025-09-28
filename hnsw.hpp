@@ -17,7 +17,7 @@
 
 // --- HNSW Metadata ---
 
-typedef unsigned short int vl_type;
+typedef unsigned char vl_type;
 
 class VisitedList {
    public:

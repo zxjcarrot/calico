@@ -16,6 +16,9 @@ import shutil
 
 import calico_py
 
+# Global cache events to profile
+CACHE_EVENTS = ['dTLB-load-misses', 'dTLB-loads', 'instructions', 'cycles', 'cache-misses', 'cache-references', 'L1-dcache-load-misses', 'LLC-load-misses']
+
 class CacheProfiler:
     """
     A context manager to profile a block of Python code for CPU cache events
@@ -38,14 +41,22 @@ class CacheProfiler:
         
         
         self.events = events or ['cache-misses', 'cache-references', 'L1-dcache-load-misses', 'LLC-load-misses']
+        self.enabled = len(self.events) > 0
         
-        print(f"CacheProfiler initialized with events: {self.events}")
+        if self.enabled:
+            print(f"CacheProfiler initialized with events: {self.events}")
+        else:
+            print("CacheProfiler disabled: no events to profile")
+        
         self.pid = os.getpid()
         self.proc = None
         self.raw_output = ""
         self.results = {}
 
     def __enter__(self):
+        if not self.enabled:
+            return self
+            
         # Note: perf may require specific permissions. You might need to run as root
         # or adjust /proc/sys/kernel/perf_event_paranoid
         # e.g., sudo sh -c 'echo -1 >/proc/sys/kernel/perf_event_paranoid'
@@ -61,6 +72,9 @@ class CacheProfiler:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        if not self.enabled:
+            return False
+            
         if self.proc:
             # Send SIGINT (Ctrl+C) to perf to make it stop and print the report
             self.proc.send_signal(signal.SIGINT)
@@ -77,6 +91,10 @@ class CacheProfiler:
         return False
 
     def _parse_output(self):
+        if not self.enabled:
+            return
+            
+        print(self.raw_output)
         # Regex to find a number (with optional commas) followed by an event name
         # e.g., "  1,234,567   cache-misses"
         for event in self.events:
@@ -91,7 +109,19 @@ class CacheProfiler:
                 except (ValueError, IndexError):
                     self.results[event] = "N/A"
             else:
-                self.results[event] = "N/A"
+                # Try alternative pattern for CPU core/atom format
+                # e.g., "151,666,428      cpu_core/cache-misses/"
+                cpu_pattern = re.compile(r"^\s*([\d,]+)\s+cpu_(?:core|atom)/{}/*".format(re.escape(event)), re.MULTILINE)
+                matches = cpu_pattern.findall(self.raw_output)
+                if matches:
+                    try:
+                        # Sum up values from all CPU cores/atoms
+                        total_value = sum(int(match.replace(',', '')) for match in matches)
+                        self.results[event] = total_value
+                    except (ValueError, IndexError):
+                        self.results[event] = "N/A"
+                else:
+                    self.results[event] = "N/A"
 
     def get_results(self):
         return self.results
@@ -215,13 +245,12 @@ def benchmark_calico(X_base, X_query, ground_truth, params, num_threads):
     
     index_calico.reset_stats()
     start_time = time.time()
-    cache_events = ['cache-misses', 'cache-references', 'L1-dcache-load-misses', 'LLC-load-misses']
-    
+
     try:
-        profiler = CacheProfiler(events=cache_events)
+        profiler = CacheProfiler(events=CACHE_EVENTS)
         with profiler:
             start_time = time.time()
-            labels, distances = index_calico.search_knn_parallel(X_query_float32, k, ef_search, num_threads, stats=True)
+            labels, distances = index_calico.search_knn_parallel(X_query_float32, k, 46, num_threads, stats=True)
             search_time = time.time() - start_time
         
         cache_stats = profiler.get_results()
@@ -303,10 +332,8 @@ def benchmark_hnswlib(X_base, X_query, ground_truth, params, num_threads):
     start_time = time.time()
     search_threads = num_threads if num_threads > 0 else -1
     
-    cache_events = ['cache-misses', 'cache-references', 'L1-dcache-load-misses', 'LLC-load-misses']
-    
     try:
-        profiler = CacheProfiler(events=cache_events)
+        profiler = CacheProfiler(events=CACHE_EVENTS)
         with profiler:
             start_time = time.time()
             labels, distances = p.knn_query(X_query_float32, k=k, num_threads=search_threads, stats=True)
@@ -432,25 +459,18 @@ def print_comparison_table(calico_res, hnswlib_res, params):
 
     # --- Cache Performance ---
     print_row("--- Cache Performance (Search) ---", "", "", is_formatted=True)
-    print_row("Cache References", 
-              format_num(calico_res.get('cache-references', 'N/A')), 
-              format_num(hnswlib_res.get('cache-references', 'N/A')), 
-              is_formatted=True)
-    print_row("Cache Misses", 
-              format_num(calico_res.get('cache-misses', 'N/A')), 
-              format_num(hnswlib_res.get('cache-misses', 'N/A')), 
-              is_formatted=True)
+    
+    # Print all cache events dynamically
+    for event in CACHE_EVENTS:
+        print_row(event, 
+                  format_num(calico_res.get(event, 'N/A')), 
+                  format_num(hnswlib_res.get(event, 'N/A')), 
+                  is_formatted=True)
+    
+    # Print cache miss rate if available
     print_row("Cache Miss Rate", 
               f"{calico_res.get('cache_miss_rate_pct', 'N/A'):.2f}%" if isinstance(calico_res.get('cache_miss_rate_pct'), float) else 'N/A', 
               f"{hnswlib_res.get('cache_miss_rate_pct', 'N/A'):.2f}%" if isinstance(hnswlib_res.get('cache_miss_rate_pct'), float) else 'N/A', 
-              is_formatted=True)
-    print_row("L1-dcache-load-misses", 
-              format_num(calico_res.get('L1-dcache-load-misses', 'N/A')), 
-              format_num(hnswlib_res.get('L1-dcache-load-misses', 'N/A')), 
-              is_formatted=True)
-    print_row("LLC-load-misses", 
-              format_num(calico_res.get('LLC-load-misses', 'N/A')), 
-              format_num(hnswlib_res.get('LLC-load-misses', 'N/A')), 
               is_formatted=True)
 
     print_separator()

@@ -187,9 +187,9 @@ std::pair<float, u32> HNSW<Dim, DistanceMetric>::findBestEntryPointForLevel(cons
 
             // Prefetch all neighbors' data at once before processing
             if (!neighbors_span.empty()) {
-                for (const u32& neighbor_id : neighbors_span) {
-                    _mm_prefetch(reinterpret_cast<const char*>(&visited_array[neighbor_id]), _MM_HINT_T0);
-                }
+                // for (const u32& neighbor_id : neighbors_span) {
+                //     _mm_prefetch(reinterpret_cast<const char*>(&visited_array[neighbor_id]), _MM_HINT_T0);
+                // }
                 pages_to_prefetch.clear();
                 offsets_within_pages.clear();
                 for (const u32& neighbor_id : neighbors_span) {
@@ -352,8 +352,21 @@ std::vector<std::pair<float, u32>> HNSW<Dim, DistanceMetric>::searchLayer(
                 }
                 bm.prefetchPages(pages_to_prefetch.data(), pages_to_prefetch.size(), offsets_within_pages.data());
             }
+            // u32 next_neighbor_id = neighbors[0];
+            // _mm_prefetch(reinterpret_cast<const char*>(&visited_array[next_neighbor_id]), _MM_HINT_T0);
+            // PID page_to_prefetch = getNodePID(next_neighbor_id);
+            // u32 next_neighbor_off = NodeAccessor::getVectorOffset(this, next_neighbor_id);
+            // bm.prefetchPages(&page_to_prefetch, 1, &next_neighbor_off);
+            for (size_t i = 0; i < neighbors.size(); ++i) {
+                const u32& neighbor_id = neighbors[i];
+                // if (i + 1 < neighbors.size()) {
+                //     u32 next_neighbor_id = neighbors[i + 1];
+                //     _mm_prefetch(reinterpret_cast<const char*>(&visited_array[next_neighbor_id]), _MM_HINT_T0);
+                //     PID page_to_prefetch = getNodePID(next_neighbor_id);
+                //     u32 next_neighbor_off = NodeAccessor::getVectorOffset(this, next_neighbor_id);
+                //     bm.prefetchPages(&page_to_prefetch, 1, &next_neighbor_off);
+                // }
 
-            for (const u32& neighbor_id : neighbors) {
                 if (!(visited_array[neighbor_id] == visited_array_tag)) {
                     visited_array[neighbor_id] = visited_array_tag;
                     GuardO<HNSWPage> neighbor_page_guard(getNodePID(neighbor_id));
