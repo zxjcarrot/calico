@@ -19,7 +19,7 @@ cpp_args = [
     '-std=c++20',
     '-O3',
     '-DNDEBUG',
-    '-g', # Generates debug info
+    #'-g', # Generates debug info
     '-fnon-call-exceptions',
     '-fasynchronous-unwind-tables',
     '-march=native', # Recommended for performance

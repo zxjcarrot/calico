@@ -38,7 +38,7 @@ typedef uint32_t u32;
 typedef uint64_t u64;
 typedef u64 PID;  // page id type
 
-static const u64 pageSize = 4096;
+static constexpr u64 pageSize = 4096 * 8;
 
 __attribute__((target("sse4.2"))) uint64_t hash64(uint64_t key, uint32_t seed);
 
@@ -47,7 +47,7 @@ struct Hasher {
     uint64_t operator()(const KeyType& key) const { return hash64(key, 0xAAAAAAAA); }
 };
 
-struct alignas(4096) Page {
+struct alignas(pageSize) Page {
     bool dirty;
 };
 
@@ -502,21 +502,22 @@ struct GuardORelaxed {
         for (u64 repeatCounter = 0;; repeatCounter++) {
             u64 v = ps.stateAndVersion.load();
             switch (PageState::getState(v)) {
-                case PageState::Marked: {
-                    u64 newV = PageState::sameVersion(v, PageState::Unlocked);
-                    if (ps.stateAndVersion.compare_exchange_weak(v, newV)) {
-                        ptr = reinterpret_cast<T*>(bm.residentPtr(pid, ps, newV));
-                        version = newV;
-                        return;
-                    }
-                    break;
-                }
+                // case PageState::Marked: {
+                //     u64 newV = PageState::sameVersion(v, PageState::Unlocked);
+                //     if (ps.stateAndVersion.compare_exchange_weak(v, newV)) {
+                //         ptr = reinterpret_cast<T*>(bm.residentPtr(pid, ps, newV));
+                //         version = newV;
+                //         return;
+                //     }
+                //     break;
+                // }
                 case PageState::Evicted:
                     if (ps.tryLockX(v)) {
                         ptr = reinterpret_cast<T*>(bm.handleFault(pid));
                         bm.unfixX(pid);
                     }
                     break;
+                case PageState::Marked:
                 case PageState::Locked:// we can live with stale data here, fallthrough
                 default:
                     ptr = reinterpret_cast<T*>(bm.residentPtr(pid, ps, v));
@@ -572,7 +573,9 @@ struct GuardORelaxed {
     }
 
     // destructor
-    ~GuardORelaxed() noexcept(false) { checkVersionAndRestart(); }
+    ~GuardORelaxed() noexcept(false) { 
+        //checkVersionAndRestart(); 
+    }
 
     T* operator->() {
         assert(pid != moved);

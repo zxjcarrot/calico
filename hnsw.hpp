@@ -311,10 +311,11 @@ class HNSW {
         const HNSWPage* page;
         u32 node_index;
         const HNSW* hnsw;
+        const size_t node_offset;  // Precomputed node_index * FixedNodeSize
 
        public:
         NodeAccessor(const HNSWPage* p, u32 node_idx, const HNSW* hnsw_instance)
-            : page(p), node_index(node_idx), hnsw(hnsw_instance) {}
+            : page(p), node_index(node_idx), hnsw(hnsw_instance), node_offset(node_idx * hnsw_instance->FixedNodeSize) {}
 
         u32 getLevel() const {
             // Level is stored as the maximum non-zero count in the level counts array
@@ -327,20 +328,35 @@ class HNSW {
         }
 
         const float* getVector() const {
-            const u8* node_start = page->getNodeData() + node_index * hnsw->FixedNodeSize;
+            const u8* node_start = page->getNodeData() + node_offset;
             return reinterpret_cast<const float*>(node_start);
         }
 
-        static u32 getVectorOffset(HNSW* hnsw, u32 graph_node_id) {
+        static inline u32 getVectorOffset(HNSW* hnsw, u32 graph_node_id) {
             return HNSWPage::HeaderSize + hnsw->getNodeIndexInPage(graph_node_id) * hnsw->FixedNodeSize;
         }
 
+        static inline u32 getL0NeighborOffset(HNSW* hnsw, u32 graph_node_id) {
+            return HNSWPage::HeaderSize + hnsw->getNodeIndexInPage(graph_node_id) * hnsw->FixedNodeSize +
+                   VectorSize + hnsw->MaxNeighborsHeaderSize;
+        }
+
         const u16* getLevelCounts() const {
-            const u8* node_start = page->getNodeData() + node_index * hnsw->FixedNodeSize;
+            const u8* node_start = page->getNodeData() + node_offset;
             return reinterpret_cast<const u16*>(node_start + VectorSize);
         }
 
         std::span<const u32> getNeighbors(u32 level, const HNSW* hnsw_instance) const {
+            // optimize for level 0 access
+            if (level == 0) {
+                // directly return level 0 neighbors
+                const u8* node_start = page->getNodeData() + node_offset;
+                const u32* neighbor_ids_start =
+                    reinterpret_cast<const u32*>(node_start + VectorSize + hnsw_instance->MaxNeighborsHeaderSize);
+                u16 count_for_level = getLevelCounts()[0];
+                return {neighbor_ids_start, count_for_level};
+            }
+            // General case for levels > 0
             const u16* counts_per_level = getLevelCounts();
             if (level >= hnsw_instance->MaxLevel) return {};
 
@@ -352,7 +368,7 @@ class HNSW {
                 }
             }
 
-            const u8* node_start = page->getNodeData() + node_index * hnsw->FixedNodeSize;
+            const u8* node_start = page->getNodeData() + node_offset;
             const u32* neighbor_ids_start =
                 reinterpret_cast<const u32*>(node_start + VectorSize + hnsw_instance->MaxNeighborsHeaderSize);
             const u32* level_start_ptr = neighbor_ids_start + level_neighbor_offset_count;
@@ -367,28 +383,29 @@ class HNSW {
         HNSWPage* page;
         u32 node_index;
         const HNSW* hnsw;
+        const size_t node_offset;  // Precomputed node_index * FixedNodeSize
 
        public:
         MutableNodeAccessor(HNSWPage* p, u32 node_idx, const HNSW* hnsw_instance)
-            : page(p), node_index(node_idx), hnsw(hnsw_instance) {}
+            : page(p), node_index(node_idx), hnsw(hnsw_instance), node_offset(node_idx * hnsw_instance->FixedNodeSize) {}
 
         const float* getVector() const {
-            const u8* node_start = page->getNodeData() + node_index * hnsw->FixedNodeSize;
+            const u8* node_start = page->getNodeData() + node_offset;
             return reinterpret_cast<const float*>(node_start);
         }
 
         float* getVector() {
-            u8* node_start = page->getNodeData() + node_index * hnsw->FixedNodeSize;
+            u8* node_start = page->getNodeData() + node_offset;
             return reinterpret_cast<float*>(node_start);
         }
 
         u16* getLevelCounts() {
-            u8* node_start = page->getNodeData() + node_index * hnsw->FixedNodeSize;
+            u8* node_start = page->getNodeData() + node_offset;
             return reinterpret_cast<u16*>(node_start + VectorSize);
         }
 
         const u16* getLevelCounts() const {
-            const u8* node_start = page->getNodeData() + node_index * hnsw->FixedNodeSize;
+            const u8* node_start = page->getNodeData() + node_offset;
             return reinterpret_cast<const u16*>(node_start + VectorSize);
         }
 
@@ -404,7 +421,7 @@ class HNSW {
                 }
             }
 
-            const u8* node_start = page->getNodeData() + node_index * hnsw->FixedNodeSize;
+            const u8* node_start = page->getNodeData() + node_offset;
             const u32* neighbor_ids_start =
                 reinterpret_cast<const u32*>(node_start + VectorSize + hnsw_instance->MaxNeighborsHeaderSize);
             const u32* level_start_ptr = neighbor_ids_start + level_neighbor_offset_count;
@@ -424,7 +441,7 @@ class HNSW {
                 }
             }
 
-            u8* node_start = page->getNodeData() + node_index * hnsw->FixedNodeSize;
+            u8* node_start = page->getNodeData() + node_offset;
             u32* neighbor_ids_start =
                 reinterpret_cast<u32*>(node_start + VectorSize + hnsw_instance->MaxNeighborsHeaderSize);
             u32* level_start_ptr = neighbor_ids_start + level_neighbor_offset_count;
@@ -457,7 +474,7 @@ class HNSW {
                 }
             }
 
-            u8* node_start = page->getNodeData() + node_index * hnsw->FixedNodeSize;
+            u8* node_start = page->getNodeData() + node_offset;
             u32* neighbor_ids_start =
                 reinterpret_cast<u32*>(node_start + VectorSize + hnsw_instance->MaxNeighborsHeaderSize);
 

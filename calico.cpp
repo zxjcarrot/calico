@@ -311,7 +311,7 @@ BufferManager::BufferManager()
             virtMem = (Page*)mmap(NULL, virtAllocSize, PROT_READ | PROT_WRITE, MAP_SHARED, exmapfd, 0);
         } else {
             virtMem = (Page*)mmap(NULL, virtAllocSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-            madvise(virtMem, virtAllocSize, MADV_NOHUGEPAGE);
+            madvise(virtMem, virtAllocSize, MADV_HUGEPAGE);
         }
         if (virtMem == MAP_FAILED) die("mmap failed");
     }
@@ -373,16 +373,17 @@ Page* BufferManager::residentPtr(PID pid, PageState& ps, u64 stateAndVersion) {
     assert(pid < virtCount);
     if (!useTraditional) return virtMem + pid;
 
-    if (hashMode == HashMode::Array) {
-        u64 frame = pidToFrameArray[pid].load(std::memory_order_acquire);
-        assert(frame != invalidFrame);
+    if (hashMode == HashMode::Array1Access) {
+        u64 frame = PageState::extractFrame(stateAndVersion);
+        assert(frame != PageState::packedInvalidFrame);
         assert(frame < physCount);
         return frameMem + static_cast<size_t>(frame);
     }
 
-    if (hashMode == HashMode::Array1Access) {
-        u64 frame = PageState::extractFrame(stateAndVersion);
-        assert(frame != PageState::packedInvalidFrame);
+
+    if (hashMode == HashMode::Array) {
+        u64 frame = pidToFrameArray[pid].load(std::memory_order_acquire);
+        assert(frame != invalidFrame);
         assert(frame < physCount);
         return frameMem + static_cast<size_t>(frame);
     }
@@ -784,7 +785,6 @@ void BufferManager::evict() {
 }
 
 void BufferManager::prefetchPages(const PID* pages, int n_pages, const u32* offsets_within_pages) {
-    if (n_pages == 0) return;
     // if (!useTraditional) {
     //    // For mmap mode, all pages are always "resident"
     //    return;
@@ -817,6 +817,7 @@ void BufferManager::prefetchPages(const PID* pages, int n_pages, const u32* offs
                   // Touch the page to bring it into cache
                   char *tmp = (((char*)residentPtr(pid, ps, stateAndVersion)) + offsets_within_pages[i]);
                   _mm_prefetch(reinterpret_cast<const char*>(tmp), _MM_HINT_T0);
+                  _mm_prefetch(reinterpret_cast<const char*>(tmp) + 64, _MM_HINT_T0);
             }
             continue;
         }

@@ -381,9 +381,9 @@ def print_comparison_table(calico_res, hnswlib_res, params):
     """
     k = params['k']
     
-    METRIC_COL_WIDTH = 28
-    CALICO_COL_WIDTH = 25
-    HNSWLIB_COL_WIDTH = 25
+    METRIC_COL_WIDTH = 35
+    CALICO_COL_WIDTH = 40
+    HNSWLIB_COL_WIDTH = 40
     TOTAL_WIDTH = METRIC_COL_WIDTH + CALICO_COL_WIDTH + HNSWLIB_COL_WIDTH + 7
     
     def format_num(value):
