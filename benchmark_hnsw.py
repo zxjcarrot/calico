@@ -2,6 +2,7 @@ import numpy as np
 import time
 import os
 import sys
+import argparse
 
 # Add local hnswlib directory to Python path
 sys.path.insert(0, './hnswlib')
@@ -208,7 +209,7 @@ def calculate_recall(ground_truth, result_labels, k):
     return correct / (total_queries * k)
 
 
-def benchmark_calico(X_base, X_query, ground_truth, params, num_threads):
+def benchmark_calico(X_base, X_query, ground_truth, params, num_threads, enable_prefetch=True):
     print("\n--- Benchmarking calico_py HNSW ---")
     results = {}
 
@@ -217,10 +218,10 @@ def benchmark_calico(X_base, X_query, ground_truth, params, num_threads):
     X_base_float32 = np.ascontiguousarray(X_base, dtype=np.float32)
     X_query_float32 = np.ascontiguousarray(X_query, dtype=np.float32)
 
-    print(f"Building index with M={params['M']}, ef_construction={params['ef_construction']}...")
+    print(f"Building index with M={params['M']}, ef_construction={params['ef_construction']}, enable_prefetch={enable_prefetch}...")
     start_time = time.time()
     
-    index_calico = calico_py.HnswIndex(max_elements=num_elements)
+    index_calico = calico_py.HnswIndex(max_elements=num_elements, enable_prefetch=enable_prefetch)
     print("Start building graph")
     index_calico.add_items(X_base_float32, 0)
     
@@ -538,13 +539,21 @@ if __name__ == "__main__":
 
     # You can add the sift10m loading logic here if needed.
     
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser(description='Benchmark HNSW implementations with optional prefetch control')
+    parser.add_argument('--prefetch', action='store_true', default=True, 
+                        help='Enable prefetch optimization (default: True)')
+    parser.add_argument('--no-prefetch', dest='prefetch', action='store_false',
+                        help='Disable prefetch optimization')
+    args = parser.parse_args()
+    
     hnsw_params = {"M": 16, "ef_construction": 200, "k": 10, "ef_search": 50}
     num_threads = 1 # Set to 0 to let hnswlib auto-detect
     
-    print(f"Using {num_threads} threads for benchmarking.\n")
+    print(f"Using {num_threads} threads for benchmarking with prefetch={'enabled' if args.prefetch else 'disabled'}.\n")
     
     calico_results = benchmark_calico(
-        X_base, X_query, ground_truth, hnsw_params, num_threads
+        X_base, X_query, ground_truth, hnsw_params, num_threads, args.prefetch
     )
     hnswlib_results = benchmark_hnswlib(
         X_base, X_query, ground_truth, hnsw_params, num_threads

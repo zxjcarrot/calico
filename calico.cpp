@@ -200,6 +200,11 @@ u64 envOr(const char* env, u64 value) {
     return value;
 }
 
+float envOrF(const char* env, float value) {
+    if (getenv(env)) return atof(getenv(env));
+    return value;
+}
+
 double envOrDouble(const char* env, double value) {
     if (getenv(env)) return atof(getenv(env));
     return value;
@@ -207,7 +212,7 @@ double envOrDouble(const char* env, double value) {
 
 BufferManager::BufferManager()
     : virtSize(envOr("VIRTGB", 16) * gb),
-      physSize(envOr("PHYSGB", 4) * gb),
+      physSize(envOrF("PHYSGB", 4) * gb),
       virtCount(virtSize / pageSize),
       physCount(physSize / pageSize),
       residentSet(physCount) {
@@ -319,9 +324,6 @@ BufferManager::BufferManager()
     pageState = (PageState*)allocHuge(virtCount * sizeof(PageState));
     for (u64 i = 0; i < virtCount; i++) pageState[i].init();
 
-    libaioInterface.reserve(maxWorkerThreads);
-    for (unsigned i = 0; i < maxWorkerThreads; i++) libaioInterface.emplace_back(LibaioInterface(blockfd, this));
-
     physUsedCount = 0;
     allocCount = 1;  // pid 0 reserved for meta data
     readCount = 0;
@@ -329,12 +331,17 @@ BufferManager::BufferManager()
     batch = envOr("BATCH", 64);
 
     cerr << "vmcache "
-         << "blk:" << path << " virtgb:" << virtSize / gb << " physgb:" << physSize / gb
+         << "blk:" << path << " virtgb:" << virtSize / gb << " physgb:" << (float)physSize / gb
          << " traditional:" << useTraditional << " trad_hash:" << static_cast<int>(hashMode) << " exmap:" << useExmap
          << endl;
 }
 
 BufferManager::~BufferManager() {}
+
+LibaioInterface& BufferManager::getIOInterface() {
+    thread_local LibaioInterface instance(blockfd, this);
+    return instance;
+}
 
 bool BufferManager::isValidPtr(void* page) {
     if (useTraditional) return (page >= frameMem) && (page < (frameMem + physCount));
@@ -739,7 +746,7 @@ void BufferManager::evict() {
     }
 
     // 1. write dirty pages
-    libaioInterface[workerThreadId].writePages(toWrite);
+    getIOInterface().writePages(toWrite);
     writeCount += toWrite.size();
 
     // 2. try to lock clean page candidates
@@ -854,10 +861,10 @@ void BufferManager::prefetchPages(const PID* pages, int n_pages, const u32* offs
                 size_t batchSize = std::min(LibaioInterface::maxIOs, pidsToRead->size() - i);
                 vector<PID> batch(pidsToRead->begin() + i, pidsToRead->begin() + i + batchSize);
                 vector<Page*> batchDest(destinations->begin() + i, destinations->begin() + i + batchSize);
-                libaioInterface[workerThreadId].readPages(batch, batchDest);
+                getIOInterface().readPages(batch, batchDest);
             }
         } else {
-            libaioInterface[workerThreadId].readPages(*pidsToRead, *destinations);
+            getIOInterface().readPages(*pidsToRead, *destinations);
         }
 
         // Unlock all successfully loaded pages

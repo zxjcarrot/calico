@@ -38,7 +38,7 @@ typedef uint32_t u32;
 typedef uint64_t u64;
 typedef u64 PID;  // page id type
 
-static constexpr u64 pageSize = 4096 * 8;
+static constexpr u64 pageSize = 4096;
 
 __attribute__((target("sse4.2"))) uint64_t hash64(uint64_t key, uint32_t seed);
 
@@ -247,7 +247,13 @@ struct ResidentPageSet {
 
 struct BufferManager;
 
-struct LibaioInterface {
+struct IOInterface {
+    virtual void writePages(const std::vector<PID>& pages) = 0;
+    virtual void readPages(const std::vector<PID>& pages, const std::vector<Page*>& destinations) = 0;
+    virtual ~IOInterface() {}
+};
+
+struct LibaioInterface: public IOInterface {
     static const u64 maxIOs = 256;
 
     int blockfd;
@@ -258,8 +264,9 @@ struct LibaioInterface {
     io_event events[maxIOs];
 
     LibaioInterface(int blockfd, BufferManager* bm_ptr);
-    void writePages(const std::vector<PID>& pages);
-    void readPages(const std::vector<PID>& pages, const std::vector<Page*>& destinations);
+    ~LibaioInterface() {}
+    virtual void writePages(const std::vector<PID>& pages);
+    virtual void readPages(const std::vector<PID>& pages, const std::vector<Page*>& destinations);
 };
 
 struct FreePartition {
@@ -276,7 +283,6 @@ struct BufferManager {
     u64 virtCount;
     u64 physCount;
     struct exmap_user_interface* exmapInterface[maxWorkerThreads];
-    std::vector<LibaioInterface> libaioInterface;
 
     enum class HashMode { Array1Access = 0, Unordered = 1, OpenAddress = 2, Array = 3, Lockfree = 4 };
 
@@ -339,6 +345,8 @@ struct BufferManager {
     u32 partitionForFrame(u64 frame) const;
     void lockPartition(u32 partition);
     void unlockPartition(u32 partition);
+    
+    LibaioInterface& getIOInterface();
 };
 
 extern BufferManager* bm_ptr;

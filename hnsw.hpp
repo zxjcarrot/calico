@@ -254,6 +254,7 @@ class HNSW {
     PID base_pid;
     u64 max_elements_;
     double mult_factor;
+    bool enable_prefetch_;
     std::unique_ptr<VisitedListPool> visited_list_pool_{nullptr};
     
     // `mutable` allows const methods like searchKnn to update stats.
@@ -261,7 +262,7 @@ class HNSW {
 
    public:
     // Constructor with runtime parameters
-    HNSW(u64 max_elements, size_t M = 16, size_t ef_construction = 200);
+    HNSW(u64 max_elements, size_t M = 16, size_t ef_construction = 200, bool enable_prefetch = true);
     ~HNSW() { visited_list_pool_.reset(nullptr); }
 
    private:

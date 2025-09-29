@@ -110,8 +110,8 @@ PYBIND11_MODULE(calico_py, m) {
     });
 
     py::class_<HnswIndexType>(m, "HnswIndex")
-        .def(py::init<u64, size_t, size_t>(), py::arg("max_elements"), py::arg("M") = 16,
-             py::arg("ef_construction") = 200, "Initializes a new, empty HNSW index with runtime parameters.")
+        .def(py::init<u64, size_t, size_t, bool>(), py::arg("max_elements"), py::arg("M") = 16,
+             py::arg("ef_construction") = 200, py::arg("enable_prefetch") = true, "Initializes a new, empty HNSW index with runtime parameters.")
 
         .def(
             "add_points",

@@ -89,7 +89,7 @@ size_t HNSW<Dim, DistanceMetric>::estimateMaxLevel(u64 max_elements, size_t M) {
 
 // --- HNSW Constructor Implementation ---
 template <size_t Dim, typename DistanceMetric>
-HNSW<Dim, DistanceMetric>::HNSW(u64 max_elements, size_t M_param, size_t ef_construction_param)
+HNSW<Dim, DistanceMetric>::HNSW(u64 max_elements, size_t M_param, size_t ef_construction_param, bool enable_prefetch_param)
     : M(M_param),
       M0(2 * M_param),  // M0 = 2 * M as requested
       efConstruction(ef_construction_param),
@@ -98,7 +98,8 @@ HNSW<Dim, DistanceMetric>::HNSW(u64 max_elements, size_t M_param, size_t ef_cons
       MaxNeighborsListSize((M0 + (MaxLevel - 1) * M) * sizeof(u32)),
       FixedNodeSize(VectorSize + MaxNeighborsHeaderSize + MaxNeighborsListSize),
       MaxNodesPerPage((pageSize - HNSWPage::HeaderSize) / FixedNodeSize),
-      NodesPerPage(MaxNodesPerPage) {
+      NodesPerPage(MaxNodesPerPage),
+      enable_prefetch_(enable_prefetch_param) {
     // Validate that we can fit at least one node per page
     if (MaxNodesPerPage == 0) {
         throw std::runtime_error(
@@ -144,6 +145,7 @@ HNSW<Dim, DistanceMetric>::HNSW(u64 max_elements, size_t M_param, size_t ef_cons
 template <size_t Dim, typename DistanceMetric>
 u32 HNSW<Dim, DistanceMetric>::getRandomLevel() {
     thread_local static std::mt19937 level_generator(std::hash<std::thread::id>{}(std::this_thread::get_id()));
+    //static std::default_random_engine level_generator(100);
     std::uniform_real_distribution<double> distribution(0.0, 1.0);
     double r = -std::log(distribution(level_generator)) * mult_factor;
     return std::min(static_cast<u32>(r), static_cast<u32>(MaxLevel - 1));
@@ -153,7 +155,14 @@ template <size_t Dim, typename DistanceMetric>
 template <bool stats>
 std::pair<float, u32> HNSW<Dim, DistanceMetric>::findBestEntryPointForLevel(const float* query, u32 entry_point_id, int level, float entry_point_dist) {
     u32 current_node_id = entry_point_id;
-    float current_dist = entry_point_dist; // Use the pre-calculated distance
+    float min_dist = entry_point_dist; // Use the pre-calculated distance
+
+    VisitedList* visited_nodes = visited_list_pool_->getFreeVisitedList();
+    std::unique_ptr<VisitedList, std::function<void(VisitedList*)>> visited_guard(
+        visited_nodes, [&](VisitedList* p) { this->visited_list_pool_->releaseVisitedList(p); });
+
+    vl_type* visited_array = visited_nodes->mass;
+    vl_type visited_array_tag = visited_nodes->curV;
 
     std::vector<PID> pages_to_prefetch;
     std::vector<u32> offsets_within_pages;
@@ -163,36 +172,51 @@ std::pair<float, u32> HNSW<Dim, DistanceMetric>::findBestEntryPointForLevel(cons
     bool changed = true;
     while (changed) {
         changed = false;
-        u32 best_candidate = current_node_id;
-        float best_dist = current_dist;
+        u32 best_neighbor_id = current_node_id;
 
         try {
             GuardO<HNSWPage> current_page_guard(getNodePID(current_node_id));
             NodeAccessor current_acc(current_page_guard.ptr, getNodeIndexInPage(current_node_id), this);
 
+            // The first node is marked as visited here.
+            // Note: We don't need to re-calculate its distance as it's passed in.
+            visited_array[current_node_id] = visited_array_tag;
+
             if (stats) {
                 stats_.search_hops.fetch_add(1, std::memory_order_relaxed);
             }
-            
             auto neighbors_span = current_acc.getNeighbors(level, this);
 
-            if (stats) {
-                stats_.dist_comps.fetch_add(neighbors_span.size(), std::memory_order_relaxed);
-            }
-
             // Prefetch all neighbors' data at once before processing
-            if (level <= 1 && !neighbors_span.empty()) {
+            if (!neighbors_span.empty() && enable_prefetch_) {
+                // for (const u32& neighbor_id : neighbors_span) {
+                //     _mm_prefetch(reinterpret_cast<const char*>(&visited_array[neighbor_id]), _MM_HINT_T0);
+                // }
                 pages_to_prefetch.clear();
                 offsets_within_pages.clear();
                 for (const u32& neighbor_id : neighbors_span) {
-                    pages_to_prefetch.push_back(getNodePID(neighbor_id));
-                    offsets_within_pages.push_back(NodeAccessor::getVectorOffset(this, neighbor_id));
+                    if (!(visited_array[neighbor_id] == visited_array_tag)) {
+                        pages_to_prefetch.push_back(getNodePID(neighbor_id));
+                        offsets_within_pages.push_back(NodeAccessor::getVectorOffset(this, neighbor_id));
+                    }
                 }
                 bm.prefetchPages(pages_to_prefetch.data(), pages_to_prefetch.size(), offsets_within_pages.data());
             }
 
-            for (const u32& neighbor_id : neighbors_span) {
-                try {
+            for (size_t i = 0; i < neighbors_span.size(); ++i) {
+                const u32& neighbor_id = neighbors_span[i];
+
+                // // In-loop prefetch for the *next* neighbor to keep the pipeline full.
+                // if (i + 1 < neighbors_span.size()) {
+                //     u32 next_neighbor_id = neighbors_span[i + 1];
+                //     _mm_prefetch(reinterpret_cast<const char*>(&visited_array[next_neighbor_id]), _MM_HINT_T0);
+                //     PID page_to_prefetch = getNodePID(next_neighbor_id);
+                //     bm.prefetchPages(&page_to_prefetch, 1);
+                // }
+
+                if (!(visited_array[neighbor_id] == visited_array_tag)) {
+                    visited_array[neighbor_id] = visited_array_tag;
+
                     GuardO<HNSWPage> neighbor_page_guard(getNodePID(neighbor_id));
                     NodeAccessor neighbor_acc(neighbor_page_guard.ptr, getNodeIndexInPage(neighbor_id), this);
 
@@ -203,27 +227,22 @@ std::pair<float, u32> HNSW<Dim, DistanceMetric>::findBestEntryPointForLevel(cons
                         neighbor_dist = DistanceMetric::compare(query, neighbor_acc.getVector(), Dim);
                     }
 
-                    if (neighbor_dist < best_dist) {
-                        best_dist = neighbor_dist;
-                        best_candidate = neighbor_id;
+                    if (neighbor_dist < min_dist) {
+                        min_dist = neighbor_dist;
+                        best_neighbor_id = neighbor_id;
                         changed = true;
                     }
-                } catch (const OLCRestartException&) {
-                    // Skip this neighbor if there's a concurrent modification
-                    continue;
                 }
             }
-            
-            current_node_id = best_candidate;
-            current_dist = best_dist;
-            
+            current_node_id = best_neighbor_id;
         } catch (const OLCRestartException&) {
-            // If we can't read the current node, break out of the loop
+            // If a concurrent modification happens, stop the greedy search at this level
+            // and proceed with the best node found so far.
             changed = false;
         }
     }
 
-    return {current_dist, current_node_id};
+    return {min_dist, current_node_id};
 }
 
 template <size_t Dim, typename DistanceMetric>
@@ -326,7 +345,7 @@ std::vector<std::pair<float, u32>> HNSW<Dim, DistanceMetric>::searchLayer(
 
             // Prefetch all neighbors' vector data at once before processing
             // only prefetch aggressively for lower levels as the top levels have exponentially fewer nodes and are likely to be cached
-            if (level <= 2 && !neighbors.empty()) {
+            if (level <= 2 && !neighbors.empty() && enable_prefetch_) {
                 // for (const u32& neighbor_id : neighbors) { 
                 //     _mm_prefetch(reinterpret_cast<const char*>(&visited_array[neighbor_id]), _MM_HINT_T0);
                 // }
@@ -357,7 +376,7 @@ std::vector<std::pair<float, u32>> HNSW<Dim, DistanceMetric>::searchLayer(
 
                 if (!(visited_array[neighbor_id] == visited_array_tag)) {
                     visited_array[neighbor_id] = visited_array_tag;
-                    GuardORelaxed<HNSWPage> neighbor_page_guard(getNodePID(neighbor_id));
+                    GuardO<HNSWPage> neighbor_page_guard(getNodePID(neighbor_id));
                     NodeAccessor neighbor_acc(neighbor_page_guard.ptr, getNodeIndexInPage(neighbor_id), this);
                     float neighbor_dist;
                     if (stats) {
@@ -677,29 +696,23 @@ void HNSW<Dim, DistanceMetric>::addPoint_parallel(std::span<const float> points,
             addPoint_internal(points.data() + i * Dim, start_id + i);
         }
     } else {
-        // Batch size: process 16 points per task to reduce future overhead
-        constexpr size_t BATCH_SIZE = 32;
-        size_t num_batches = (num_points + BATCH_SIZE - 1) / BATCH_SIZE;
-        
         ThreadPool pool(threads_to_use);
         std::vector<std::future<void>> futures;
-        futures.reserve(num_batches);
+        futures.reserve(threads_to_use);
         
-        // Atomic counter for work distribution
-        std::atomic<size_t> batch_counter{0};
+        // Atomic counter for work distribution - each thread will fetch_add(1) to get next point index
+        std::atomic<size_t> point_counter{0};
         
         for (size_t thread_idx = 0; thread_idx < threads_to_use; ++thread_idx) {
-            futures.emplace_back(pool.enqueue([this, points_data = points.data(), start_id, num_points, &batch_counter]() {
-                size_t batch_idx;
-                while ((batch_idx = batch_counter.fetch_add(1, std::memory_order_relaxed)) * BATCH_SIZE < num_points) {
-                    size_t start_idx = batch_idx * BATCH_SIZE;
-                    size_t end_idx = std::min(start_idx + BATCH_SIZE, num_points);
-                    
-                    // Process this batch of points
-                    for (size_t i = start_idx; i < end_idx; ++i) {
-                        const float* point_vector = points_data + i * Dim;
-                        u32 node_id = start_id + i;
-                        this->addPoint_internal(point_vector, node_id);
+            futures.emplace_back(pool.enqueue([this, points_data = points.data(), start_id, num_points, &point_counter]() {
+                size_t point_idx;
+                // print every 10%th point added by all threads
+                while ((point_idx = point_counter.fetch_add(1, std::memory_order_relaxed)) < num_points) {
+                    const float* point_vector = points_data + point_idx * Dim;
+                    u32 node_id = start_id + point_idx;
+                    this->addPoint_internal(point_vector, node_id);
+                    if (point_idx % (num_points / 10 + 1) == 0) {
+                        std::cout << "Added point " << point_idx + 1 << " / " << num_points << std::endl;
                     }
                 }
             }));
