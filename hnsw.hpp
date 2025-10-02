@@ -4,18 +4,18 @@
 #include <atomic>
 #include <cmath>
 #include <functional>
-#include <limits>  // Required for std::numeric_limits
+#include <iomanip>
+#include <limits>
 #include <optional>
 #include <queue>
 #include <random>
 #include <span>
 #include <vector>
-#include <iomanip>  // For std::setprecision
 
 #include "calico.hpp"
 #include "distance.hpp"
 
-// --- HNSW Metadata ---
+// --- HNSW Metadata & Support Structures ---
 
 typedef unsigned char vl_type;
 
@@ -41,12 +41,6 @@ class VisitedList {
 
     ~VisitedList() { delete[] mass; }
 };
-
-///////////////////////////////////////////////////////////
-//
-// Class for multi-threaded pool-management of VisitedLists
-//
-/////////////////////////////////////////////////////////
 
 class VisitedListPool {
     std::deque<VisitedList*> pool;
@@ -88,23 +82,15 @@ class VisitedListPool {
     }
 };
 
-// --- HNSW Stats ---
 struct HNSWStats {
-    // Live counters (updated during operations)
     std::atomic<u64> dist_comps{0};
-    std::atomic<u64> search_hops{0};  // Total nodes visited/evaluated during search
-
-    // Snapshot stats (calculated by iterating the graph)
+    std::atomic<u64> search_hops{0};
     u32 num_levels = 0;
     std::vector<u64> nodes_per_level;
     std::vector<u64> links_per_level;
     double avg_neighbors_total = 0.0;
     std::vector<double> avg_neighbors_per_level;
-
-    // Default constructor
     HNSWStats() = default;
-
-    // Custom Copy Constructor
     HNSWStats(const HNSWStats& other) {
         dist_comps.store(other.dist_comps.load());
         search_hops.store(other.search_hops.load());
@@ -160,8 +146,6 @@ struct HNSWStats {
         dist_comps.store(0);
         search_hops.store(0);
     }
-
-    // Format stats into a readable string
     std::string toString() const {
         std::ostringstream oss;
         oss << "--- HNSW Performance Stats ---\n";
@@ -191,63 +175,100 @@ struct HNSWStats {
     }
 };
 
+// --- Core HNSW Structures ---
+
+// Represents a logical pointer to a block within an OverflowPage.
+struct OverflowPointer {
+    PID page_id;
+    u16 offset;  // Offset within the OverflowPage where the LinkListBlock starts.
+    static constexpr PID INVALID_PID = std::numeric_limits<PID>::max();
+
+    bool isValid() const { return page_id != INVALID_PID; }
+};
+
 struct HNSWMetadataPage {
     bool dirty;
-    PID base_pid;                 // The starting Page ID for HNSW data pages.
-    u64 max_elements;             // The maximum number of elements the index can hold.
-    std::atomic<u64> node_count;  // The total number of nodes currently inserted.
+    PID base_pid;
+    u64 max_elements;
+    std::atomic<u64> node_count;
 
-    // Entry point information.
-    u32 enter_point_node_id;     // The global entry point node ID for the graph.
-    std::atomic<u32> max_level;  // The highest level currently present in the graph.
+    u32 enter_point_node_id;
+    std::atomic<u32> max_level;
+
+    // --- Added fields for managing overflow page allocations ---
+    PID last_overflow_pid;     // Tracks the current overflow page for new allocations.
+    u16 last_overflow_offset;  // Tracks the next free byte offset on that page.
+
     static constexpr u32 invalid_node_id = std::numeric_limits<u32>::max();
 };
 
 // --- HNSW Main Class ---
 
-template <size_t Dim,  // Vector dimension.
-          typename DistanceMetric = hnsw_distance::SIMDAcceleratedL2>
+template <size_t Dim, typename DistanceMetric = hnsw_distance::SIMDAcceleratedL2>
 class HNSW {
    public:
-    // Fixed-size node layout (no more slots/indirection):
-    // Each node has: [Vector Data][Level Counts][Neighbor IDs]
-    // Node size is constant and computed at runtime
+    // --- Runtime parameters ---
+    const size_t M;
+    const size_t M0;
+    const size_t efConstruction;
+    const size_t MaxLevel;
 
-    // --- Runtime parameters (formerly template parameters) ---
-    const size_t M;               // Max number of neighbors for layers > 0
-    const size_t M0;              // Max number of neighbors for layer 0 (computed as 2*M)
-    const size_t efConstruction;  // Number of neighbors to search during index construction
-    const size_t MaxLevel;        // Pre-estimated max level for random level generation
-
-    // --- Runtime size calculations for fixed-size nodes ---
-    const size_t MaxNeighborsHeaderSize;  // MaxLevel * sizeof(u16) - level counts
-    const size_t MaxNeighborsListSize;    // (M0 + (MaxLevel - 1) * M) * sizeof(u32) - neighbor IDs
+    // --- Runtime size and offset calculations for the new layout ---
     static constexpr size_t VectorSize = Dim * sizeof(float);
-    const size_t FixedNodeSize;  // VectorSize + MaxNeighborsHeaderSize + MaxNeighborsListSize
+    const size_t BaseNodeSize;      // Size of a single node's data on a BaseNodePage
+    const size_t LinkSizePerLevel;  // Size of neighbor list for one level on an OverflowPage (u16 count + M * u32 ids)
+    const size_t MaxNodesPerBasePage;
 
-    // HNSW data page: uses fixed-size node grid layout for direct access.
-    struct HNSWPage {
+    // --- Page Structures defined within the HNSW class scope ---
+
+    // A page containing the primary data for nodes (vector, level 0 neighbors).
+    struct BaseNodePage {
         bool dirty;
         u16 node_count;
-        u16 padding[3];  // Align to 8 bytes
-
+        u16 padding[3];
         static constexpr size_t HeaderSize = sizeof(dirty) + sizeof(node_count) + sizeof(padding);
 
-        // Get node data area (nodes start immediately after header)
-        u8* getNodeData() { return reinterpret_cast<u8*>(this) + HeaderSize; }
-
-        const u8* getNodeData() const { return reinterpret_cast<const u8*>(this) + HeaderSize; }
+        u8* getNodeDataArea() { return reinterpret_cast<u8*>(this) + HeaderSize; }
+        const u8* getNodeDataArea() const { return reinterpret_cast<const u8*>(this) + HeaderSize; }
     };
 
-    const size_t MaxNodesPerPage;  // Runtime computed: (pageSize - HNSWPage::HeaderSize) / FixedNodeSize
-    const size_t NodesPerPage;     // Same as MaxNodesPerPage
+    // A page that acts as a heap for storing higher-level neighbor lists.
+    struct OverflowPage {
+        bool dirty;
+        u16 free_space_offset;  // Offset to the next available byte for allocation.
+        u16 padding[3];
+        static constexpr size_t HeaderSize = sizeof(dirty) + sizeof(free_space_offset) + sizeof(padding);
 
-    // Calculates and returns a snapshot of the graph structure stats,
-    // along with the current values of live counters.
+        u8* getDataArea() { return reinterpret_cast<u8*>(this) + HeaderSize; }
+        const u8* getDataArea() const { return reinterpret_cast<const u8*>(this) + HeaderSize; }
+    };
+
+   public:
+    // --- Public API ---
+    HNSW(u64 max_elements, size_t M = 16, size_t ef_construction = 200, bool enable_prefetch = true);
+    ~HNSW() { visited_list_pool_.reset(nullptr); }
+
+    void addPoint(const float* point, u32& node_id_out);
+    void addPoint_parallel(std::span<const float> points, size_t num_threads = 0);
+
+    template <bool stats = false>
+    std::vector<std::pair<float, u32>> searchKnn(const float* query, size_t k, size_t ef_search_param);
+
+    template <bool stats = false>
+    std::vector<std::vector<std::pair<float, u32>>> searchKnn_parallel(std::span<const float> queries, size_t k,
+                                                                       size_t ef_search_param, size_t num_threads = 0);
+
     HNSWStats getStats() const;
-
-    // Resets live counters like distance computations and search hops.
     void resetStats() { stats_.reset_live_counters(); }
+    PID getMetadataPid() const { return metadata_pid; }
+    u64 getBufferManagerAllocCount() const;
+    std::string getIndexInfo() const;
+
+    HNSW(const HNSW&) = delete;
+    HNSW& operator=(const HNSW&) = delete;
+    HNSW(HNSW&&) = delete;
+    HNSW& operator=(HNSW&&) = delete;
+    
 
    private:
     PID metadata_pid;
@@ -256,244 +277,18 @@ class HNSW {
     double mult_factor;
     bool enable_prefetch_;
     std::unique_ptr<VisitedListPool> visited_list_pool_{nullptr};
-    
-    // `mutable` allows const methods like searchKnn to update stats.
     mutable HNSWStats stats_;
 
-   public:
-    // Constructor with runtime parameters
-    HNSW(u64 max_elements, size_t M = 16, size_t ef_construction = 200, bool enable_prefetch = true);
-    ~HNSW() { visited_list_pool_.reset(nullptr); }
+    // --- Private helper functions for the new layout ---
+    OverflowPointer allocateOverflowSpace(size_t required_size);
+    static size_t calculateBaseNodeSize(size_t M0_param);
 
-   private:
-    // Helper function to estimate MaxLevel from max_elements
+    // Internal implementation helpers (signatures might change to adapt to new layout)
+    void addPoint_internal(const float* point, u32 node_id);
+    u32 getRandomLevel();
     static size_t estimateMaxLevel(u64 max_elements, size_t M);
 
-    inline float calculateDistance(const float* v1, const float* v2, size_t dim) const {
-        // This is now the single point for distance calculation counting.
-        stats_.dist_comps.fetch_add(1, std::memory_order_relaxed);
-        return DistanceMetric::compare(v1, v2, dim);
-    }
-
-   public:
-    // Add a point to the index.
-    void addPoint(const float* point, u32& node_id_out);
-
-    // Search for the K nearest neighbors for a single query.
-    template <bool stats = false>
-    std::vector<std::pair<float, u32>> searchKnn(const float* query, size_t k, size_t ef_search_param);
-
-    // Search for the K nearest neighbors for a batch of queries in parallel.
-    template <bool stats = false>
-    std::vector<std::vector<std::pair<float, u32>>> searchKnn_parallel(std::span<const float> queries, size_t k,
-                                                                       size_t ef_search_param, size_t num_threads = 0);
-    // Add a batch of points to the index in parallel.
-    void addPoint_parallel(std::span<const float> points, size_t num_threads = 0);
-
-    HNSW(const HNSW&) = delete;
-    HNSW& operator=(const HNSW&) = delete;
-    HNSW(HNSW&&) = delete;
-    HNSW& operator=(HNSW&&) = delete;
-    PID getMetadataPid() const { return metadata_pid; }
-
-    // Get buffer manager statistics
-    u64 getBufferManagerAllocCount() const;
-
-    // Print comprehensive index information
-    std::string getIndexInfo() const;
-
-   private:
-    // --- Internal Helper Classes & Functions ---
-    inline PID getNodePID(u32 node_id) const;
-    inline u32 getNodeIndexInPage(u32 node_id) const;
-
-    class NodeAccessor {
-       private:
-        const HNSWPage* page;
-        u32 node_index;
-        const HNSW* hnsw;
-        const size_t node_offset;  // Precomputed node_index * FixedNodeSize
-
-       public:
-        NodeAccessor(const HNSWPage* p, u32 node_idx, const HNSW* hnsw_instance)
-            : page(p), node_index(node_idx), hnsw(hnsw_instance), node_offset(node_idx * hnsw_instance->FixedNodeSize) {}
-
-        u32 getLevel() const {
-            // Level is stored as the maximum non-zero count in the level counts array
-            const u16* counts = getLevelCounts();
-            u32 max_level = 0;
-            for (u32 i = 0; i < hnsw->MaxLevel; ++i) {
-                if (counts[i] > 0) max_level = i;
-            }
-            return max_level;
-        }
-
-        const float* getVector() const {
-            const u8* node_start = page->getNodeData() + node_offset;
-            return reinterpret_cast<const float*>(node_start);
-        }
-
-        static inline u32 getVectorOffset(HNSW* hnsw, u32 graph_node_id) {
-            return HNSWPage::HeaderSize + hnsw->getNodeIndexInPage(graph_node_id) * hnsw->FixedNodeSize;
-        }
-
-        static inline u32 getL0NeighborOffset(HNSW* hnsw, u32 graph_node_id) {
-            return HNSWPage::HeaderSize + hnsw->getNodeIndexInPage(graph_node_id) * hnsw->FixedNodeSize +
-                   VectorSize + hnsw->MaxNeighborsHeaderSize;
-        }
-
-        const u16* getLevelCounts() const {
-            const u8* node_start = page->getNodeData() + node_offset;
-            return reinterpret_cast<const u16*>(node_start + VectorSize);
-        }
-
-        std::span<const u32> getNeighbors(u32 level, const HNSW* hnsw_instance) const {
-            // optimize for level 0 access
-            if (level == 0) {
-                // directly return level 0 neighbors
-                const u8* node_start = page->getNodeData() + node_offset;
-                const u32* neighbor_ids_start =
-                    reinterpret_cast<const u32*>(node_start + VectorSize + hnsw_instance->MaxNeighborsHeaderSize);
-                u16 count_for_level = getLevelCounts()[0];
-                return {neighbor_ids_start, count_for_level};
-            }
-            // General case for levels > 0
-            const u16* counts_per_level = getLevelCounts();
-            if (level >= hnsw_instance->MaxLevel) return {};
-
-            u32 level_neighbor_offset_count = 0;
-            if (level > 0) {
-                level_neighbor_offset_count += hnsw_instance->M0;
-                for (u32 i = 1; i < level; ++i) {
-                    level_neighbor_offset_count += hnsw_instance->M;
-                }
-            }
-
-            const u8* node_start = page->getNodeData() + node_offset;
-            const u32* neighbor_ids_start =
-                reinterpret_cast<const u32*>(node_start + VectorSize + hnsw_instance->MaxNeighborsHeaderSize);
-            const u32* level_start_ptr = neighbor_ids_start + level_neighbor_offset_count;
-            u16 count_for_level = counts_per_level[level];
-            return {level_start_ptr, count_for_level};
-        }
-    };
-
-    // Non-const version for modification
-    class MutableNodeAccessor {
-       private:
-        HNSWPage* page;
-        u32 node_index;
-        const HNSW* hnsw;
-        const size_t node_offset;  // Precomputed node_index * FixedNodeSize
-
-       public:
-        MutableNodeAccessor(HNSWPage* p, u32 node_idx, const HNSW* hnsw_instance)
-            : page(p), node_index(node_idx), hnsw(hnsw_instance), node_offset(node_idx * hnsw_instance->FixedNodeSize) {}
-
-        const float* getVector() const {
-            const u8* node_start = page->getNodeData() + node_offset;
-            return reinterpret_cast<const float*>(node_start);
-        }
-
-        float* getVector() {
-            u8* node_start = page->getNodeData() + node_offset;
-            return reinterpret_cast<float*>(node_start);
-        }
-
-        u16* getLevelCounts() {
-            u8* node_start = page->getNodeData() + node_offset;
-            return reinterpret_cast<u16*>(node_start + VectorSize);
-        }
-
-        const u16* getLevelCounts() const {
-            const u8* node_start = page->getNodeData() + node_offset;
-            return reinterpret_cast<const u16*>(node_start + VectorSize);
-        }
-
-        std::span<const u32> getNeighbors(u32 level, const HNSW* hnsw_instance) const {
-            const u16* counts_per_level = getLevelCounts();
-            if (level >= hnsw_instance->MaxLevel) return {};
-
-            u32 level_neighbor_offset_count = 0;
-            if (level > 0) {
-                level_neighbor_offset_count += hnsw_instance->M0;
-                for (u32 i = 1; i < level; ++i) {
-                    level_neighbor_offset_count += hnsw_instance->M;
-                }
-            }
-
-            const u8* node_start = page->getNodeData() + node_offset;
-            const u32* neighbor_ids_start =
-                reinterpret_cast<const u32*>(node_start + VectorSize + hnsw_instance->MaxNeighborsHeaderSize);
-            const u32* level_start_ptr = neighbor_ids_start + level_neighbor_offset_count;
-            u16 count_for_level = counts_per_level[level];
-            return {level_start_ptr, count_for_level};
-        }
-
-        void setNeighbors(u32 level, const std::vector<u32>& new_neighbors, const HNSW* hnsw_instance) {
-            u16* counts_per_level = getLevelCounts();
-            if (level >= hnsw_instance->MaxLevel) return;
-
-            u32 level_neighbor_offset_count = 0;
-            if (level > 0) {
-                level_neighbor_offset_count += hnsw_instance->M0;
-                for (u32 i = 1; i < level; ++i) {
-                    level_neighbor_offset_count += hnsw_instance->M;
-                }
-            }
-
-            u8* node_start = page->getNodeData() + node_offset;
-            u32* neighbor_ids_start =
-                reinterpret_cast<u32*>(node_start + VectorSize + hnsw_instance->MaxNeighborsHeaderSize);
-            u32* level_start_ptr = neighbor_ids_start + level_neighbor_offset_count;
-            size_t M_level = (level == 0) ? hnsw_instance->M0 : hnsw_instance->M;
-
-            size_t count_to_copy = std::min(new_neighbors.size(), M_level);
-            std::copy(new_neighbors.begin(), new_neighbors.begin() + count_to_copy, level_start_ptr);
-            counts_per_level[level] = count_to_copy;
-            page->dirty = true;
-        }
-
-        bool addNeighbor(u32 level, u32 new_neighbor_id, const HNSW* hnsw_instance) {
-            u16* counts_per_level = getLevelCounts();
-            if (level >= hnsw_instance->MaxLevel) return false;
-
-            size_t M_level = (level == 0) ? hnsw_instance->M0 : hnsw_instance->M;
-            u16 current_count = counts_per_level[level];
-
-            // Check if there is space
-            if (current_count >= M_level) {
-                return false;
-            }
-
-            // Calculate the memory offset to the start of the neighbor list for this level
-            u32 level_neighbor_offset_count = 0;
-            if (level > 0) {
-                level_neighbor_offset_count += hnsw_instance->M0;
-                for (u32 i = 1; i < level; ++i) {
-                    level_neighbor_offset_count += hnsw_instance->M;
-                }
-            }
-
-            u8* node_start = page->getNodeData() + node_offset;
-            u32* neighbor_ids_start =
-                reinterpret_cast<u32*>(node_start + VectorSize + hnsw_instance->MaxNeighborsHeaderSize);
-
-            // Get the pointer to the exact location to append the new neighbor
-            u32* append_location = neighbor_ids_start + level_neighbor_offset_count + current_count;
-
-            // Write the new neighbor ID directly into the page
-            *append_location = new_neighbor_id;
-
-            // Increment the count for this level
-            counts_per_level[level]++;
-            page->dirty = true;
-
-            return true;
-        }
-    };
-
-    u32 getRandomLevel();
+    // Search helpers
     template <bool stats = false>
     std::vector<std::pair<float, u32>> searchLayer(const float* query, u32 entry_point_id, u32 level, size_t ef,
                                                    std::optional<std::pair<float, u32>> initial_entry_dist_pair);
@@ -503,12 +298,162 @@ class HNSW {
     template <bool stats = false>
     std::pair<float, u32> searchBaseLayer(const float* query, u32 entry_point_id, int start_level, int end_level);
 
-    // --- Now takes the query vector to match hnswlib's heuristic ---
     std::vector<std::pair<float, u32>> selectNeighborsHeuristic(const float* query,
                                                                 const std::vector<std::pair<float, u32>>& candidates,
                                                                 size_t M_limit);
 
-    void addPoint_internal(const float* point, u32 node_id);
+    // --- Location helpers ---
+    inline PID getNodePID(u32 node_id) const;
+    inline u32 getNodeIndexInPage(u32 node_id) const;
+
+    // --- Node Accessors ---
+
+    // Accessor for reading data from a BaseNodePage. It does NOT access OverflowPages.
+    // It provides the OverflowPointer, which the caller must use to fetch the correct OverflowPage.
+    class NodeAccessor {
+       private:
+        const u8* node_start_ptr_;  // Pointer to the start of this node's slot in the page
+        const HNSW* hnsw_;
+
+       public:
+        NodeAccessor(const BaseNodePage* page, u32 node_idx, const HNSW* hnsw_instance) : hnsw_(hnsw_instance) {
+            node_start_ptr_ = page->getNodeDataArea() + node_idx * hnsw_->BaseNodeSize;
+        }
+
+        const float* getVector() const { return reinterpret_cast<const float*>(node_start_ptr_); }
+
+        u16 getLevel() const { return *reinterpret_cast<const u16*>(node_start_ptr_ + VectorSize); }
+
+        u16 getL0Count() const { return *reinterpret_cast<const u16*>(node_start_ptr_ + VectorSize + sizeof(u16)); }
+
+        OverflowPointer getOverflowPointer() const {
+            return *reinterpret_cast<const OverflowPointer*>(node_start_ptr_ + VectorSize + sizeof(u16) + sizeof(u16));
+        }
+
+        std::span<const u32> getL0Neighbors() const {
+            const u32* neighbors_start = reinterpret_cast<const u32*>(node_start_ptr_ + VectorSize + sizeof(u16) +
+                                                                      sizeof(u16) + sizeof(OverflowPointer));
+            return {neighbors_start, getL0Count()};
+        }
+
+        // Helper to get higher-level neighbors from a provided, already-fetched OverflowPage.
+        // The CALLER is responsible for fetching the page using the OverflowPointer.
+        std::span<const u32> getHigherLevelNeighbors(u32 level, const OverflowPage* overflow_page) const {
+            if (level == 0) return {};
+
+            OverflowPointer ptr = getOverflowPointer();
+            if (!ptr.isValid()) return {};
+
+            // Calculate offset to the start of this level's neighbor list within the LinkListBlock
+            size_t level_offset_in_block = (level - 1) * hnsw_->LinkSizePerLevel;
+            const u8* list_start = overflow_page->getDataArea() + ptr.offset + level_offset_in_block;
+
+            u16 count = *reinterpret_cast<const u16*>(list_start);
+            const u32* neighbors = reinterpret_cast<const u32*>(list_start + sizeof(u16));
+            return {neighbors, count};
+        }
+
+        static inline size_t getVectorOffset(const HNSW* hnsw_instance, u32 graph_node_id) {
+            u32 node_idx_in_page = hnsw_instance->getNodeIndexInPage(graph_node_id);
+            // The offset is the page header size plus the space for all preceding nodes in that page.
+            // The vector is the very first field in the node's data slot.
+            return BaseNodePage::HeaderSize + (node_idx_in_page * hnsw_instance->BaseNodeSize);
+        }
+    };
+
+    // Mutable accessor for modifying a node's data.
+    class MutableNodeAccessor {
+       private:
+        u8* node_start_ptr_;
+        HNSW* hnsw_;
+        BaseNodePage* page_;  // Keep a pointer to the page to mark it dirty
+
+       public:
+        MutableNodeAccessor(BaseNodePage* page, u32 node_idx, HNSW* hnsw_instance) : hnsw_(hnsw_instance), page_(page) {
+            node_start_ptr_ = page->getNodeDataArea() + node_idx * hnsw_->BaseNodeSize;
+        }
+
+        float* getVector() { return reinterpret_cast<float*>(node_start_ptr_); }
+        u16 getLevel() const { return *reinterpret_cast<const u16*>(node_start_ptr_ + VectorSize); }
+        void setLevel(u16 level) {
+            *reinterpret_cast<u16*>(node_start_ptr_ + VectorSize) = level;
+            page_->dirty = true;
+        }
+        u16 getL0Count() const { return *reinterpret_cast<const u16*>(node_start_ptr_ + VectorSize + sizeof(u16)); }
+        void setL0Count(u16 count) {
+            *reinterpret_cast<u16*>(node_start_ptr_ + VectorSize + sizeof(u16)) = count;
+            page_->dirty = true;
+        }
+        void setOverflowPointer(OverflowPointer ptr) {
+            *reinterpret_cast<OverflowPointer*>(node_start_ptr_ + VectorSize + sizeof(u16) + sizeof(u16)) = ptr;
+            page_->dirty = true;
+        }
+
+        OverflowPointer getOverflowPointer() const {
+            return *reinterpret_cast<const OverflowPointer*>(node_start_ptr_ + VectorSize + sizeof(u16) + sizeof(u16));
+        }
+
+        void setL0Neighbors(const std::vector<u32>& new_neighbors) {
+            u32* neighbors_start = reinterpret_cast<u32*>(node_start_ptr_ + VectorSize + sizeof(u16) + sizeof(u16) +
+                                                          sizeof(OverflowPointer));
+            size_t count_to_copy = std::min(new_neighbors.size(), hnsw_->M0);
+            std::copy(new_neighbors.begin(), new_neighbors.begin() + count_to_copy, neighbors_start);
+            setL0Count(count_to_copy);
+        }
+
+        std::span<const u32> getL0Neighbors() const {
+            const u32* neighbors_start = reinterpret_cast<const u32*>(node_start_ptr_ + VectorSize + sizeof(u16) +
+                                                                      sizeof(u16) + sizeof(OverflowPointer));
+            return {neighbors_start, getL0Count()};
+        }
+
+        // Helper to modify higher-level neighbors on a provided OverflowPage.
+        void setHigherLevelNeighbors(u32 level, const std::vector<u32>& new_neighbors, OverflowPage* overflow_page) {
+            if (level == 0) return;
+
+            OverflowPointer ptr =
+                *reinterpret_cast<const OverflowPointer*>(node_start_ptr_ + VectorSize + sizeof(u16) + sizeof(u16));
+
+            if (!ptr.isValid()) return;  // Should not happen if called correctly
+
+            size_t level_offset_in_block = (level - 1) * hnsw_->LinkSizePerLevel;
+            u8* list_start = overflow_page->getDataArea() + ptr.offset + level_offset_in_block;
+
+            size_t count_to_copy = std::min(new_neighbors.size(), hnsw_->M);
+            *reinterpret_cast<u16*>(list_start) = count_to_copy;
+            u32* neighbors = reinterpret_cast<u32*>(list_start + sizeof(u16));
+            std::copy(new_neighbors.begin(), new_neighbors.begin() + count_to_copy, neighbors);
+
+            overflow_page->dirty = true;
+        }
+
+        std::span<const u32> getHigherLevelNeighbors(u32 level, const OverflowPage* overflow_page) const {
+            if (level == 0) return {};
+
+            OverflowPointer ptr = getOverflowPointer();
+            if (!ptr.isValid()) return {};
+
+            // Calculate offset to the start of this level's neighbor list within the LinkListBlock
+            size_t level_offset_in_block = (level - 1) * hnsw_->LinkSizePerLevel;
+            const u8* list_start = overflow_page->getDataArea() + ptr.offset + level_offset_in_block;
+
+            u16 count = *reinterpret_cast<const u16*>(list_start);
+            const u32* neighbors = reinterpret_cast<const u32*>(list_start + sizeof(u16));
+            return {neighbors, count};
+        }
+
+        static inline size_t getVectorOffset(const HNSW* hnsw_instance, u32 graph_node_id) {
+            u32 node_idx_in_page = hnsw_instance->getNodeIndexInPage(graph_node_id);
+            // The offset is the page header size plus the space for all preceding nodes in that page.
+            // The vector is the very first field in the node's data slot.
+            return BaseNodePage::HeaderSize + (node_idx_in_page * hnsw_instance->BaseNodeSize);
+        }
+    };
+
+    inline float calculateDistance(const float* v1, const float* v2, size_t dim) const {
+        stats_.dist_comps.fetch_add(1, std::memory_order_relaxed);
+        return DistanceMetric::compare(v1, v2, dim);
+    }
 };
 
 #endif  // HNSW_HPP

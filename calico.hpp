@@ -598,6 +598,91 @@ struct GuardORelaxed {
 };
 
 template <class T>
+struct GuardO_NoThrow {
+    PID pid;
+    T* ptr;
+    u64 version;
+    static const u64 moved = ~0ull;
+
+    explicit GuardO_NoThrow(u64 pid) : pid(pid), ptr(nullptr) {
+        assert(pid != moved);
+        PageState& ps = bm.getPageState(pid);
+        for (u64 repeatCounter = 0;; repeatCounter++) {
+            u64 v = ps.stateAndVersion.load();
+            switch (PageState::getState(v)) {
+                case PageState::Marked: {
+                    u64 newV = PageState::sameVersion(v, PageState::Unlocked);
+                    if (ps.stateAndVersion.compare_exchange_weak(v, newV)) {
+                        ptr = reinterpret_cast<T*>(bm.residentPtr(pid, ps, newV));
+                        version = newV;
+                        return;
+                    }
+                    break;
+                }
+                case PageState::Locked:
+                    break;
+                case PageState::Evicted:
+                    if (ps.tryLockX(v)) {
+                        ptr = reinterpret_cast<T*>(bm.handleFault(pid));
+                        bm.unfixX(pid);
+                    }
+                    break;
+                default:
+                    ptr = reinterpret_cast<T*>(bm.residentPtr(pid, ps, v));
+                    version = v;
+                    return;
+            }
+            yield(repeatCounter);
+        }
+    }
+
+    GuardO_NoThrow(GuardO_NoThrow&& other) noexcept {
+        pid = other.pid;
+        ptr = other.ptr;
+        version = other.version;
+        other.pid = moved;
+    }
+    
+    GuardO_NoThrow& operator=(GuardO_NoThrow&& other) noexcept {
+        pid = other.pid;
+        ptr = other.ptr;
+        version = other.version;
+        other.pid = moved;
+        other.ptr = nullptr;
+        return *this;
+    }
+
+    GuardO_NoThrow(const GuardO_NoThrow&) = delete;
+    GuardO_NoThrow& operator=(const GuardO_NoThrow&) = delete;
+
+    ~GuardO_NoThrow() noexcept {
+        // No version check here!
+    }
+
+    void check() {
+        if (pid != moved) {
+            PageState& ps = bm.getPageState(pid);
+            u64 stateAndVersion = ps.stateAndVersion.load();
+            if (version == stateAndVersion) return;
+            if ((stateAndVersion << 8) == (version << 8)) {
+                u64 state = PageState::getState(stateAndVersion);
+                if (state <= PageState::MaxShared) return;
+                if (state == PageState::Marked)
+                    if (ps.stateAndVersion.compare_exchange_weak(
+                            stateAndVersion, PageState::sameVersion(stateAndVersion, PageState::Unlocked)))
+                        return;
+            }
+            throw OLCRestartException();
+        }
+    }
+
+    T* operator->() {
+        assert(pid != moved);
+        return ptr;
+    }
+};
+
+template <class T>
 struct GuardX {
     PID pid;
     T* ptr;
