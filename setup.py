@@ -17,9 +17,9 @@ all_sources = ['bindings.cpp', 'calico.cpp', 'hnsw.cpp'] + tpcc_sources
 # Compiler arguments translated from your Makefile
 cpp_args = [
     '-std=c++20',
-    '-O3',
+    '-O1',
     '-DNDEBUG',
-    #'-g', # Generates debug info
+    '-g3', # Generates debug info
     '-fnon-call-exceptions',
     '-fasynchronous-unwind-tables',
     '-march=native', # Recommended for performance

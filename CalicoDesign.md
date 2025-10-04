@@ -10,6 +10,27 @@ Calico is a high-performance buffer pool that combines the best aspects of diffe
 
 The key insight is that **user-space indirection with huge page optimization** can eliminate the traditional performance trade-offs between direct memory mapping and flexible buffer pool management.
 
+**Table 1: Conceptual comparison of buffer manager designs**
+
+| Property | `mmap` | Trad. Hash | Pointer Swiz. | vmcache+`exmap`/libdbos | **Calico** |
+|----------|--------|------------|---------------|-----------------|------------|
+| **Translation Control** | <span style="background-color:#FFFFE0">Page tbl. (OS)</span> | <span style="background-color:#90EE90">Hash tbl. (DBMS)</span> | <span style="background-color:#FFB6C6">Invasive (DBMS)</span> | <span style="background-color:#90EE90">Page tbl. (DBMS)</span> | **<span style="background-color:#90EE90">Array (DBMS)</span>** |
+| **Graph Support** | <span style="background-color:#90EE90">Yes</span> | <span style="background-color:#90EE90">Yes</span> | <span style="background-color:#FFB6C6">No</span> | <span style="background-color:#90EE90">Yes</span> | **<span style="background-color:#90EE90">Yes</span>** |
+| **Implementation** | <span style="background-color:#90EE90">Easy</span> | <span style="background-color:#90EE90">Easy</span> | <span style="background-color:#FFB6C6">Hard</span> | <span style="background-color:#FFFFE0">Medium</span> | **<span style="background-color:#90EE90">Easy (user)</span>** |
+| **In-Memory Speed** | <span style="background-color:#90EE90">Fast</span> | <span style="background-color:#FFB6C6">Slow</span> | <span style="background-color:#90EE90">Fast</span> | <span style="background-color:#90EE90">Fast</span> | **<span style="background-color:#90EE90">Fast</span>** |
+| **Out-of-Memory I/O** | <span style="background-color:#FFB6C6">Slow</span> | <span style="background-color:#90EE90">Fast</span> | <span style="background-color:#90EE90">Fast</span> | <span style="background-color:#90EE90">Fast</span> | **<span style="background-color:#90EE90">Fast</span>** |
+| **Huge Page Friendly** | <span style="background-color:#FFB6C6">No†</span> | <span style="background-color:#90EE90">Yes</span> | <span style="background-color:#90EE90">Fast</span> | <span style="background-color:#FFB6C6">No†</span> | **<span style="background-color:#90EE90">Yes</span>** |
+| **Kernel Module Required** | <span style="background-color:#90EE90">No</span> | <span style="background-color:#90EE90">No</span> | <span style="background-color:#90EE90">No</span> | <span style="background-color:#FFB6C6">Yes</span> | **<span style="background-color:#90EE90">No</span>** |
+| **User Control** | <span style="background-color:#FFB6C6">Limited</span> | <span style="background-color:#90EE90">Full</span> | <span style="background-color:#90EE90">Full</span> | <span style="background-color:#FFB6C6">Limited</span> | **<span style="background-color:#90EE90">Full</span>** |
+
+*Legend: <span style="background-color:#90EE90">Green</span> = Good, <span style="background-color:#FFFFE0">Yellow</span> = Medium, <span style="background-color:#FFB6C6">Light Red</span> = Bad*
+
+**Key Distinctions:**
+- †`mmap` and VMCache/`exmap` cannot use huge pages due to eviction granularity conflicts (4KB page eviction breaks 2MB huge page boundaries)
+- Calico combines user-space control with huge page optimization through array-based indirection
+- Pointer swizzling requires invasive changes to data structures, limiting applicability to graph workloads
+- Kernel solutions (VMCache/`exmap`) require custom modules and have deployment complexity
+
 ## The Buffer Management Challenge
 
 Modern database systems face a fundamental trade-off when choosing buffer pool implementations:
@@ -33,7 +54,7 @@ Modern database systems face a fundamental trade-off when choosing buffer pool i
 
 ## Calico's Innovation: Array-Based Translation
 
-Calico's breakthrough is replacing hash table translation with **direct array indexing**. Instead of computing hash values and handling collisions, page translation becomes simple array access:
+Calico's idea is replacing hash table translation with **direct array indexing**. Instead of computing hash values and handling collisions, page translation becomes simple array access:
 
 ```cpp
 PageState* state = &pageStateArray[pageId];
@@ -116,19 +137,8 @@ The indirection layer supports three core operations:
 
 ### Performance Characteristics
 
-**Calico vs Existing Approaches**
+As shown in Table 1, Calico uniquely combines fast in-memory performance with fast out-of-memory I/O while maintaining huge page support and full user-space control. The key breakthrough is that huge page optimization makes indirection overhead negligible while preserving all the benefits of user-space buffer management.
 
-| Property | `mmap` | Hash Tables | `exmap` | **Calico** |
-|----------|--------|-------------|---------|------------|
-| **In-Memory Speed** | Fast | Slow | Fast | **Fast** |
-| **I/O Efficiency** | Slow | Fast | Fast | **Fast** |  
-| **Huge Page Support** | No* | Yes | No* | **Yes** |
-| **User Control** | Limited | Full | Limited | **Full** |
-| **Kernel Dependencies** | None | None | Module | **None** |
-
-*Cannot use huge pages due to eviction granularity conflicts
-
-The key breakthrough is that huge page optimization makes indirection overhead negligible while preserving all the benefits of user-space buffer management.
 
 ## Performance Evaluation
 
@@ -167,7 +177,14 @@ We evaluated Calico using comprehensive multi-threaded benchmarks on both synthe
 - **Huge pages critical for all approaches**: 14.4% penalty for array, 13.9% penalty for lockfree hash when disabled
 - **Traditional hash tables suffer severely**: 60-64% overhead from collision handling in B-tree operations
 
-### Graph Traversal: Real-World Validation
+### Vector Search: pgvector
+
+
+![alt text](fb6c059b3fc1c9df3644cf1e2d8eab35.png)
+
+Buffer pool and cache misses are the major bottlenecks in hnsw-based vector search.
+
+### Graph Traversal
 
 To validate Calico's effectiveness for irregular access patterns, we benchmarked all configurations using breadth-first search on a 5-million-node graph. This workload exercises the same memory patterns found in modern vector databases and graph analytics systems.
 
@@ -178,8 +195,8 @@ To validate Calico's effectiveness for irregular access patterns, we benchmarked
 | **calico_array** | **4,918** | **34.55** | **24.23** | **Baseline (100%)** |
 | calico_mmap | 7,190 | 57.17 | 31.68 | 31.6% slower |
 | calico_array_nohuge | 7,815 | 57.36 | 31.74 | 37.1% slower |
-| calico_lockfree_hash | 8,659 | 64.71 | 56.57 | 43.2% slower |
-| calico_unordered_hash | 25,088 | 128.83 | 107.89 | 80.4% slower |
+| calico_lockfree_openaddr_hash | 8,659 | 64.71 | 56.57 | 43.2% slower |
+| calico_chained_hash | 25,088 | 128.83 | 107.89 | 80.4% slower |
 
 **Key Insights:**
 

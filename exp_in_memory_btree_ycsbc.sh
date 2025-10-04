@@ -74,6 +74,29 @@ run_experiment() {
     done
 }
 
+# Function to run experiments for a specific base configuration with huge page variations
+run_config_combinations() {
+    local thread_count="$1"
+    local base_name="$2"
+    local base_description="$3"
+    shift 3
+    local base_env_vars=("$@")
+    
+    echo "=================================================================="
+    echo "Running huge page combinations for: ${base_name} with ${thread_count} threads"
+    echo "=================================================================="
+    
+    # Combination 1: No huge pages
+    run_experiment ${thread_count} "${base_name}_nohuge" \
+        "${base_description} (no huge pages)" \
+        "${base_env_vars[@]}" "NOHUGEPAGE_FRAME_MEM=1"
+    
+    # Combination 2: With huge pages
+    run_experiment ${thread_count} "${base_name}_huge" \
+        "${base_description} (with huge pages)" \
+        "${base_env_vars[@]}" "NOHUGEPAGE_FRAME_MEM=0"
+}
+
 # Create main experiment directory
 mkdir -p "${EXP_BASE_DIR}"
 
@@ -113,33 +136,25 @@ EOF
     
     echo "Running experiments with ${threads} threads..." >> "${GLOBAL_SUMMARY_FILE}"
     
-    # Experiment 1: Calico mmap (virtual memory cache)
-    run_experiment ${threads} "calico_mmap" "Calico with mmap (virtual memory cache)" \
-        "TRADITIONAL=0" "TRADHASH=0"
-
-    # Experiment 2: Calico array (traditional buffer pool with array translator)
-    run_experiment ${threads} "calico_array" "Calico with traditional buffer pool using array translator" \
+    # Configuration 1: Calico array (traditional buffer pool with array translator)
+    run_config_combinations ${threads} "calico_array" "Calico with traditional buffer pool using array translator" \
         "TRADITIONAL=1" "TRADHASH=0"
 
-    # Experiment 3: Calico array + nohuge (array translator without huge pages)
-    run_experiment ${threads} "calico_array_nohuge" "Calico array translator without huge pages for frame memory" \
-        "TRADITIONAL=1" "TRADHASH=0" "NOHUGEPAGE_FRAME_MEM=1"
+    # Configuration 2: Calico mmap (virtual memory cache)
+    run_config_combinations ${threads} "calico_mmap" "Calico with mmap (virtual memory cache)" \
+        "TRADITIONAL=0" "TRADHASH=0"
 
-    # Experiment 4: Calico unordered_hash (traditional buffer pool with unordered_map)
-    run_experiment ${threads} "calico_unordered_hash" "Calico with traditional buffer pool using unordered_map translator" \
+    # Configuration 3: Calico chained_hash (traditional buffer pool with unordered_map)
+    run_config_combinations ${threads} "calico_chained_hash" "Calico with traditional buffer pool using chained hash (unordered_map) translator" \
         "TRADITIONAL=1" "TRADHASH=1"
 
-    # Experiment 5: Calico openaddr_hash (traditional buffer pool with open addressing)
-    run_experiment ${threads} "calico_openaddr_hash" "Calico with traditional buffer pool using open addressing hash translator" \
+    # Configuration 4: Calico openaddr_hash (traditional buffer pool with open addressing)
+    run_config_combinations ${threads} "calico_openaddr_hash" "Calico with traditional buffer pool using open addressing hash translator" \
         "TRADITIONAL=1" "TRADHASH=2"
     
-    # Experiment 6: Calico lockfree_hash (traditional buffer pool with lock free open addressing)
-    run_experiment ${threads} "calico_lockfree_hash" "Calico with traditional buffer pool using lock free open addressing hash translator" \
+    # Configuration 5: Calico lockfree_hash (traditional buffer pool with lock free open addressing)
+    run_config_combinations ${threads} "calico_lockfree_hash" "Calico with traditional buffer pool using lock free open addressing hash translator" \
         "TRADITIONAL=1" "TRADHASH=4"
-
-    # Experiment 7: Calico lockfree_hash + nohuge (lock free open addressing without huge pages)
-    run_experiment ${threads} "calico_lockfree_hash_nohuge" "Calico lockfree hash translator without huge pages for frame memory" \
-        "TRADITIONAL=1" "TRADHASH=4" "NOHUGEPAGE_FRAME_MEM=1"
 
     echo "Completed experiments with ${threads} threads" >> "${GLOBAL_SUMMARY_FILE}"
     echo "" >> "${GLOBAL_SUMMARY_FILE}"
@@ -155,6 +170,14 @@ echo "ALL EXPERIMENTS COMPLETED SUCCESSFULLY!"
 echo "=================================================================="
 echo "Results saved in: ${EXP_BASE_DIR}"
 echo "Global summary file: ${GLOBAL_SUMMARY_FILE}"
+echo
+echo "Configuration combinations tested per thread count:"
+echo "  - calico_array: 2 combinations (nohuge, huge)"
+echo "  - calico_mmap: 2 combinations (nohuge, huge)"
+echo "  - calico_chained_hash: 2 combinations (nohuge, huge)"
+echo "  - calico_openaddr_hash: 2 combinations (nohuge, huge)"
+echo "  - calico_lockfree_hash: 2 combinations (nohuge, huge)"
+echo "  Total per thread count: 10 experiment configurations"
 echo
 echo "Directory structure:"
 find "${EXP_BASE_DIR}" -type d | sort

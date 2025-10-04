@@ -289,6 +289,7 @@ struct BufferManager {
     bool useTraditional;
     bool useExmap;
     HashMode hashMode;
+    unsigned numThreads;
     int blockfd;
     int exmapfd;
 
@@ -316,7 +317,7 @@ struct BufferManager {
 
     PageState& getPageState(PID pid) { return pageState[pid]; }
 
-    BufferManager();
+    BufferManager(unsigned nthreads = 1);
     ~BufferManager();
 
     Page* fixX(PID pid);

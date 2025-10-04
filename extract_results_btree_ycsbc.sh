@@ -61,8 +61,14 @@ extract_avg_throughput() {
 # Create summary CSV header
 echo "thread_count,config_name,avg_throughput,llc_miss_per_op,dtlb_miss_per_op,cycles_per_op,insts_per_op,ipc" > "${EXP_BASE_DIR}/results_summary_all.csv"
 
-# List of configurations to process
-configs=("calico_mmap" "calico_array" "calico_array_nohuge" "calico_unordered_hash" "calico_openaddr_hash" "calico_lockfree_hash" "calico_lockfree_hash_nohuge")
+# List of configurations to process (huge page variations)
+configs=(
+    "calico_array_nohuge" "calico_array_huge"
+    "calico_mmap_nohuge" "calico_mmap_huge"
+    "calico_chained_hash_nohuge" "calico_chained_hash_huge"
+    "calico_openaddr_hash_nohuge" "calico_openaddr_hash_huge"
+    "calico_lockfree_hash_nohuge" "calico_lockfree_hash_huge"
+)
 
 echo "Extracting results from experiment files for all thread counts..."
 echo "=================================================================="
@@ -126,11 +132,24 @@ for threads in "${THREAD_COUNTS[@]}"; do
     fi
 done
 echo
+echo "Configuration combinations processed:"
+echo "  - calico_array: 2 combinations (nohuge, huge)"
+echo "  - calico_mmap: 2 combinations (nohuge, huge)"
+echo "  - calico_chained_hash: 2 combinations (nohuge, huge)"
+echo "  - calico_openaddr_hash: 2 combinations (nohuge, huge)"
+echo "  - calico_lockfree_hash: 2 combinations (nohuge, huge)"
+echo "  Total per thread count: 10 configurations"
+echo
 
 echo "Global Results Summary (all thread counts):"
 echo "--------------------------------------------"
 if [ -f "${EXP_BASE_DIR}/results_summary_all.csv" ]; then
-    column -t -s',' "${EXP_BASE_DIR}/results_summary_all.csv"
+    column -t -s',' "${EXP_BASE_DIR}/results_summary_all.csv" | head -100
+    total_lines=$(wc -l < "${EXP_BASE_DIR}/results_summary_all.csv")
+    if [ "$total_lines" -gt 100 ]; then
+        echo "... (showing first 100 lines, total ${total_lines} lines)"
+        echo "View complete results: ${EXP_BASE_DIR}/results_summary_all.csv"
+    fi
 fi
 echo
 

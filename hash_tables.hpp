@@ -75,6 +75,38 @@ public:
    }
 };
 
+// Single-threaded specialization with no mutex overhead
+template <typename K, typename V>
+class ShardedUnorderedMap<K, V, 1> : public PartitionedMap<K, V> {
+   std::unordered_map<K, V, Hasher<K>> map;
+
+public:
+   void reserve(size_t entries) override {
+      map.reserve(entries);
+   }
+
+   void insertOrAssign(const K& key, const V& value) override {
+      map[key] = value;
+   }
+
+   bool tryGet(const K& key, V& value) const override {
+      auto it = map.find(key);
+      if (it == map.end())
+         return false;
+      value = it->second;
+      return true;
+   }
+
+   bool erase(const K& key, V& value) override {
+      auto it = map.find(key);
+      if (it == map.end())
+         return false;
+      value = it->second;
+      map.erase(it);
+      return true;
+   }
+};
+
 template <typename K, typename V>
 struct OAEntry {
    enum class State : uint8_t { Empty, Occupied, Deleted };
@@ -262,6 +294,148 @@ public:
       auto& shard = shards[shardFor(key)];
       std::unique_lock lock(shard.mutex);
       return shard.erase(key, value);
+   }
+};
+
+// Single-threaded specialization with no mutex overhead
+template <typename K, typename V>
+class ShardedOpenAddressMap<K, V, 1> : public PartitionedMap<K, V> {
+   std::vector<OAEntry<K, V>> table;
+   size_t size = 0;
+   Hasher<K> hasher;
+
+   static size_t nextPow2(size_t v) {
+      if (v < 8)
+         return 8;
+      v--;
+      v |= v >> 1;
+      v |= v >> 2;
+      v |= v >> 4;
+      v |= v >> 8;
+      v |= v >> 16;
+#if SIZE_MAX > UINT32_MAX
+      v |= v >> 32;
+#endif
+      return v + 1;
+   }
+
+   void ensureCapacity() {
+      if (table.empty())
+         rehash(8);
+      else if ((size + 1) * 10 > table.size() * 7)
+         rehash(table.size() * 2);
+   }
+
+   void rehash(size_t newCap) {
+      newCap = nextPow2(newCap);
+      std::vector<OAEntry<K, V>> newTable(newCap);
+      size_t oldSize = size;
+      size = 0;
+      for (auto& entry : table) {
+         if (entry.state == OAEntry<K, V>::State::Occupied)
+            insertInto(newTable, entry.key, entry.value);
+      }
+      table.swap(newTable);
+      size = oldSize;
+      madvise(table.data(), table.size() * sizeof(OAEntry<K, V>), MADV_HUGEPAGE);
+   }
+
+   void insertInto(std::vector<OAEntry<K, V>>& tbl, const K& key, const V& value) {
+      size_t mask = tbl.size() - 1;
+      size_t idx = hasher(key) & mask;
+      size_t firstDeleted = tbl.size();
+      for (;;) {
+         auto& slot = tbl[idx];
+         if (slot.state == OAEntry<K, V>::State::Empty) {
+            size_t target = (firstDeleted != tbl.size()) ? firstDeleted : idx;
+            auto& dest = tbl[target];
+            dest.key = key;
+            dest.value = value;
+            dest.state = OAEntry<K, V>::State::Occupied;
+            return;
+         } else if (slot.state == OAEntry<K, V>::State::Deleted) {
+            if (firstDeleted == tbl.size())
+               firstDeleted = idx;
+         } else if (slot.key == key) {
+            slot.value = value;
+            return;
+         }
+         idx = (idx + 1) & mask;
+      }
+   }
+
+public:
+   void reserve(size_t entries) override {
+      rehash(nextPow2(entries * 2));
+   }
+
+   void insertOrAssign(const K& key, const V& value) override {
+      ensureCapacity();
+      size_t mask = table.size() - 1;
+      size_t idx = hasher(key) & mask;
+      size_t firstDeleted = table.size();
+      for (;;) {
+         auto& slot = table[idx];
+         if (slot.state == OAEntry<K, V>::State::Empty) {
+            size_t target = (firstDeleted != table.size()) ? firstDeleted : idx;
+            auto& dest = table[target];
+            dest.key = key;
+            dest.value = value;
+            if (dest.state != OAEntry<K, V>::State::Occupied) {
+               dest.state = OAEntry<K, V>::State::Occupied;
+               size++;
+            }
+            return;
+         } else if (slot.state == OAEntry<K, V>::State::Deleted) {
+            if (firstDeleted == table.size())
+               firstDeleted = idx;
+         } else if (slot.key == key) {
+            slot.value = value;
+            return;
+         }
+         idx = (idx + 1) & mask;
+         if (idx == (hasher(key) & mask)) {
+            rehash(table.size() * 2);
+            insertOrAssign(key, value);
+            return;
+         }
+      }
+   }
+
+   bool tryGet(const K& key, V& value) const override {
+      if (table.empty())
+         return false;
+      size_t mask = table.size() - 1;
+      size_t idx = hasher(key) & mask;
+      for (;;) {
+         const auto& slot = table[idx];
+         if (slot.state == OAEntry<K, V>::State::Empty)
+            return false;
+         if (slot.state == OAEntry<K, V>::State::Occupied && slot.key == key) {
+            value = slot.value;
+            return true;
+         }
+         idx = (idx + 1) & mask;
+      }
+   }
+
+   bool erase(const K& key, V& value) override {
+      if (table.empty())
+         return false;
+      size_t mask = table.size() - 1;
+      size_t idx = hasher(key) & mask;
+      for (;;) {
+         auto& slot = table[idx];
+         if (slot.state == OAEntry<K, V>::State::Empty)
+            return false;
+         if (slot.state == OAEntry<K, V>::State::Occupied && slot.key == key) {
+            value = slot.value;
+            slot.state = OAEntry<K, V>::State::Deleted;
+            size--;
+            return true;
+         }
+         idx = (idx + 1) & mask;
+      }
    }
 };
 
