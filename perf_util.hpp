@@ -55,8 +55,8 @@ public:
             anyNew = true;
          }
       }
-      if (anyNew)
-         printConfiguredEvents();
+      // if (anyNew)
+      //    printConfiguredEvents();
    }
 
    void add(const std::array<std::uint64_t, kNumEvents>& values)

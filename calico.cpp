@@ -75,7 +75,14 @@ static int exmapAction(int exmapfd, exmap_opcode op, u16 len) {
 
 // allocate memory using huge pages
 void* allocHuge(size_t size) {
-    void* p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    //void* p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    //madvise(p, size, MADV_HUGEPAGE);
+    void* p = nullptr;
+    int ret = posix_memalign(&p, 2 * 1024 * 1024, size);
+    if (ret != 0) {
+        std::cerr << "posix_memalign failed: " << strerror(ret) << std::endl;
+        exit(EXIT_FAILURE);
+    }
     madvise(p, size, MADV_HUGEPAGE);
     return p;
 }
@@ -327,10 +334,15 @@ BufferManager::BufferManager(unsigned nthreads)
             virtMem = (Page*)mmap(NULL, virtAllocSize, PROT_READ | PROT_WRITE, MAP_SHARED, exmapfd, 0);
         } else {
             virtMem = (Page*)mmap(NULL, virtAllocSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            int ret = 0;
             if (disableHugePageForFrameMem) {
-                madvise(virtMem, virtAllocSize, MADV_NOHUGEPAGE);
+                ret = madvise(virtMem, virtAllocSize, MADV_NOHUGEPAGE);
             } else {
-                madvise(virtMem, virtAllocSize, MADV_HUGEPAGE);
+                ret = madvise(virtMem, virtAllocSize, MADV_HUGEPAGE);
+            }
+            if (ret != 0) {
+                std::cerr << "madvise failed with error: " << strerror(errno) << std::endl;
+                exit(EXIT_FAILURE);
             }
         }
         if (virtMem == MAP_FAILED) die("mmap failed");
@@ -349,6 +361,7 @@ BufferManager::BufferManager(unsigned nthreads)
          << "blk:" << path << " virtgb:" << virtSize / gb << " physgb:" << (float)physSize / gb
          << " traditional:" << useTraditional << " trad_hash:" << static_cast<int>(hashMode) << " exmap:" << useExmap
          << endl;
+    // prefault the first PHYSGB worth of pages into the memory using 
 }
 
 BufferManager::~BufferManager() {}
@@ -504,13 +517,14 @@ void BufferManager::lockPartition(u32 partition) {
 
 void BufferManager::unlockPartition(u32 partition) { freePartitions[partition].lock.clear(std::memory_order_release); }
 
+const char* systemName = nullptr;
 static void runGraphBenchmark(u64 nodeCount, u64 startIndex, unsigned nthreads) {
     if (nodeCount == 0) {
         std::cout << "graph_bfs nodes=0" << std::endl;
         return;
     }
 
-    u32 desiredNeighbors = 2 * static_cast<u32>(std::log(static_cast<double>(std::max<u64>(2, nodeCount))) / std::log(2.0));
+    u32 desiredNeighbors = static_cast<u32>(std::log(static_cast<double>(std::max<u64>(2, nodeCount))) / std::log(2.0));
     desiredNeighbors = std::max<u32>(1, desiredNeighbors);
     u32 maxNeighbors = GraphNodePage::maxNeighbors();
     desiredNeighbors = std::min(desiredNeighbors, maxNeighbors);
@@ -518,24 +532,52 @@ static void runGraphBenchmark(u64 nodeCount, u64 startIndex, unsigned nthreads) 
     std::vector<PID> nodePids;
     nodePids.reserve(nodeCount);
 
-    std::mt19937_64 rng(42);
-    std::uniform_int_distribution<u64> distNode(0, nodeCount - 1);
-    std::uniform_int_distribution<u64> valueDist(1, 1000);
-
+    std::cout << "bm.physcount * 9 = " << bm.physCount * 0.9 << std::endl;
+    // prefault the physical memory
     for (u64 i = 0; i < nodeCount; i++) {
         auto* page = reinterpret_cast<GraphNodePage*>(bm.allocPage());
         PID pid = bm.toPID(page);
         page->neighborCount = 0;
         page->padding = 0;
-        page->value = valueDist(rng);
         nodePids.push_back(pid);
-        page->dirty = true;
+        // if (i == 3774870) {
+        //     std::ifstream meminfo("/proc/meminfo");
+        //     if (meminfo.is_open()) {
+        //         std::string line;
+        //         std::cout << "==== /proc/meminfo ====" << std::endl;
+        //         while (std::getline(meminfo, line)) {
+        //             std::cout << line << std::endl;
+        //         }
+        //         std::cout << "=======================" << std::endl;
+        //         meminfo.close();
+        //     } else {
+        //         std::cerr << "Failed to open /proc/meminfo" << std::endl;
+        //     }
+        // }
+        page->dirty = false;
         bm.unfixX(pid);
     }
+
+    std::mt19937_64 rng(42);
+    std::uniform_int_distribution<u64> distNode(0, nodeCount - 1);
+    std::uniform_int_distribution<u64> valueDist(1, 1000);
+
+    // for (u64 i = 0; i < nodeCount; i++) {
+    //     GraphNodePage* page = reinterpret_cast<GraphNodePage*>(bm.fixX(nodePids[i]));
+    //     //auto* page = reinterpret_cast<GraphNodePage*>(bm.allocPage());
+    //     PID pid = bm.toPID(page);
+    //     page->neighborCount = 0;
+    //     page->padding = 0;
+    //     page->value = valueDist(rng);
+    //     page->dirty = true;
+    //     bm.unfixX(pid);
+    // }
 
     for (u64 i = 0; i < nodeCount; i++) {
         GraphNodePage* node = reinterpret_cast<GraphNodePage*>(bm.fixX(nodePids[i]));
         node->neighborCount = desiredNeighbors;
+        node->padding = 0;
+        node->value = valueDist(rng);
         PID* neighbors = node->neighborData();
         for (u32 j = 0; j < desiredNeighbors; j++) neighbors[j] = nodePids[distNode(rng)];
         node->dirty = true;
@@ -563,18 +605,14 @@ static void runGraphBenchmark(u64 nodeCount, u64 startIndex, unsigned nthreads) 
         }
     }
     
-    cerr << "bfs nodes=" << nodeCount << " neighbors_per_node=" << desiredNeighbors 
-         << " nthreads=" << nthreads << " start_indices=[";
-    for (unsigned t = 0; t < nthreads; t++) {
-        cerr << startIndices[t];
-        if (t < nthreads - 1) cerr << ",";
-    }
-    cerr << "]" << endl;
-
     // Results for each thread
     std::vector<u64> threadVisitCounts(nthreads, 0);
     std::vector<u64> threadTotalValues(nthreads, 0);
     std::vector<u64> threadDurationsMs(nthreads, 0);
+    
+    // For periodic stats collection
+    std::atomic<bool> keepRunningGraph{true};
+    std::atomic<u64> globalVisitProgress{0};
     
     auto runBFS = [&](unsigned threadId) {
         workerThreadId = threadId;
@@ -585,6 +623,8 @@ static void runGraphBenchmark(u64 nodeCount, u64 startIndex, unsigned nthreads) 
         
         u64 visitCount = 0;
         u64 totalValue = 0;
+        u64 localVisitProgress = 0;
+        const u64 visitBatchSize = 1000; // Batch updates to reduce atomic contention
         
         auto begin = std::chrono::steady_clock::now();
         {
@@ -602,8 +642,15 @@ static void runGraphBenchmark(u64 nodeCount, u64 startIndex, unsigned nthreads) 
                 PID current = frontier.front();
                 frontier.pop();
                 visitCount++;
+                localVisitProgress++;
+                
+                // Batch update to global counter
+                if (localVisitProgress >= visitBatchSize) {
+                    globalVisitProgress.fetch_add(localVisitProgress, std::memory_order_relaxed);
+                    localVisitProgress = 0;
+                }
 
-                GuardO<GraphNodePage> node(current);
+                GuardS<GraphNodePage> node(current);
                 GraphNodePage* page = node.ptr;
                 const PID* neighbors = page->neighborData();
                 if (enablePrefetch) bm.prefetchPages(neighbors, page->neighborCount);
@@ -611,14 +658,28 @@ static void runGraphBenchmark(u64 nodeCount, u64 startIndex, unsigned nthreads) 
                     PID neighborPid = neighbors[i];
                     u64 idx64 = neighborPid - basePid;
                     u32 idx = static_cast<u32>(idx64);
-                    GuardO<GraphNodePage> neighborNode(neighborPid);
-                    // compute something
-                    totalValue += neighborNode->value;
-                    if (!visited[idx]) {
-                        visited[idx] = 1;
-                        frontier.push(neighborPid);
+                    while(true) {
+                        try{
+                            u64 value = 0;
+                            {
+                                GuardO<GraphNodePage> neighborNode(neighborPid);
+                                // compute something
+                                value = neighborNode->value;
+                            }
+                            totalValue += value;
+                            if (!visited[idx]) {
+                                visited[idx] = 1;
+                                frontier.push(neighborPid);
+                            }
+                            break;
+                        } catch(OLCRestartException e) {}
                     }
                 }
+            }
+            
+            // Flush any remaining local progress
+            if (localVisitProgress > 0) {
+                globalVisitProgress.fetch_add(localVisitProgress, std::memory_order_relaxed);
             }
         }
         
@@ -629,6 +690,53 @@ static void runGraphBenchmark(u64 nodeCount, u64 startIndex, unsigned nthreads) 
         threadTotalValues[threadId] = totalValue;
         threadDurationsMs[threadId] = durationMs;
     };
+
+    const char* txCsvPath = getenv("TX_CSV");
+    std::ofstream file;
+    std::ostream* out = &cerr;
+
+    if (txCsvPath) {
+        file.open(txCsvPath);
+        if (file.is_open()) {
+            out = &file;
+        } else {
+            cerr << "Error: Could not open TX_CSV file: " << txCsvPath << endl;
+        }
+    }
+
+    // Stats collection thread (similar to statFn)
+    auto graphStatFn = [&]() {
+
+
+        *out << "ts,visits,rmb,wmb,system,threads,nodes,neighbors_per_node" << endl;
+        u64 cnt = 0;
+        u64 totalVisits = 0;
+        
+        while (keepRunningGraph.load()) {
+            sleep(1);
+            float rmb = (bm.readCount.exchange(0) * pageSize) / (1024.0 * 1024);
+            float wmb = (bm.writeCount.exchange(0) * pageSize) / (1024.0 * 1024);
+            u64 visits = globalVisitProgress.exchange(0);
+            totalVisits += visits;
+            
+            if (!keepRunningGraph.load()) break;
+            
+            *out << cnt++ << "," << visits << "," << rmb << "," << wmb << "," 
+                 << systemName << "," << nthreads << "," << nodeCount << "," 
+                 << desiredNeighbors << endl;
+        }
+        
+        // Final flush for any remaining visits
+        u64 remainingVisits = globalVisitProgress.exchange(0);
+        totalVisits += remainingVisits;
+    };
+
+    // Reset counters before starting
+    bm.readCount = 0;
+    bm.writeCount = 0;
+    
+    // Start stats collection thread
+    std::thread statsThread(graphStatFn);
 
     // Run BFS searches in parallel
     auto overallBegin = std::chrono::steady_clock::now();
@@ -641,6 +749,10 @@ static void runGraphBenchmark(u64 nodeCount, u64 startIndex, unsigned nthreads) 
     }
     auto overallEnd = std::chrono::steady_clock::now();
     auto overallDurationMs = std::chrono::duration_cast<std::chrono::milliseconds>(overallEnd - overallBegin).count();
+    
+    // Stop stats collection thread
+    keepRunningGraph = false;
+    statsThread.join();
     
     // Calculate average traversal time
     u64 totalTraversalTimeMs = 0;
@@ -655,28 +767,20 @@ static void runGraphBenchmark(u64 nodeCount, u64 startIndex, unsigned nthreads) 
     
     if (enablePerf) perf::Aggregator::instance().report(totalVisits);
     
-    const char* txCsvPath = getenv("TX_CSV");
-    std::ofstream file;
-    std::ostream* out = &cout;
 
-    if (txCsvPath) {
-        file.open(txCsvPath);
-        if (file.is_open()) {
-            out = &file;
-        } else {
-            cerr << "Error: Could not open TX_CSV file: " << txCsvPath << endl;
-        }
+    *out << "bfs nodes=" << nodeCount << " neighbors_per_node=" << desiredNeighbors 
+         << " nthreads=" << nthreads << " start_indices=[";
+    for (unsigned t = 0; t < nthreads; t++) {
+        *out << startIndices[t];
+        if (t < nthreads - 1) *out << ",";
     }
-    
-    *out << "graph_bfs nodes=" << nodeCount << " neighbors_per_node=" << desiredNeighbors 
-         << " nthreads=" << nthreads
-         << " total_visited=" << totalVisits << " total_value_sum=" << totalValueSum 
-         << " avg_traversal_time_ms=" << avgTraversalTimeMs 
-         << " overall_time_ms=" << overallDurationMs << std::endl;
-    
-    cerr << "BFS completed: nthreads=" << nthreads 
+    *out << "]" << endl;
+
+
+    *out << "BFS completed: nthreads=" << nthreads 
          << " avg_traversal_time=" << avgTraversalTimeMs << "ms"
-         << " overall_time=" << overallDurationMs << "ms" << endl;
+         << " overall_time=" << overallDurationMs << "ms" 
+         << " total_visited=" << totalVisits << endl;
 }
 
 void BufferManager::ensureFreePages() {
@@ -859,7 +963,15 @@ void BufferManager::evict() {
         }
         if (exmapAction(exmapfd, EXMAP_OP_FREE, toEvict.size()) < 0) die("ioctl: EXMAP_OP_FREE");
     } else if (!useTraditional) {
-        for (u64& pid : toEvict) madvise(virtMem + pid, pageSize, MADV_DONTNEED);
+        for (u64& pid : toEvict) {
+            int ret = madvise(virtMem + pid, pageSize, MADV_DONTNEED);
+            if (ret != 0) {
+                std::cerr << "madvise failed for PID: " << pid << " with error: " << strerror(errno) << std::endl;
+            } 
+            //else {
+            //     std::cout << "madvise succeeded on PID: " << pid << " addr " << (virtMem + pid) << " pageSize " << pageSize << std::endl;
+            // }
+        }
     }
 
     // 5. remove from hash table and unlock
@@ -1495,12 +1607,6 @@ int main(int argc, char** argv) {
     bool isRndread = envOr("RNDREAD", 0);
     double skewFactor = envOrDouble("SKEW", 0.0);  // Zipfian skew factor, 0.0 = uniform
 
-    if (envOr("GRAPH", 0)) {
-        u64 nodeCount = n;
-        u64 startIndex = envOr("GRAPHSTART", 0);
-        runGraphBenchmark(nodeCount, startIndex, nthreads);
-        return 0;
-    }
     u64 statDiff = 1e8;
     atomic<u64> txProgress(0);
     atomic<u64> txTotal(0);
@@ -1514,8 +1620,15 @@ int main(int argc, char** argv) {
         tradMode = "traditional-hash-open";
     else if (bm.hashMode == BufferManager::HashMode::Lockfree)
         tradMode = "traditional-hash-lockfree";
-    const char* systemName = bm.useTraditional ? tradMode : (bm.useExmap ? "exmap" : "vmcache");
+    systemName = bm.useTraditional ? tradMode : (bm.useExmap ? "exmap" : "vmcache");
 
+
+    if (envOr("GRAPH", 0)) {
+        u64 nodeCount = n;
+        u64 startIndex = envOr("GRAPHSTART", 0);
+        runGraphBenchmark(nodeCount, startIndex, nthreads);
+        return 0;
+    }
     auto statFn = [&]() {
         const char* txCsvPath = getenv("TX_CSV");
         std::ofstream file;

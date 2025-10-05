@@ -108,21 +108,27 @@ for config in "${CONFIGS[@]}"; do
     
     # Extract graph BFS metrics from TX_CSV
     if [ -s "${tx_csv}" ]; then
-        # Look for line containing "graph_bfs nodes="
-        graph_line=$(grep "graph_bfs nodes=" "${tx_csv}" 2>/dev/null || echo "")
+        # Look for line containing "bfs nodes=" (configuration line)
+        config_line=$(grep "^bfs nodes=" "${tx_csv}" 2>/dev/null || echo "")
+        # Look for line containing "BFS completed:" (results line)
+        results_line=$(grep "BFS completed:" "${tx_csv}" 2>/dev/null || echo "")
         
-        if [ -n "${graph_line}" ]; then
-            # Extract nodes, avg_traversal_time_ms, and overall_time_ms from new format:
-            # graph_bfs nodes=xxx neighbors_per_node=xxx nthreads=xxx total_visited=xxx total_value_sum=xxx avg_traversal_time_ms=xxx overall_time_ms=xxx
-            nodes=$(echo "${graph_line}" | sed -n 's/.*nodes=\([0-9]*\).*/\1/p')
-            avg_time_ms=$(echo "${graph_line}" | sed -n 's/.*avg_traversal_time_ms=\([0-9.]*\).*/\1/p')
-            overall_time_ms=$(echo "${graph_line}" | sed -n 's/.*overall_time_ms=\([0-9.]*\).*/\1/p')
+        if [ -n "${config_line}" ]; then
+            # Extract nodes from config line: bfs nodes=5000000 neighbors_per_node=22 nthreads=1 start_indices=[0]
+            nodes=$(echo "${config_line}" | sed -n 's/.*nodes=\([0-9]*\).*/\1/p')
+        else
+            nodes="N/A"
+        fi
+        
+        if [ -n "${results_line}" ]; then
+            # Extract metrics from results line: BFS completed: nthreads=1 avg_traversal_time=12172ms overall_time=12175ms total_visited=5000000
+            avg_time_ms=$(echo "${results_line}" | sed -n 's/.*avg_traversal_time=\([0-9.]*\)ms.*/\1/p')
+            overall_time_ms=$(echo "${results_line}" | sed -n 's/.*overall_time=\([0-9.]*\)ms.*/\1/p')
             
             # Handle empty values
             [ -z "$avg_time_ms" ] && avg_time_ms="N/A"
             [ -z "$overall_time_ms" ] && overall_time_ms="N/A"
         else
-            nodes="N/A"
             avg_time_ms="N/A"
             overall_time_ms="N/A"
         fi
