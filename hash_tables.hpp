@@ -439,37 +439,194 @@ public:
    }
 };
 
-// A lock-free hash map that supports non-concurrent resizing via reserve().
+// Epoch-Based Reclamation (EBR) for safe memory management in lock-free data structures
+// Implementation follows Xenium's approach: https://github.com/mpoeter/xenium
+class EpochManager {
+public:
+    struct alignas(64) ThreadState {
+        std::atomic<bool> is_in_critical_region{false};
+        std::atomic<uint64_t> local_epoch{0};
+        std::vector<void*> retired[3];  // Circular buffer indexed by epoch % 3
+        // No padding needed - alignment is sufficient
+    };
+    
+private:
+    std::atomic<uint64_t> global_epoch_{1};
+    std::vector<ThreadState*> thread_states_;
+    std::mutex registration_mutex_;
+    
+public:
+    class Guard {
+        ThreadState* state_;
+        uint64_t epoch_;
+    public:
+        Guard(ThreadState* state, uint64_t epoch) : state_(state), epoch_(epoch) {
+            // Mark thread as in critical region
+            state_->is_in_critical_region.store(true, std::memory_order_relaxed);
+            
+            // (1) - seq_cst fence enforces total order and synchronizes-with acquire fence (3)
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            
+            // Store the epoch (relaxed is safe due to fence)
+            state_->local_epoch.store(epoch, std::memory_order_relaxed);
+        }
+        
+        ~Guard() {
+            // (2) - release-store synchronizes-with acquire fence (3)
+            state_->is_in_critical_region.store(false, std::memory_order_release);
+        }
+        
+        Guard(const Guard&) = delete;
+        Guard& operator=(const Guard&) = delete;
+    };
+    
+    ~EpochManager() {
+        for (auto* state : thread_states_) {
+            for (auto& retired_list : state->retired) {
+                for (auto* ptr : retired_list) {
+                    ::operator delete(ptr);
+                }
+            }
+            delete state;
+        }
+    }
+    
+    ThreadState* registerThread() {
+        std::lock_guard<std::mutex> lock(registration_mutex_);
+        auto* state = new ThreadState();
+        thread_states_.push_back(state);
+        return state;
+    }
+    
+    Guard enterCriticalSection(ThreadState* state) {
+        // Load global epoch with acquire to synchronize-with release CAS (4)
+        uint64_t epoch = global_epoch_.load(std::memory_order_acquire);
+        return Guard(state, epoch);
+    }
+    
+    void retire(ThreadState* state, void* ptr) {
+        uint64_t current_epoch = global_epoch_.load(std::memory_order_relaxed);
+        state->retired[current_epoch % 3].push_back(ptr);
+        tryAdvanceEpoch(state);
+    }
+    
+private:
+    void tryAdvanceEpoch(ThreadState* state) {
+        uint64_t current_epoch = global_epoch_.load(std::memory_order_relaxed);
+        
+        // Check if all threads have moved past the epoch from 2 epochs ago
+        bool can_advance = true;
+        uint64_t min_active_epoch = current_epoch;
+        
+        {
+            std::lock_guard<std::mutex> lock(registration_mutex_);
+            
+            // (3) - acquire fence synchronizes-with seq_cst fence (1) and release-store (2)
+            std::atomic_thread_fence(std::memory_order_acquire);
+            
+            for (auto* ts : thread_states_) {
+                // Load operations can be relaxed due to acquire fence above
+                bool in_critical = ts->is_in_critical_region.load(std::memory_order_relaxed);
+                uint64_t local = ts->local_epoch.load(std::memory_order_relaxed);
+                
+                if (in_critical && local != current_epoch) {
+                    can_advance = false;
+                    break;
+                }
+                
+                if (in_critical) {
+                    min_active_epoch = std::min(min_active_epoch, local);
+                }
+            }
+        }
+        
+        if (can_advance && min_active_epoch == current_epoch) {
+            // (4) - release CAS synchronizes-with acquire load in enterCriticalSection
+            if (global_epoch_.compare_exchange_strong(current_epoch, current_epoch + 1, 
+                                                       std::memory_order_release,
+                                                       std::memory_order_relaxed)) {
+                // Safe to free memory from 2 epochs ago
+                size_t old_epoch_idx = current_epoch % 3;
+                for (auto* ptr : state->retired[old_epoch_idx]) {
+                    ::operator delete(ptr);
+                }
+                state->retired[old_epoch_idx].clear();
+            }
+        }
+    }
+};
+
+// A lock-free hash map with automatic resizing and epoch-based memory reclamation
 template <typename K, typename V>
 class LockFreeHashMap : public PartitionedMap<K, V> {
 private:
-    // The internal representation for each slot in the hash table.
-    // We use a pointer to the slots array to allow resizing.
     struct Slot {
         std::atomic<uint8_t> tag;
         K key;
         V value;
     };
+    
+    struct Table {
+        Slot* slots;
+        size_t capacity;
+        size_t capacity_mask;
+        std::atomic<size_t> size{0};
+        
+        Table(size_t cap) : capacity(cap), capacity_mask(cap - 1) {
+            slots = static_cast<Slot*>(::operator new(cap * sizeof(Slot)));
+            for (size_t i = 0; i < cap; ++i) {
+                new (&slots[i]) Slot();
+                slots[i].tag.store(EMPTY_TAG, std::memory_order_relaxed);
+            }
+            madvise(slots, cap * sizeof(Slot), MADV_HUGEPAGE);
+        }
+        
+        ~Table() {
+            if (slots) {
+                for (size_t i = 0; i < capacity; ++i) {
+                    slots[i].~Slot();
+                }
+                ::operator delete(slots);
+            }
+        }
+    };
 
 public:
-    // --- Tag constants for slot state management ---
     static constexpr uint8_t EMPTY_TAG = 0xFF;
     static constexpr uint8_t LOCKED_TAG = 0xFE;
     static constexpr uint8_t DELETED_TAG = 0xFD;
 
 private:
-    // These must be atomic because they are read by concurrent threads,
-    // even though they are only written by the single-threaded reserve().
-    size_t capacity_;
-    size_t capacity_mask_;
-    // The pointer to the slot array itself doesn't need to be atomic if we assume
-    // that no operations are running *during* the swap in reserve(). The guarantee
-    // that reserve() is not called concurrently with other operations is key.
-    std::vector<Slot> slots_;
-
+    std::atomic<Table*> current_table_;
+    std::atomic<Table*> next_table_{nullptr};
+    std::atomic<bool> resizing_{false};
+    std::atomic<size_t> resize_progress_{0};
+    
+    EpochManager epoch_manager_;
     Hasher<K> hasher_;
+    
+    static constexpr double LOAD_FACTOR_THRESHOLD = 0.75;
+    
+    // Thread-local state for automatic registration
+    struct ThreadLocalState {
+        EpochManager::ThreadState* ebr_state = nullptr;
+        LockFreeHashMap* map = nullptr;
+        
+        ~ThreadLocalState() {
+            // Cleanup happens in EpochManager destructor
+        }
+    };
+    
+    EpochManager::ThreadState* getThreadState() {
+        // Use function-local static thread_local to avoid guard name collision
+        static thread_local ThreadLocalState tls_{};
+        if (tls_.ebr_state == nullptr || tls_.map != this) {
+            tls_.ebr_state = epoch_manager_.registerThread();
+            tls_.map = this;
+        }
+        return tls_.ebr_state;
+    }
 
-    // Calculates the next power of 2 for a given number.
     static size_t nextPow2(size_t n) {
         if (n == 0) return 1;
         #if defined(__GNUC__) || defined(__clang__)
@@ -481,159 +638,332 @@ private:
         #endif
     }
     
-    // Non-atomic insert helper used only during rehash.
-    void insertInto(std::vector<Slot>& new_slots, size_t new_mask, const K& key, const V& value) {
+    // Insert into new table during migration (lock-free)
+    void insertIntoNewTable(Table* new_table, const K& key, const V& value) {
         uint64_t hash = hasher_(key);
         uint8_t tag = hash >> 56;
         if (tag >= DELETED_TAG) tag = 0;
         
-        size_t pos = hash & new_mask;
+        size_t pos = hash & new_table->capacity_mask;
+        const size_t initial_pos = pos;
         
         while (true) {
-            // During rehash, we know we are the only writer, so we can use relaxed memory order.
-            uint8_t current_tag = new_slots[pos].tag.load(std::memory_order_relaxed);
-            if (current_tag == EMPTY_TAG) {
-                new_slots[pos].key = key;
-                new_slots[pos].value = value;
-                new_slots[pos].tag.store(tag, std::memory_order_relaxed);
-                return;
+            uint8_t current_tag = new_table->slots[pos].tag.load(std::memory_order_acquire);
+            
+            if (current_tag == EMPTY_TAG || current_tag == DELETED_TAG) {
+                if (new_table->slots[pos].tag.compare_exchange_strong(
+                        current_tag, LOCKED_TAG, std::memory_order_acq_rel)) {
+                    new_table->slots[pos].key = key;
+                    new_table->slots[pos].value = value;
+                    new_table->slots[pos].tag.store(tag, std::memory_order_release);
+                    return;
+                }
+                continue;
             }
-            pos = (pos + 1) & new_mask;
+            
+            // Check if key already exists (from another migration thread)
+            if (current_tag == tag) {
+                // Lock the slot to safely check the key
+                if (new_table->slots[pos].tag.compare_exchange_strong(
+                        current_tag, LOCKED_TAG, std::memory_order_acq_rel)) {
+                    bool is_same_key = (new_table->slots[pos].key == key);
+                    // Restore the original tag
+                    new_table->slots[pos].tag.store(tag, std::memory_order_release);
+                    if (is_same_key) {
+                        return;  // Already migrated
+                    }
+                    // Different key with same tag, continue probing
+                } else {
+                    // CAS failed, retry this slot
+                    continue;
+                }
+            }
+            
+            pos = (pos + 1) & new_table->capacity_mask;
+            if (pos == initial_pos) {
+                throw std::runtime_error("New table is full during migration");
+            }
         }
+    }
+    
+    // Help migrate buckets from old to new table
+    void helpMigrate() {
+        Table* old_table = current_table_.load(std::memory_order_acquire);
+        Table* new_table = next_table_.load(std::memory_order_acquire);
+        
+        if (!new_table || !resizing_.load(std::memory_order_acquire)) {
+            return;
+        }
+        
+        // Each thread claims buckets to migrate
+        size_t batch_size = 64;  // Migrate in batches for better cache locality
+        size_t start_idx = resize_progress_.fetch_add(batch_size, std::memory_order_relaxed);
+        size_t end_idx = std::min(start_idx + batch_size, old_table->capacity);
+        
+        if (start_idx >= old_table->capacity) {
+            return;  // All buckets claimed
+        }
+        
+        // Migrate claimed buckets
+        for (size_t i = start_idx; i < end_idx; ++i) {
+            uint8_t tag = old_table->slots[i].tag.load(std::memory_order_acquire);
+            // Skip locked, deleted, or empty slots
+            if (tag >= DELETED_TAG) {
+                continue;
+            }
+            // Read key and value, then double-check tag wasn't modified
+            K key = old_table->slots[i].key;
+            V value = old_table->slots[i].value;
+            // Verify slot wasn't modified during read
+            if (old_table->slots[i].tag.load(std::memory_order_acquire) == tag) {
+                insertIntoNewTable(new_table, key, value);
+            }
+            // If tag changed, slot was modified - skip it, will be handled by insertOrAssign
+        }
+        
+        // Check if migration is complete
+        if (resize_progress_.load(std::memory_order_acquire) >= old_table->capacity) {
+            // Try to finalize migration
+            if (current_table_.compare_exchange_strong(old_table, new_table, std::memory_order_acq_rel)) {
+                resizing_.store(false, std::memory_order_release);
+                next_table_.store(nullptr, std::memory_order_release);
+                
+                // Retire old table for later reclamation
+                auto* state = getThreadState();
+                epoch_manager_.retire(state, old_table);
+            }
+        }
+    }
+    
+    // Try to start a resize operation
+    void tryResize(Table* table) {
+        if (resizing_.load(std::memory_order_acquire)) {
+            helpMigrate();  // Already resizing, help out
+            return;
+        }
+        
+        size_t current_size = table->size.load(std::memory_order_relaxed);
+        if (current_size < table->capacity * LOAD_FACTOR_THRESHOLD) {
+            return;  // No resize needed
+        }
+        
+        bool expected = false;
+        if (!resizing_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+            helpMigrate();  // Another thread started resize
+            return;
+        }
+        
+        // We won the race to start resizing
+        size_t new_capacity = nextPow2(table->capacity * 2);
+        Table* new_table = new Table(new_capacity);
+        
+        next_table_.store(new_table, std::memory_order_release);
+        resize_progress_.store(0, std::memory_order_release);
+        
+        // Help with migration
+        helpMigrate();
     }
 
 public:
-    explicit LockFreeHashMap()
-        : capacity_(0), capacity_mask_(0) {
+    explicit LockFreeHashMap(size_t initial_capacity = 8192) {  // Start smaller, let it resize properly
+        size_t capacity = nextPow2(initial_capacity);
+        current_table_.store(new Table(capacity), std::memory_order_relaxed);
+    }
+
+    ~LockFreeHashMap() {
+        Table* table = current_table_.load(std::memory_order_acquire);
+        delete table;
+        
+        Table* next = next_table_.load(std::memory_order_acquire);
+        if (next) {
+            delete next;
+        }
     }
 
     LockFreeHashMap(const LockFreeHashMap&) = delete;
     LockFreeHashMap& operator=(const LockFreeHashMap&) = delete;
 
-    // Resizes the hash map to accommodate at least `entries` elements.
-    // IMPORTANT: This method is NOT thread-safe and must NOT be called
-    // concurrently with any other method on this map.
+    // Pre-allocate capacity (thread-safe, triggers migration if needed)
     void reserve(size_t entries) override {
-        size_t old_capacity = capacity_;
-        // Target a load factor of ~50% to leave space for probing
-        size_t new_capacity = nextPow2(entries * 2);
-        if (new_capacity <= old_capacity) {
-            return;
-        }
-
-        auto new_slots = std::vector<Slot>(new_capacity);
-        for (size_t i = 0; i < new_capacity; ++i) {
-            new_slots[i].tag.store(EMPTY_TAG, std::memory_order_relaxed);
-        }
-        madvise(new_slots.data(), new_capacity * sizeof(Slot), MADV_HUGEPAGE);
-        size_t new_mask = new_capacity - 1;
-
-        // Move elements from the old table to the new one
-        if (!slots_.empty()) {
-            for (size_t i = 0; i < old_capacity; ++i) {
-                uint8_t tag = slots_[i].tag.load(std::memory_order_relaxed);
-                if (tag < DELETED_TAG) { // If it's a valid, occupied slot
-                    insertInto(new_slots, new_mask, slots_[i].key, slots_[i].value);
-                }
-            }
+        Table* table = current_table_.load(std::memory_order_acquire);
+        size_t target_capacity = nextPow2(entries * 2);
+        
+        if (table->capacity >= target_capacity) {
+            return;  // Already large enough
         }
         
-        // Atomically update the state for other threads to see
-        slots_ = std::move(new_slots);
-        capacity_mask_ = new_mask;
-        capacity_ = new_capacity;
+        // Trigger resize by artificially increasing size
+        size_t old_size = table->size.load(std::memory_order_relaxed);
+        table->size.store(table->capacity, std::memory_order_relaxed);
+        tryResize(table);
+        
+        // Wait for resize to complete
+        while (resizing_.load(std::memory_order_acquire)) {
+            helpMigrate();
+        }
+        
+        // Restore actual size
+        Table* new_table = current_table_.load(std::memory_order_acquire);
+        new_table->size.store(old_size, std::memory_order_relaxed);
     }
 
     void insertOrAssign(const K& key, const V& value) override {
-        // Load capacity info at the start of the operation.
-        // It's guaranteed not to change during this call because reserve() is not concurrent.
-        size_t current_mask = capacity_mask_;
+        auto* state = getThreadState();
+        auto guard = epoch_manager_.enterCriticalSection(state);
+        
+        Table* table = current_table_.load(std::memory_order_acquire);
         
         uint64_t hash = hasher_(key);
         uint8_t tag = hash >> 56;
         if (tag >= DELETED_TAG) tag = 0;
 
-        size_t pos = hash & current_mask;
-        const size_t initial_pos = pos;
+        bool is_new_insert = false;
 
         while (true) {
-            uint8_t current_tag = slots_[pos].tag.load(std::memory_order_acquire);
+            size_t pos = hash & table->capacity_mask;
+            const size_t initial_pos = pos;
+            
+            while (true) {
+                uint8_t current_tag = table->slots[pos].tag.load(std::memory_order_acquire);
 
-            if (current_tag == tag && slots_[pos].key == key) {
-                if (slots_[pos].tag.compare_exchange_strong(current_tag, LOCKED_TAG, std::memory_order_acq_rel)) {
-                    slots_[pos].value = value;
-                    slots_[pos].tag.store(tag, std::memory_order_release);
-                    return;
+                if (current_tag == tag && table->slots[pos].key == key) {
+                    if (table->slots[pos].tag.compare_exchange_strong(
+                            current_tag, LOCKED_TAG, std::memory_order_acq_rel)) {
+                        table->slots[pos].value = value;
+                        table->slots[pos].tag.store(tag, std::memory_order_release);
+                        return;
+                    }
+                    continue;
                 }
-                continue;
-            }
 
-            if (current_tag == EMPTY_TAG || current_tag == DELETED_TAG) {
-                if (slots_[pos].tag.compare_exchange_strong(current_tag, LOCKED_TAG, std::memory_order_acq_rel)) {
-                    slots_[pos].key = key;
-                    slots_[pos].value = value;
-                    slots_[pos].tag.store(tag, std::memory_order_release);
-                    return;
+                if (current_tag == EMPTY_TAG || current_tag == DELETED_TAG) {
+                    if (table->slots[pos].tag.compare_exchange_strong(
+                            current_tag, LOCKED_TAG, std::memory_order_acq_rel)) {
+                        table->slots[pos].key = key;
+                        table->slots[pos].value = value;
+                        table->slots[pos].tag.store(tag, std::memory_order_release);
+                        
+                        if (current_tag == EMPTY_TAG) {
+                            is_new_insert = true;
+                        }
+                        goto insertion_complete;
+                    }
+                    continue;
                 }
-                continue;
-            }
 
-            pos = (pos + 1) & current_mask;
-            if (pos == initial_pos) {
-                throw std::runtime_error("LockFreeHashMap is full. Consider calling reserve().");
+                pos = (pos + 1) & table->capacity_mask;
+                if (pos == initial_pos) {
+                    // Table is full, trigger resize and wait for completion
+                    tryResize(table);
+                    
+                    // Wait for resize to complete by helping with migration
+                    while (resizing_.load(std::memory_order_acquire)) {
+                        helpMigrate();
+                    }
+                    
+                    // Double-check resizing flag and reload table to avoid stale pointer
+                    // (another resize could have started and completed)
+                    while (resizing_.load(std::memory_order_acquire)) {
+                        helpMigrate();
+                    }
+                    table = current_table_.load(std::memory_order_acquire);
+                    // Break inner loop to restart with new table and reset initial_pos
+                    break;
+                }
+            }
+        }
+        
+insertion_complete:
+        
+        // Update size and check if resize is needed
+        if (is_new_insert) {
+            size_t new_size = table->size.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (new_size > table->capacity * LOAD_FACTOR_THRESHOLD) {
+                tryResize(table);
             }
         }
     }
 
     bool tryGet(const K& key, V& value) const override {
-        size_t current_mask = capacity_mask_;
-        if (current_mask == 0 && capacity_ == 0) return false;
+        // Note: const_cast is safe here as we're only modifying thread_local state
+        auto* state = const_cast<LockFreeHashMap*>(this)->getThreadState();
+        auto guard = const_cast<LockFreeHashMap*>(this)->epoch_manager_.enterCriticalSection(state);
+        
+        // Help with any ongoing migration first
+        const_cast<LockFreeHashMap*>(this)->helpMigrate();
+        
+        // During migration, new inserts go to new table, so check new table first
+        Table* new_table = const_cast<LockFreeHashMap*>(this)->next_table_.load(std::memory_order_acquire);
+        if (new_table != nullptr) {
+            // Migration in progress - search new table first
+            if (tryGetFromTable(new_table, key, value)) {
+                return true;
+            }
+        }
+        
+        // Search current (or old) table
+        Table* table = current_table_.load(std::memory_order_acquire);
+        return tryGetFromTable(table, key, value);
+    }
 
+private:
+    bool tryGetFromTable(Table* table, const K& key, V& value) const {
         uint64_t hash = hasher_(key);
         uint8_t tag = hash >> 56;
         if (tag >= DELETED_TAG) tag = 0;
 
-        size_t pos = hash & current_mask;
+        size_t pos = hash & table->capacity_mask;
         const size_t initial_pos = pos;
 
         do {
-            uint8_t current_tag = slots_[pos].tag.load(std::memory_order_acquire);
+            uint8_t current_tag = table->slots[pos].tag.load(std::memory_order_acquire);
             
-            if (current_tag == tag && slots_[pos].key == key) {
-                value = slots_[pos].value;
-                if (slots_[pos].tag.load(std::memory_order_acquire) == tag) {
+            if (current_tag == tag && table->slots[pos].key == key) {
+                value = table->slots[pos].value;
+                // Double-check tag to ensure slot wasn't modified during read
+                if (table->slots[pos].tag.load(std::memory_order_acquire) == tag) {
                     return true;
                 }
+                // Tag changed (slot was being modified), continue probing
             }
             
             if (current_tag == EMPTY_TAG) {
                 return false;
             }
 
-            pos = (pos + 1) & current_mask;
+            pos = (pos + 1) & table->capacity_mask;
 
         } while (pos != initial_pos);
         
         return false;
     }
 
+public:
+
     bool erase(const K& key, V& value) override {
-        size_t current_mask = capacity_mask_;
-        if (current_mask == 0 && capacity_ == 0) return false;
+        auto* state = getThreadState();
+        auto guard = epoch_manager_.enterCriticalSection(state);
+        
+        // Help with any ongoing migration first
+        helpMigrate();
+        
+        Table* table = current_table_.load(std::memory_order_acquire);
         
         uint64_t hash = hasher_(key);
         uint8_t tag = hash >> 56;
         if (tag >= DELETED_TAG) tag = 0;
 
-        size_t pos = hash & current_mask;
+        size_t pos = hash & table->capacity_mask;
         const size_t initial_pos = pos;
 
         do {
-            uint8_t current_tag = slots_[pos].tag.load(std::memory_order_acquire);
+            uint8_t current_tag = table->slots[pos].tag.load(std::memory_order_acquire);
             
-            if (current_tag == tag && slots_[pos].key == key) {
-                if (slots_[pos].tag.compare_exchange_strong(current_tag, DELETED_TAG, std::memory_order_acq_rel)) {
-                    value = slots_[pos].value;
+            if (current_tag == tag && table->slots[pos].key == key) {
+                if (table->slots[pos].tag.compare_exchange_strong(
+                        current_tag, DELETED_TAG, std::memory_order_acq_rel)) {
+                    value = table->slots[pos].value;
+                    table->size.fetch_sub(1, std::memory_order_relaxed);
                     return true;
                 }
                 continue;
@@ -643,7 +973,7 @@ public:
                 return false;
             }
 
-            pos = (pos + 1) & current_mask;
+            pos = (pos + 1) & table->capacity_mask;
         } while (pos != initial_pos);
 
         return false;

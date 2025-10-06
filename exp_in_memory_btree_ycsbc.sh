@@ -12,17 +12,73 @@ EXP_BASE_DIR="${SCRIPT_DIR}/exps/in-memory/btree_ycsbc"
 # Thread counts to test
 THREAD_COUNTS=(1 4 8 16 32)
 
+PHYSMEM=24
+RUN_DURATION=60
+
 # Common settings for all experiments (except THREADS which varies)
 export RNDREAD=1
 export BLOCK=/home/zxjcarrot/Workspace/calico/heapfile
 export VIRTGB=32G
-export PHYSGB=24G
+export PHYSGB=${PHYSMEM}G
 export DATASIZE=1e8
+export RUNFOR=${RUN_DURATION}
 export PERF=1
 
 # Build the project first
 echo "Building calico..."
 make clean && make -j$(nproc)
+
+# Function to run leanstore experiment
+run_leanstore_experiment() {
+    local thread_count="$1"
+    local thread_dir="${EXP_BASE_DIR}/${thread_count}"
+    mkdir -p "${thread_dir}"
+    
+    local config_name="leanstore"
+    local tx_file="${thread_dir}/${config_name}_tx.csv"
+    local perf_file="${thread_dir}/${config_name}_perf.csv"
+    
+    echo "=================================================================="
+    echo "Running leanstore experiment with ${thread_count} threads"
+    echo "=================================================================="
+    
+    cd "${SCRIPT_DIR}/leanstore"
+    
+    # Ensure heapfile exists
+    if [ ! -f "build/heapfile" ]; then
+        echo "Creating leanstore heapfile..."
+        fallocate -l 20G build/heapfile
+    fi
+    
+    echo "Running leanstore ycsb..."
+    echo "Output files:"
+    echo "  TX CSV: ${tx_file}"
+    echo "  PERF CSV: ${perf_file}"
+    
+    # Run leanstore and capture output
+    build/frontend/ycsb \
+        --ycsb_read_ratio=100 \
+        --ycsb_tuple_count=100000000 \
+        --ssd_path=build/heapfile \
+        --worker_threads=${thread_count} \
+        --pp_threads=1 \
+        --dram_gib=${PHYSMEM} \
+        --csv_path=./log \
+        --free_pct=1 \
+        --contention_split \
+        --xmerge \
+        --print_tx_console \
+        --run_for_seconds=${RUN_DURATION} \
+        --isolation_level=ru > "${tx_file}" 2>&1
+    
+    # Parse output to extract perf-like metrics
+    # This will be done in extract script
+    touch "${perf_file}"
+    
+    cd "${SCRIPT_DIR}"
+    echo "Leanstore experiment with ${thread_count} threads completed."
+    echo
+}
 
 # Function to run a single experiment
 run_experiment() {
@@ -155,6 +211,9 @@ EOF
     # Configuration 5: Calico lockfree_hash (traditional buffer pool with lock free open addressing)
     run_config_combinations ${threads} "calico_lockfree_hash" "Calico with traditional buffer pool using lock free open addressing hash translator" \
         "TRADITIONAL=1" "TRADHASH=4"
+
+    # Configuration 6: Leanstore
+    run_leanstore_experiment ${threads}
 
     echo "Completed experiments with ${threads} threads" >> "${GLOBAL_SUMMARY_FILE}"
     echo "" >> "${GLOBAL_SUMMARY_FILE}"
