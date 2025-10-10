@@ -8,6 +8,12 @@
 #include <memory>
 #include <random>
 #include <unordered_set>
+#include <cstdlib>
+#include <cstring>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 #include "hnswlib.h"
 #include "visited_list_pool.h"
@@ -54,6 +60,12 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     std::vector<int> element_levels_;  // keeps level of each element
 
     size_t data_size_{0};
+    
+    // mmap-related members
+    bool use_mmap_{false};
+    int mmap_fd_{-1};
+    size_t mmap_size_{0};
+    std::string mmap_file_path_;
 
     DISTFUNC<dist_t> fstdistfunc_;
     void *dist_func_param_{nullptr};
@@ -86,6 +98,8 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
           link_list_locks_(max_elements),
           element_levels_(max_elements),
           allow_replace_deleted_(allow_replace_deleted) {
+        fprintf(stderr, "[HNSW Constructor] START - max_elements=%zu\n", max_elements);
+        fflush(stderr);
         max_elements_ = max_elements;
         num_deleted_ = 0;
         data_size_ = s->get_data_size();
@@ -112,8 +126,54 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         label_offset_ = size_links_level0_ + data_size_;
         offsetLevel0_ = 0;
 
-        data_level0_memory_ = (char *)malloc(max_elements_ * size_data_per_element_);
-        if (data_level0_memory_ == nullptr) throw std::runtime_error("Not enough memory");
+        // Check if mmap should be used
+        const char* mmap_env = std::getenv("MMAP_FOR_HSNWLIB");
+        use_mmap_ = (mmap_env != nullptr && std::string(mmap_env) == "1");
+        fprintf(stderr, "[HNSW Constructor] use_mmap_ = %d, mmap_env = %s\n", use_mmap_, mmap_env ? mmap_env : "null");
+        fflush(stderr);
+        mmap_size_ = max_elements_ * size_data_per_element_;
+        
+        if (use_mmap_) {
+            // Allocate using file-backed mmap
+            mmap_file_path_ = "/home/zxjcarrot/Workspace/calico/hnswlib_mmap.dat";
+            mmap_fd_ = open(mmap_file_path_.c_str(), O_RDWR | O_CREAT, 0600);
+            if (mmap_fd_ == -1) {
+                throw std::runtime_error("Failed to create mmap file: " + mmap_file_path_);
+            }
+            
+            // Check if file already has enough space
+            struct stat st;
+            bool needs_resize = true;
+            if (fstat(mmap_fd_, &st) == 0) {
+                if (static_cast<size_t>(st.st_size) >= mmap_size_) {
+                    needs_resize = false;  // File is large enough
+                }
+            }
+            
+            // Set file size only if needed
+            if (needs_resize) {
+                if (ftruncate(mmap_fd_, mmap_size_) == -1) {
+                    close(mmap_fd_);
+                    unlink(mmap_file_path_.c_str());
+                    throw std::runtime_error("Failed to set mmap file size");
+                }
+            }
+            
+            // Map the file
+            data_level0_memory_ = (char *)mmap(nullptr, mmap_size_, PROT_READ | PROT_WRITE, MAP_SHARED, mmap_fd_, 0);
+            if (data_level0_memory_ == MAP_FAILED) {
+                close(mmap_fd_);
+                unlink(mmap_file_path_.c_str());
+                throw std::runtime_error("Failed to mmap file");
+            }
+            printf("Using mmap for HNSW index at %s, data_level0_memory_ %p\n", mmap_file_path_.c_str(), data_level0_memory_);
+            // Initialize memory to zero
+            //memset(data_level0_memory_, 0, mmap_size_);
+        } else {
+            // Use regular malloc
+            data_level0_memory_ = (char *)malloc(max_elements_ * size_data_per_element_);
+            if (data_level0_memory_ == nullptr) throw std::runtime_error("Not enough memory");
+        }
 
         cur_element_count = 0;
 
@@ -134,8 +194,24 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     ~HierarchicalNSW() { clear(); }
 
     void clear() {
-        free(data_level0_memory_);
-        data_level0_memory_ = nullptr;
+        if (data_level0_memory_ != nullptr) {
+            if (use_mmap_) {
+                // Unmap and cleanup mmap resources
+                munmap(data_level0_memory_, mmap_size_);
+                if (mmap_fd_ != -1) {
+                    close(mmap_fd_);
+                    mmap_fd_ = -1;
+                }
+                if (!mmap_file_path_.empty()) {
+                    unlink(mmap_file_path_.c_str());
+                    mmap_file_path_.clear();
+                }
+            } else {
+                free(data_level0_memory_);
+            }
+            data_level0_memory_ = nullptr;
+        }
+        
         for (tableint i = 0; i < cur_element_count; i++) {
             if (element_levels_[i] > 0) free(linkLists_[i]);
         }
@@ -664,10 +740,43 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         std::vector<std::mutex>(new_max_elements).swap(link_list_locks_);
 
         // Reallocate base layer
-        char *data_level0_memory_new = (char *)realloc(data_level0_memory_, new_max_elements * size_data_per_element_);
-        if (data_level0_memory_new == nullptr)
-            throw std::runtime_error("Not enough memory: resizeIndex failed to allocate base layer");
-        data_level0_memory_ = data_level0_memory_new;
+        size_t new_mmap_size = new_max_elements * size_data_per_element_;
+        
+        if (use_mmap_) {
+            // Unmap old region
+            if (data_level0_memory_ != nullptr) {
+                munmap(data_level0_memory_, mmap_size_);
+            }
+            
+            // Check if file already has enough space
+            struct stat st;
+            bool needs_resize = true;
+            if (fstat(mmap_fd_, &st) == 0) {
+                if (static_cast<size_t>(st.st_size) >= new_mmap_size) {
+                    needs_resize = false;  // File is large enough
+                }
+            }
+            
+            // Resize file only if needed
+            if (needs_resize) {
+                if (ftruncate(mmap_fd_, new_mmap_size) == -1) {
+                    throw std::runtime_error("Failed to resize mmap file");
+                }
+            }
+            
+            // Remap with new size
+            data_level0_memory_ = (char *)mmap(nullptr, new_mmap_size, PROT_READ | PROT_WRITE, MAP_SHARED, mmap_fd_, 0);
+            if (data_level0_memory_ == MAP_FAILED) {
+                throw std::runtime_error("Failed to remap file after resize");
+            }
+            
+            mmap_size_ = new_mmap_size;
+        } else {
+            char *data_level0_memory_new = (char *)realloc(data_level0_memory_, new_max_elements * size_data_per_element_);
+            if (data_level0_memory_new == nullptr)
+                throw std::runtime_error("Not enough memory: resizeIndex failed to allocate base layer");
+            data_level0_memory_ = data_level0_memory_new;
+        }
 
         // Reallocate all other layers
         char **linkLists_new = (char **)realloc(linkLists_, sizeof(void *) * new_max_elements);
@@ -792,9 +901,53 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
         input.seekg(pos, input.beg);
 
-        data_level0_memory_ = (char *)malloc(max_elements * size_data_per_element_);
-        if (data_level0_memory_ == nullptr)
-            throw std::runtime_error("Not enough memory: loadIndex failed to allocate level0");
+        // Check if mmap should be used
+        const char* mmap_env = std::getenv("MMAP_FOR_HSNWLIB");
+        use_mmap_ = (mmap_env != nullptr && std::string(mmap_env) == "1");
+        printf("[HNSW loadIndex] use_mmap_ = %d, mmap_env = %s\n", use_mmap_, mmap_env ? mmap_env : "null");
+        fflush(stdout);
+        mmap_size_ = max_elements * size_data_per_element_;
+        
+        if (use_mmap_) {
+            // Allocate using file-backed mmap
+            mmap_file_path_ = "/home/zxjcarrot/Workspace/calico/hnswlib_mmap.dat";
+            // Open without O_TRUNC to preserve existing file
+            mmap_fd_ = open(mmap_file_path_.c_str(), O_RDWR | O_CREAT, 0600);
+            if (mmap_fd_ == -1) {
+                throw std::runtime_error("Failed to create mmap file for loadIndex: " + mmap_file_path_);
+            }
+            
+            // Check if file already has enough space
+            struct stat st;
+            bool needs_resize = true;
+            if (fstat(mmap_fd_, &st) == 0) {
+                if (static_cast<size_t>(st.st_size) >= mmap_size_) {
+                    needs_resize = false;  // File is large enough
+                }
+            }
+            
+            // Set file size only if needed
+            if (needs_resize) {
+                if (ftruncate(mmap_fd_, mmap_size_) == -1) {
+                    close(mmap_fd_);
+                    unlink(mmap_file_path_.c_str());
+                    throw std::runtime_error("Failed to set mmap file size for loadIndex");
+                }
+            }
+            
+            // Map the file
+            data_level0_memory_ = (char *)mmap(nullptr, mmap_size_, PROT_READ | PROT_WRITE, MAP_SHARED, mmap_fd_, 0);
+            if (data_level0_memory_ == MAP_FAILED) {
+                close(mmap_fd_);
+                unlink(mmap_file_path_.c_str());
+                throw std::runtime_error("Failed to mmap file for loadIndex");
+            }
+        } else {
+            data_level0_memory_ = (char *)malloc(max_elements * size_data_per_element_);
+            if (data_level0_memory_ == nullptr)
+                throw std::runtime_error("Not enough memory: loadIndex failed to allocate level0");
+        }
+        
         input.read(data_level0_memory_, cur_element_count * size_data_per_element_);
 
         size_links_per_element_ = maxM_ * sizeof(tableint) + sizeof(linklistsizeint);

@@ -17,7 +17,7 @@ all_sources = ['bindings.cpp', 'calico.cpp', 'hnsw.cpp'] + tpcc_sources
 # Compiler arguments translated from your Makefile
 cpp_args = [
     '-std=c++20',
-    '-O1',
+    '-O3',
     '-DNDEBUG',
     '-g3', # Generates debug info
     '-fnon-call-exceptions',
@@ -43,8 +43,8 @@ calico_module = Extension(
         'tpcc'    # Directory for tpcc headers
     ],
     
-    # Libraries to link against, translated from -laio and -lpthread
-    libraries=['aio', 'pthread'], 
+    # Libraries to link against, translated from -laio, -luring and -lpthread
+    libraries=['aio', 'uring', 'pthread'], 
     
     language='c++',
     

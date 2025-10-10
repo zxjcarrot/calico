@@ -56,7 +56,7 @@ run_leanstore_experiment() {
     echo "  PERF CSV: ${perf_file}"
     
     # Run leanstore and capture output
-    build/frontend/ycsb \
+    until build/frontend/ycsb \
         --ycsb_read_ratio=100 \
         --ycsb_tuple_count=100000000 \
         --ssd_path=build/heapfile \
@@ -70,7 +70,10 @@ run_leanstore_experiment() {
         --print_tx_console \
         --run_for_seconds=${RUN_DURATION} \
         --isolation_level=ru > "${tx_file}" 2>&1
-    
+    do
+        echo "leanstore_ycsb failed, retrying in 5 seconds..."
+        sleep 5
+    done
     # Parse output to extract perf-like metrics
     # This will be done in extract script
     touch "${perf_file}"

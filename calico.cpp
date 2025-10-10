@@ -51,6 +51,10 @@ bool PageState::packedMode = false;
 // Definition for LibaioInterface static member
 const u64 LibaioInterface::maxIOs;
 
+// Definition for IOUringInterface static members
+const u64 IOUringInterface::maxIOs;
+const u64 IOUringInterface::queueDepth;
+
 __attribute__((target("sse4.2"))) uint64_t hash64(uint64_t key, uint32_t seed) {
     uint64_t k = 0x8648DBDB;
     uint64_t crc = _mm_crc32_u64(seed, key);
@@ -202,6 +206,112 @@ void LibaioInterface::readPages(const vector<PID>& pages, const vector<Page*>& d
     }
 }
 
+// io_uring implementation
+IOUringInterface::IOUringInterface(int blockfd, BufferManager* bm_ptr) : blockfd(blockfd), bm_ptr(bm_ptr) {
+    int ret = io_uring_queue_init(queueDepth, &ring, 0);
+    if (ret < 0) {
+        std::cerr << "io_uring_queue_init failed: " << strerror(-ret) << std::endl;
+        exit(EXIT_FAILURE);
+    }
+}
+
+IOUringInterface::~IOUringInterface() {
+    io_uring_queue_exit(&ring);
+}
+
+void IOUringInterface::writePages(const vector<PID>& pages) {
+    assert(pages.size() < maxIOs);
+    
+    // Prepare all write requests
+    for (u64 i = 0; i < pages.size(); i++) {
+        PID pid = pages[i];
+        Page* page = bm_ptr->preparePageForWrite(pid);
+        
+        struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
+        if (!sqe) {
+            std::cerr << "io_uring_get_sqe failed to get SQE" << std::endl;
+            exit(EXIT_FAILURE);
+        }
+        
+        io_uring_prep_write(sqe, blockfd, page, pageSize, pageSize * pid);
+        io_uring_sqe_set_data(sqe, (void*)(uintptr_t)i);
+    }
+    
+    // Submit all requests and wait for completions in one system call
+    int ret = io_uring_submit_and_wait(&ring, pages.size());
+    if (ret < 0) {
+        std::cerr << "io_uring_submit_and_wait failed: " << strerror(-ret) << std::endl;
+        exit(EXIT_FAILURE);
+    }
+    
+    // Reap all completions
+    for (u64 i = 0; i < pages.size(); i++) {
+        struct io_uring_cqe* cqe;
+        ret = io_uring_peek_cqe(&ring, &cqe);
+        if (ret < 0) {
+            std::cerr << "io_uring_peek_cqe failed: " << strerror(-ret) << std::endl;
+            exit(EXIT_FAILURE);
+        }
+        
+        if (cqe->res < 0) {
+            std::cerr << "write failed: " << strerror(-cqe->res) << std::endl;
+            exit(EXIT_FAILURE);
+        }
+        
+        io_uring_cqe_seen(&ring, cqe);
+    }
+}
+
+void IOUringInterface::readPages(const vector<PID>& pages, const vector<Page*>& destinations) {
+    assert(pages.size() == destinations.size());
+    assert(pages.size() < maxIOs);
+    
+    // Prepare all read requests
+    for (u64 i = 0; i < pages.size(); i++) {
+        PID pid = pages[i];
+        Page* dest = destinations[i];
+        
+        struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
+        if (!sqe) {
+            std::cerr << "io_uring_get_sqe failed to get SQE" << std::endl;
+            exit(EXIT_FAILURE);
+        }
+        
+        io_uring_prep_read(sqe, blockfd, dest, pageSize, pageSize * pid);
+        io_uring_sqe_set_data(sqe, (void*)(uintptr_t)i);
+    }
+    
+    // Submit all requests and wait for completions in one system call
+    int ret = io_uring_submit_and_wait(&ring, pages.size());
+    if (ret < 0) {
+        std::cerr << "io_uring_submit_and_wait failed: " << strerror(-ret) << std::endl;
+        exit(EXIT_FAILURE);
+    }
+    
+    // Reap all completions
+    for (u64 i = 0; i < pages.size(); i++) {
+        struct io_uring_cqe* cqe;
+        ret = io_uring_peek_cqe(&ring, &cqe);
+        if (ret < 0) {
+            std::cerr << "io_uring_peek_cqe failed: " << strerror(-ret) << std::endl;
+            exit(EXIT_FAILURE);
+        }
+        
+        if (cqe->res < 0) {
+            std::cerr << "read failed: " << strerror(-cqe->res) << std::endl;
+            exit(EXIT_FAILURE);
+        }
+        
+        io_uring_cqe_seen(&ring, cqe);
+    }
+    
+    // Mark pages as clean after successful read
+    for (u64 i = 0; i < pages.size(); i++) {
+        destinations[i]->dirty = false;
+        bm_ptr->readCount++;
+    }
+}
+
 u64 envOr(const char* env, u64 value) {
     if (getenv(env)) return atof(getenv(env));
     return value;
@@ -226,16 +336,26 @@ BufferManager::BufferManager(unsigned nthreads)
       numThreads(nthreads) {
     assert(virtSize >= physSize);
     const char* path = getenv("BLOCK") ? getenv("BLOCK") : "/tmp/bm";
-    blockfd = open(path, O_RDWR | O_DIRECT, S_IRWXU);
+    
+    // Check if we're using mmap with OS page cache before opening the file
+    u64 traditionalSetting = envOr("TRADITIONAL", 0);
+    useTraditional = (traditionalSetting == 1);
+    useMmapOSPageacche = (traditionalSetting == 2);
+    
+    // Disable O_DIRECT when using mmap with OS page cache to allow kernel buffering
+    int openFlags = O_RDWR;
+    if (!useMmapOSPageacche) {
+        openFlags |= O_DIRECT;
+    }
+    
+    blockfd = open(path, openFlags, S_IRWXU);
     if (blockfd == -1) {
         cerr << "cannot open BLOCK device '" << path << "'" << endl;
         exit(EXIT_FAILURE);
     }
-
-    useTraditional = envOr("TRADITIONAL", 0);
-    useExmap = (!useTraditional) && envOr("EXMAP", 0);
+    useExmap = (!useTraditional && !useMmapOSPageacche) && envOr("EXMAP", 0);
     u64 tradHashSetting = useTraditional ? envOr("TRADHASH", 0) : 0;
-    if (!useTraditional)
+    if (!useTraditional && !useMmapOSPageacche)
         hashMode = HashMode::Array1Access;
     else if (tradHashSetting == 1)
         hashMode = HashMode::Unordered;
@@ -288,7 +408,7 @@ BufferManager::BufferManager(unsigned nthreads)
             frameToPidHash.reset();
         } else {
             if (hashMode == HashMode::Unordered) {
-                if (numThreads == 1) {
+                if (numThreads == -1) {
                     pidToFrameHash = std::make_unique<ShardedUnorderedMap<PID, u64, 1>>();
                     frameToPidHash = std::make_unique<ShardedUnorderedMap<u64, PID, 1>>();
                 } else {
@@ -296,7 +416,7 @@ BufferManager::BufferManager(unsigned nthreads)
                     frameToPidHash = std::make_unique<ShardedUnorderedMap<u64, PID>>();
                 }
             } else if (hashMode == HashMode::OpenAddress) {
-                if (numThreads == 1) {
+                if (numThreads == -1) {
                     pidToFrameHash = std::make_unique<ShardedOpenAddressMap<PID, u64, 1>>();
                     frameToPidHash = std::make_unique<ShardedOpenAddressMap<u64, PID, 1>>();
                 } else {
@@ -314,7 +434,34 @@ BufferManager::BufferManager(unsigned nthreads)
         }
         // round robin cursors will skip empty partitions automatically
     } else {
-        if (useExmap) {
+        // by default vmcache uses no huge pages for virtMem
+        disableHugePageForFrameMem = envOr("NOHUGEPAGE_FRAME_MEM", 1);
+        if (useMmapOSPageacche) {
+            // For mmap+OS page cache mode, map the entire file directly using virtMem
+            // This is like vmcache's original approach, but without explicit eviction/page IO
+            virtMem = (Page*)mmap(NULL, virtAllocSize, PROT_READ | PROT_WRITE, MAP_SHARED, blockfd, 0);
+            if (virtMem == MAP_FAILED) {
+                std::cerr << "mmap failed for mmap+OS page cache mode: " << strerror(errno) << std::endl;
+                die("mmap virtMem for useMmapOSPageacche");
+            }
+            // madvise random
+            // int ret = madvise(virtMem, virtAllocSize, MADV_RANDOM);
+            // if (ret != 0) {
+            //     std::cerr << "madvise(MADV_RANDOM) failed with error: " << strerror(errno) << std::endl;
+            //     die("madvise MADV_RANDOM");
+            // }
+            // Let OS handle paging - no need for explicit eviction or readPage
+            int ret = 0;
+            if (disableHugePageForFrameMem) {
+                ret = madvise(virtMem, virtAllocSize, MADV_NOHUGEPAGE);
+            } else {
+                ret = madvise(virtMem, virtAllocSize, MADV_HUGEPAGE);
+            }
+            if (ret != 0) {
+                std::cerr << "madvise failed with error: " << strerror(errno) << std::endl;
+                exit(EXIT_FAILURE);
+            }
+        } else if (useExmap) {
             exmapfd = open("/dev/exmap", O_RDWR);
             if (exmapfd < 0) die("open exmap");
 
@@ -359,16 +506,23 @@ BufferManager::BufferManager(unsigned nthreads)
 
     cerr << "vmcache "
          << "blk:" << path << " virtgb:" << virtSize / gb << " physgb:" << (float)physSize / gb
-         << " traditional:" << useTraditional << " trad_hash:" << static_cast<int>(hashMode) << " exmap:" << useExmap
+         << " traditional:" << useTraditional << " mmap_os_pagecache:" << useMmapOSPageacche 
+         << " trad_hash:" << static_cast<int>(hashMode) << " exmap:" << useExmap << " hugepage: " << (disableHugePageForFrameMem == 0)
          << endl;
     // prefault the first PHYSGB worth of pages into the memory using 
 }
 
 BufferManager::~BufferManager() {}
 
-LibaioInterface& BufferManager::getIOInterface() {
-    thread_local LibaioInterface instance(blockfd, this);
-    return instance;
+IOInterface& BufferManager::getIOInterface() {
+    static bool useIOUring = envOr("USE_IOURING", 1);
+    if (useIOUring) {
+        thread_local IOUringInterface instance(blockfd, this);
+        return instance;
+    } else {
+        thread_local LibaioInterface instance(blockfd, this);
+        return instance;
+    }
 }
 
 bool BufferManager::isValidPtr(void* page) {
@@ -784,13 +938,16 @@ static void runGraphBenchmark(u64 nodeCount, u64 startIndex, unsigned nthreads) 
 }
 
 void BufferManager::ensureFreePages() {
+    if (useMmapOSPageacche) return; // OS manages memory
     if (physUsedCount >= physCount * 0.95) evict();
 }
 
 // allocated new page and fix it
 Page* BufferManager::allocPage() {
-    physUsedCount++;
-    ensureFreePages();
+    if (!useMmapOSPageacche) {
+        physUsedCount++;
+        ensureFreePages();
+    }
     u64 pid = allocCount++;
     if (pid >= virtCount) {
         cerr << "VIRTGB is too low" << endl;
@@ -810,13 +967,20 @@ Page* BufferManager::allocPage() {
         }
     }
 
-    residentSet.insert(pid);
+    if (!useMmapOSPageacche) {
+        residentSet.insert(pid);
+    }
     page->dirty = true;
 
     return page;
 }
 
 Page* BufferManager::handleFault(PID pid) {
+    if (useMmapOSPageacche) {
+        // In mmap+OS page cache mode, OS handles faults automatically
+        // Just return the mapped address, no explicit I/O needed
+        return virtMem + pid;
+    }
     physUsedCount++;
     ensureFreePages();
     Page* page = acquireFrameForPid(pid);
@@ -829,21 +993,35 @@ Page* BufferManager::fixX(PID pid) {
     PageState& ps = getPageState(pid);
     for (u64 repeatCounter = 0;; repeatCounter++) {
         u64 stateAndVersion = ps.stateAndVersion.load();
-        switch (PageState::getState(stateAndVersion)) {
-            case PageState::Evicted: {
+        u64 state = PageState::getState(stateAndVersion);
+        
+        if (useMmapOSPageacche) {
+            // In mmap+OS page cache mode, pages are never evicted by DB
+            // Only need to handle: Locked, Marked, Unlocked states
+            if (state == PageState::Marked || state == PageState::Unlocked) {
                 if (ps.tryLockX(stateAndVersion)) {
-                    Page* page = handleFault(pid);
-                    return page;
-                }
-                break;
-            }
-            case PageState::Marked:
-            case PageState::Unlocked: {
-                if (ps.tryLockX(stateAndVersion)) {
-                    // u64 lockedState = PageState::sameVersion(stateAndVersion, PageState::Locked);
                     return residentPtr(pid, ps, stateAndVersion);
                 }
-                break;
+            }
+            // For Locked state, just retry
+        } else {
+            // Original vmcache or traditional mode logic
+            switch (state) {
+                case PageState::Evicted: {
+                    if (ps.tryLockX(stateAndVersion)) {
+                        Page* page = handleFault(pid);
+                        return page;
+                    }
+                    break;
+                }
+                case PageState::Marked:
+                case PageState::Unlocked: {
+                    if (ps.tryLockX(stateAndVersion)) {
+                        // u64 lockedState = PageState::sameVersion(stateAndVersion, PageState::Locked);
+                        return residentPtr(pid, ps, stateAndVersion);
+                    }
+                    break;
+                }
             }
         }
         yield(repeatCounter);
@@ -854,23 +1032,42 @@ Page* BufferManager::fixS(PID pid) {
     PageState& ps = getPageState(pid);
     for (u64 repeatCounter = 0;; repeatCounter++) {
         u64 stateAndVersion = ps.stateAndVersion;
-        switch (PageState::getState(stateAndVersion)) {
-            case PageState::Locked: {
-                break;
-            }
-            case PageState::Evicted: {
-                if (ps.tryLockX(stateAndVersion)) {
-                    handleFault(pid);
-                    ps.unlockX();
-                }
-                break;
-            }
-            default: {
+        u64 state = PageState::getState(stateAndVersion);
+        
+        if (useMmapOSPageacche) {
+            // In mmap+OS page cache mode, pages are never evicted by DB
+            // Only need to handle: Locked, Marked, Unlocked, and shared states
+            if (state == PageState::Locked) {
+                // Just retry
+            } else {
+                // Try to acquire shared lock (state can be Marked, Unlocked, or already shared)
                 if (ps.tryLockS(stateAndVersion)) {
                     u64 s = PageState::getState(stateAndVersion);
                     u64 nextState = (s < PageState::MaxShared) ? (s + 1) : 1;
                     u64 newState = PageState::sameVersion(stateAndVersion, nextState);
                     return residentPtr(pid, ps, newState);
+                }
+            }
+        } else {
+            // Original vmcache or traditional mode logic
+            switch (state) {
+                case PageState::Locked: {
+                    break;
+                }
+                case PageState::Evicted: {
+                    if (ps.tryLockX(stateAndVersion)) {
+                        handleFault(pid);
+                        ps.unlockX();
+                    }
+                    break;
+                }
+                default: {
+                    if (ps.tryLockS(stateAndVersion)) {
+                        u64 s = PageState::getState(stateAndVersion);
+                        u64 nextState = (s < PageState::MaxShared) ? (s + 1) : 1;
+                        u64 newState = PageState::sameVersion(stateAndVersion, nextState);
+                        return residentPtr(pid, ps, newState);
+                    }
                 }
             }
         }
@@ -904,6 +1101,11 @@ void BufferManager::readPage(PID pid, Page* dest) {
 }
 
 void BufferManager::evict() {
+    if (useMmapOSPageacche) {
+        // In mmap+OS page cache mode, OS handles all eviction
+        // No need for explicit eviction by the buffer manager
+        return;
+    }
     vector<PID> toEvict;
     toEvict.reserve(batch);
     vector<PID> toWrite;
@@ -962,7 +1164,7 @@ void BufferManager::evict() {
             exmapInterface[workerThreadId]->iov[i].len = 1;
         }
         if (exmapAction(exmapfd, EXMAP_OP_FREE, toEvict.size()) < 0) die("ioctl: EXMAP_OP_FREE");
-    } else if (!useTraditional) {
+    } else if (!useTraditional && !useMmapOSPageacche) {
         for (u64& pid : toEvict) {
             int ret = madvise(virtMem + pid, pageSize, MADV_DONTNEED);
             if (ret != 0) {
@@ -977,8 +1179,10 @@ void BufferManager::evict() {
     // 5. remove from hash table and unlock
     for (u64& pid : toEvict) {
         if (useTraditional) releaseFrame(pid);
-        bool succ = residentSet.remove(pid);
-        assert(succ);
+        if (!useMmapOSPageacche) {
+            bool succ = residentSet.remove(pid);
+            assert(succ);
+        }
         getPageState(pid).unlockXEvicted();
     }
 
@@ -986,6 +1190,9 @@ void BufferManager::evict() {
 }
 
 void BufferManager::prefetchPages(const PID* pages, int n_pages, const u32* offsets_within_pages) {
+    if (useMmapOSPageacche) {
+        return; // mmap + os page cache does not support batch async prefetch.
+    }
     // if (!useTraditional) {
     //    // For mmap mode, all pages are always "resident"
     //    return;
@@ -1049,10 +1256,11 @@ void BufferManager::prefetchPages(const PID* pages, int n_pages, const u32* offs
 
     // Batch read all pages that need to be loaded
     if (pidsToRead && !pidsToRead->empty()) {
-        if (pidsToRead->size() >= LibaioInterface::maxIOs) {
+        constexpr size_t maxBatchSize = 256;  // Safe for both LibaioInterface and IOUringInterface
+        if (pidsToRead->size() >= maxBatchSize) {
             // Split into multiple batches if too many pages
-            for (size_t i = 0; i < pidsToRead->size(); i += LibaioInterface::maxIOs) {
-                size_t batchSize = std::min(LibaioInterface::maxIOs, pidsToRead->size() - i);
+            for (size_t i = 0; i < pidsToRead->size(); i += maxBatchSize) {
+                size_t batchSize = std::min(maxBatchSize, pidsToRead->size() - i);
                 vector<PID> batch(pidsToRead->begin() + i, pidsToRead->begin() + i + batchSize);
                 vector<Page*> batchDest(destinations->begin() + i, destinations->begin() + i + batchSize);
                 getIOInterface().readPages(batch, batchDest);
@@ -1826,7 +2034,7 @@ void initialize_system() {
         setenv("VIRTGB", "24", 0);
         setenv("PHYSGB", "16", 0);
         
-        unsigned nthreads = envOr("THREADS", 1);
+        unsigned nthreads = envOr("THREADS", 2);
         bm_ptr = new BufferManager(nthreads);
     }
 }

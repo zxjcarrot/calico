@@ -2,6 +2,7 @@
 #define CALICO_HPP
 
 #include <libaio.h>
+#include <liburing.h>
 #include <nmmintrin.h>  // For CRC32 and prefetch
 #include <sys/types.h>
 #include <sys/uio.h>
@@ -269,6 +270,20 @@ struct LibaioInterface: public IOInterface {
     virtual void readPages(const std::vector<PID>& pages, const std::vector<Page*>& destinations);
 };
 
+struct IOUringInterface: public IOInterface {
+    static const u64 maxIOs = 256;
+    static const u64 queueDepth = 512;
+
+    int blockfd;
+    BufferManager* bm_ptr;
+    struct io_uring ring;
+
+    IOUringInterface(int blockfd, BufferManager* bm_ptr);
+    ~IOUringInterface();
+    virtual void writePages(const std::vector<PID>& pages);
+    virtual void readPages(const std::vector<PID>& pages, const std::vector<Page*>& destinations);
+};
+
 struct FreePartition {
     std::atomic_flag lock = ATOMIC_FLAG_INIT;
     std::vector<u32> frames;
@@ -287,6 +302,7 @@ struct BufferManager {
     enum class HashMode { Array1Access = 0, Unordered = 1, OpenAddress = 2, Array = 3, Lockfree = 4 };
 
     bool useTraditional;
+    bool useMmapOSPageacche;
     bool useExmap;
     HashMode hashMode;
     unsigned numThreads;
@@ -347,7 +363,7 @@ struct BufferManager {
     void lockPartition(u32 partition);
     void unlockPartition(u32 partition);
     
-    LibaioInterface& getIOInterface();
+    IOInterface& getIOInterface();
 };
 
 extern BufferManager* bm_ptr;

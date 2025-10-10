@@ -100,13 +100,7 @@ run_wiredtiger_experiment() {
     echo "=================================================================="
     
     cd "${SCRIPT_DIR}/leanstore"
-    
-    # Ensure heapfile exists (allocate enough space for largest dataset)
-    if [ ! -f "build/wt_heapfile" ]; then
-        echo "Creating WiredTiger heapfile..."
-        fallocate -l 100G build/wt_heapfile
-    fi
-    
+
     # Remove old WiredTiger database directory
     rm -rf build/wt_db
     
@@ -119,9 +113,9 @@ run_wiredtiger_experiment() {
     until build/frontend/wiredtiger_ycsb \
         --ycsb_read_ratio=100 \
         --ycsb_tuple_count=${datasize} \
-        --ssd_path=build/wt_heapfile \
+        --ssd_path=build/wt_dir \
         --worker_threads=${THREAD_COUNT} \
-        --pp_threads=4 \
+        --pp_threads=1 \
         --dram_gib=${PHYSMEM} \
         --csv_path=./log \
         --free_pct=1 \

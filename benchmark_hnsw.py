@@ -220,7 +220,7 @@ def benchmark_calico(X_base, X_query, ground_truth, params, num_threads):
     print(f"Building index with M={params['M']}, ef_construction={params['ef_construction']}...")
     start_time = time.time()
     
-    index_calico = calico_py.HnswIndex(max_elements=num_elements, enable_prefetch=False)
+    index_calico = calico_py.HnswIndex(max_elements=num_elements, enable_prefetch=True)
     print("Start building graph")
     index_calico.add_items(X_base_float32, 0)
     
