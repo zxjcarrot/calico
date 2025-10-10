@@ -55,100 +55,13 @@ Modern database systems face a fundamental trade-off when choosing buffer pool i
 ## Calico's Innovation: Array-Based Translation
 
 Calico's idea is replacing hash table translation with **direct array indexing**. Instead of computing hash values and handling collisions, page translation becomes simple array access:
+## Evaluation and Reproducibility
 
-```cpp
-PageState* state = &pageStateArray[pageId];
-Frame* frame = frameMem + state->getFrameId();
-```
+Detailed experimental results, tables, microarchitectural counters, and cross-platform comparisons are now split into `CalicoEval.md`. That document includes the HNSW larger-than-memory and in-memory runs, B-tree CSV extractions, Graph BFS results, and platform (AMD vs ARM) comparisons.
 
-This fundamental change enables four key advantages that work together to eliminate traditional buffer pool bottlenecks:
+To view the complete evaluation and raw numbers, see: `CalicoEval.md`.
 
-## Core Techniques
-
-### 1. Direct Array Translation
-**Eliminates hash table complexity through simple indexing**
-
-Traditional buffer pools use hash tables for page-to-frame mapping, introducing multiple overheads:
-- Hash collisions requiring unpredictable probe sequences  
-- Load factor management necessitating expensive resize operations
-- Pointer chasing that defeats CPU prefetching and increases cache misses
-
-Calico replaces this with a **preallocated indirection array** sized for the entire storage capacity. Translation becomes deterministic array access with predictable cache behavior and no collision handling.
-
-### 2. Huge Page Optimization  
-**Overcomes mmap's fundamental limitation**
-
-The critical insight is that **mmap-based systems cannot use huge pages** for buffer management. While individual database pages are 4KB, huge pages are 2MB (512× larger). Evicting a single 4KB page from a huge page mapping would require either:
-- Failing the eviction (losing control over memory usage)
-- Evicting all 512 pages in the huge page (dropping hot data)
-
-Calico's user-space translation solves this by **decoupling logical eviction from physical memory management**:
-- Individual 4KB frames can be evicted while preserving huge page TLB mappings
-- Both frame memory and PageState arrays can use huge page backing
-- No dependency on `madvise()` operations that conflict with huge page management
-
-This enables huge page benefits that more than compensate for the indirection overhead.
-
-### 3. CPU-Friendly Access Patterns
-**Optimized for modern processor capabilities**
-
-Array-based translation is designed to leverage CPU parallelism:
-- **Out-of-order execution**: Multiple independent array lookups can execute simultaneously
-- **Prefetching synergy**: Access patterns in workloads like graph traversal enable parallel translation lookups for multiple pages
-- **Cache efficiency**: Sequential metadata layout improves cache utilization compared to scattered hash entries
-
-### 4. Unified Metadata Storage
-**Single-word atomic state management**
-
-Each PageState entry packs multiple pieces of information into one 64-bit word:
-```
-63           56 55               32 31                     0
-+--------------+------------------+------------------------+
-| lock state   | 24-bit version   | 32-bit frame id        |
-+--------------+------------------+------------------------+
-```
-
-This design eliminates the separate metadata lookups required by hash table approaches, reducing memory accesses while enabling atomic state transitions for lock-free concurrency.
-
-## Design Deep Dive
-
-### Why Array Translation Works
-
-The counter-intuitive result is that adding indirection can improve performance. The key is recognizing that **huge page benefits exceed indirection costs**:
-
-1. **TLB Efficiency**: Huge page backing reduces TLB pressure for both frame memory and PageState arrays
-2. **Cache Locality**: Array layout provides better cache behavior than hash table pointer chasing  
-3. **CPU Parallelism**: Predictable access patterns enable better out-of-order execution
-4. **Reduced Overhead**: No hash computation, collision handling, or resize operations
-
-### Implementation Details
-
-**Translation Operations**
-The indirection layer supports three core operations:
-
-1. **Page Access** (`residentPtr`): Single array lookup to get frame location
-2. **Page Load** (`acquireFrameForPid`): Atomic PageState update with new frame assignment  
-3. **Page Eviction** (`releaseFrame`): Atomic state clearing and frame return to freelist
-
-**Memory Layout**
-- **Frame Memory**: Large contiguous allocation for page data, backed by huge pages
-- **PageState Array**: One 8-byte entry per storage page, also backed by huge pages
-- **Fixed Sizing**: Both arrays sized at initialization, eliminating resize overhead
-
-### Performance Characteristics
-
-As shown in Table 1, Calico uniquely combines fast in-memory performance with fast out-of-memory I/O while maintaining huge page support and full user-space control. The key breakthrough is that huge page optimization makes indirection overhead negligible while preserving all the benefits of user-space buffer management.
-
-
-## Performance Evaluation
-
-We evaluated Calico using comprehensive multi-threaded benchmarks on both synthetic and realistic workloads to validate the design principles.
-
-### B-tree Index Workload Results
-
-**Test Configuration**: YCSB-C (read-only) on B+ tree indexes, 24GB buffer pool, varying thread counts
-
-| Configuration | 1 Thread | 16 Threads | 32 Threads | Key Insights |
+## Configuration and Usage
 |---------------|----------|------------|------------|--------------|
 | **Throughput (Mops/s)** ||||
 | calico_array | 1.19 | 16.37 | 29.13 | Exceeds mmap performance |
@@ -299,3 +212,40 @@ The key insight is leveraging OS copy-on-write zero pages to reduce physical mem
 - **Scalability**: Enables Calico to handle much larger storage capacities without proportional memory overhead
 
 This optimization would maintain Calico's performance characteristics while addressing the primary limitation of array-based translation: memory overhead for large, sparsely-accessed storage systems.
+
+### Experimental Results (Consolidated)
+
+Below is a concise summary of representative HNSW experiments run from the `exps/` folder. Numbers were extracted from experiment logs for different buffer pool configurations and physical memory budgets.
+
+Key experiment setup notes:
+- Dataset: SIFT1M (1,000,000 base vectors, 10,000 queries)
+- Queries repeated across threads to produce 320,000 total queries for the measurement runs (10,000 × 32 threads)
+- Reported QPS is end-to-end query throughput; Recall@10 is reported where available
+
+Summary (physgb = 0.3, 32 threads, larger-than-memory):
+
+| Configuration | Build Time (s) | Search Time (s) | QPS | Recall@10 |
+|---------------:|---------------:|-----------------:|----:|----------:|
+| calico_array (array translator, huge pages) | 1023.74 | 236.06 | 1355.56 | 0.9503 |
+| vmcache (mmap + vmcache/exmap style) | 1686.91 | 379.16 | 843.98 | 0.9504 |
+| calico_mmap_oscache (mmap + OS page cache) | 1911.59 | 615.51 | 519.89 | 0.9510 |
+
+Representative in-memory (physgb = 1, 32 threads) results (shows orders-of-magnitude higher QPS when dataset fits in RAM):
+
+| Configuration | Build Time (s) | Search Time (s) | QPS | Recall@10 |
+|---------------:|---------------:|-----------------:|----:|----------:|
+| calico_array | 35.05 | 5.23 | 61135.74 | 0.9507 |
+| vmcache | 34.95 | 5.38 | 59437.63 | 0.9025 |
+
+Observations and takeaways:
+
+- Array translator consistently outperforms `vmcache`/`mmap` in larger-than-memory settings (physgb=0.3): calico_array achieved ~1.61× higher QPS than `vmcache` and ~2.61× higher QPS than `calico_mmap_oscache`.
+- When the dataset fits in memory (physgb=1), all designs have vastly higher QPS; calico_array still retains a modest lead in QPS and recall.
+- Build times are substantially higher for out-of-memory builds (index construction streams from disk), explaining long experiment walltimes for physgb=0.3.
+- Recall@10 is essentially identical across configurations in larger-than-memory runs, indicating that the translator strategy does not hurt search quality while improving throughput.
+- Microarchitectural counters (from perf traces) show that `vmcache` and `mmap` have higher cache-miss pressure and LLC misses in the larger-than-memory runs; calico_array shows lower LLC misses/op and lower DTLB misses/op in many workloads, which aligns with the huge-page + sequential metadata layout hypothesis.
+
+Practical implication:
+
+- For latency/throughput-critical vector search workloads that exceed physical RAM, Calico's array translator with huge-page backing provides a clear performance advantage and more predictable microarchitectural behavior compared to mmap-based alternatives.
+
