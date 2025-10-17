@@ -367,7 +367,7 @@ std::vector<std::pair<float, u32>> HNSW<Dim, DistanceMetric>::searchLayer(
 
         u32 current_id = current_pair.second;
         try {
-            GuardO<HNSWPage> current_page_guard(getNodePID(current_id));
+            GuardS<HNSWPage> current_page_guard(getNodePID(current_id));
             NodeAccessor current_acc(current_page_guard.ptr, getNodeIndexInPage(current_id), this);
 
             if (current_acc.getLevel() < level) continue;

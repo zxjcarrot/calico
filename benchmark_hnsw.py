@@ -7,6 +7,9 @@ import sys
 sys.path.insert(0, './hnswlib')
 import hnswlib
 
+# Import USearch for comparison
+from usearch.index import Index as USearchIndex
+
 import re
 from itertools import zip_longest
 import signal
@@ -375,16 +378,114 @@ def benchmark_hnswlib(X_base, X_query, ground_truth, params, num_threads):
     return results
 
 
-def print_comparison_table(calico_res, hnswlib_res, params):
+def benchmark_usearch(X_base, X_query, ground_truth, params, num_threads):
+    print("\n--- Benchmarking USearch ---")
+    results = {}
+
+    num_elements, dim = X_base.shape
+    k = params["k"]
+    results['node_count'] = num_elements
+
+    X_base_float32 = np.ascontiguousarray(X_base, dtype=np.float32)
+    X_query_float32 = np.ascontiguousarray(X_query, dtype=np.float32)
+    
+    print(f"Building index with M={params['M']}, ef_construction={params['ef_construction']}...")
+    start_time = time.time()
+
+    # Create USearch index with equivalent parameters
+    # USearch uses 'connectivity' for M and 'expansion_add' for ef_construction
+    # 'expansion_search' is the ef_search parameter
+    index = USearchIndex(
+        ndim=dim,
+        metric='l2sq',  # L2 squared distance (equivalent to hnswlib's 'l2')
+        dtype='f32',
+        connectivity=params["M"],
+        expansion_add=params["ef_construction"],
+        expansion_search=params.get("ef_search", 50),
+    )
+    
+    # Add vectors to the index
+    index.add(np.arange(num_elements), X_base_float32)
+
+    build_time = time.time() - start_time
+    results['build_time'] = build_time
+    print(f"Build time: {build_time:.4f} seconds")
+
+    print("\nMemory usage after build:")
+    # USearch memory usage - it's a property, not a method
+    index_bytes = index.memory_usage
+    results['index_bytes'] = index_bytes
+    
+    # Get process RSS
+    import psutil
+    process = psutil.Process()
+    mem_info = process.memory_info()
+    results['rss_after_build'] = mem_info.rss
+    
+    print(f"  Index bytes: {format_bytes(results['index_bytes'])}")
+    print(f"  Process RSS: {format_bytes(results['rss_after_build'])}")
+
+    ef_search = params.get("ef_search", 50)
+    print(f"Querying for k={k} nearest neighbors with ef_search={ef_search}...")
+    
+    start_time = time.time()
+    
+    try:
+        profiler = CacheProfiler(events=CACHE_EVENTS)
+        with profiler:
+            start_time = time.time()
+            # USearch search - expansion_search (ef_search) is set via exact parameter
+            # The search method signature is: search(queries, count, exact=False, threads=0)
+            # For HNSW tuning, we need to pass exact=False and let the index use its internal ef
+            matches = index.search(X_query_float32, k, exact=False, threads=num_threads)
+            search_time = time.time() - start_time
+        
+        cache_stats = profiler.get_results()
+        results.update(cache_stats)
+        # Calculate cache miss rate
+        if 'cache-misses' in cache_stats and 'cache-references' in cache_stats:
+            misses = cache_stats['cache-misses']
+            refs = cache_stats['cache-references']
+            if isinstance(refs, int) and refs > 0 and isinstance(misses, int):
+                results['cache_miss_rate_pct'] = (misses / refs) * 100
+    except RuntimeError as e:
+        print(f"Warning: Could not run CacheProfiler. Error: {e}")
+        # Run without profiling
+        start_time = time.time()
+        matches = index.search(X_query_float32, k, exact=False, threads=num_threads)
+        search_time = time.time() - start_time
+    
+    search_time = time.time() - start_time
+    results['search_time'] = search_time
+    
+    qps = len(X_query) / search_time
+    results['qps'] = qps
+    print(f"Search time ({len(X_query)} queries): {search_time:.4f} seconds ({qps:.2f} QPS)")
+    
+    # Extract labels from matches
+    labels = np.array([[match.key for match in query_matches] for query_matches in matches])
+    
+    recall = calculate_recall(ground_truth, labels, k)
+    results['recall'] = recall
+    print(f"Recall@{k}: {recall:.4f}")
+    
+    # USearch provides some statistics
+    results['max_level'] = index.max_level if hasattr(index, 'max_level') else 'N/A'
+    results['size'] = len(index)
+    results['capacity'] = index.capacity
+
+    return results
+
+
+def print_comparison_table(calico_res, hnswlib_res, usearch_res, params):
     """
-    Prints a detailed side-by-side comparison table of the benchmark results.
+    Prints a detailed side-by-side comparison table of the benchmark results for 3 libraries.
     """
     k = params['k']
     
     METRIC_COL_WIDTH = 35
-    CALICO_COL_WIDTH = 40
-    HNSWLIB_COL_WIDTH = 40
-    TOTAL_WIDTH = METRIC_COL_WIDTH + CALICO_COL_WIDTH + HNSWLIB_COL_WIDTH + 7
+    LIB_COL_WIDTH = 30
+    TOTAL_WIDTH = METRIC_COL_WIDTH + LIB_COL_WIDTH * 3 + 10
     
     def format_num(value):
         # Only apply comma formatting if the value is an integer
@@ -398,15 +499,17 @@ def print_comparison_table(calico_res, hnswlib_res, params):
     
     def print_header():
         print("-" * TOTAL_WIDTH)
-        print(f"| {'Metric':<{METRIC_COL_WIDTH}} | {'calico_py':<{CALICO_COL_WIDTH}} | {'hnswlib':<{HNSWLIB_COL_WIDTH}} |")
+        print(f"| {'Metric':<{METRIC_COL_WIDTH}} | {'calico_py':<{LIB_COL_WIDTH}} | {'hnswlib':<{LIB_COL_WIDTH}} | {'usearch':<{LIB_COL_WIDTH}} |")
         print("-" * TOTAL_WIDTH)
 
-    def print_row(metric_name, calico_val, hnswlib_val, is_formatted=False):
-        c_val, h_val = (calico_val, hnswlib_val) if is_formatted else (str(calico_val), str(hnswlib_val))
-        print(f"| {metric_name:<{METRIC_COL_WIDTH}} | {c_val:<{CALICO_COL_WIDTH}} | {h_val:<{HNSWLIB_COL_WIDTH}} |")
+    def print_row(metric_name, calico_val, hnswlib_val, usearch_val, is_formatted=False):
+        c_val = calico_val if is_formatted else str(calico_val)
+        h_val = hnswlib_val if is_formatted else str(hnswlib_val)
+        u_val = usearch_val if is_formatted else str(usearch_val)
+        print(f"| {metric_name:<{METRIC_COL_WIDTH}} | {c_val:<{LIB_COL_WIDTH}} | {h_val:<{LIB_COL_WIDTH}} | {u_val:<{LIB_COL_WIDTH}} |")
 
     def print_separator():
-        print(f"|{'-' * (METRIC_COL_WIDTH+2)}|{'-' * (CALICO_COL_WIDTH+2)}|{'-' * (HNSWLIB_COL_WIDTH+2)}|")
+        print(f"|{'-' * (METRIC_COL_WIDTH+2)}|{'-' * (LIB_COL_WIDTH+2)}|{'-' * (LIB_COL_WIDTH+2)}|{'-' * (LIB_COL_WIDTH+2)}|")
 
     print("\n\n--- Benchmark Comparison Summary ---")
     print(f"Parameters: M={params['M']}, ef_construction={params['ef_construction']}, k={k}, ef_search={params['ef_search']}")
@@ -414,63 +517,112 @@ def print_comparison_table(calico_res, hnswlib_res, params):
     print_header()
     
     # --- Performance ---
-    print_row("--- Performance ---", "", "", is_formatted=True)
-    print_row("Build Time (s)", f"{calico_res.get('build_time', 0):.4f}", f"{hnswlib_res.get('build_time', 0):.4f}", is_formatted=True)
-    print_row("Search Time (s)", f"{calico_res.get('search_time', 0):.4f}", f"{hnswlib_res.get('search_time', 0):.4f}", is_formatted=True)
-    print_row("QPS (Queries/Sec)", f"{calico_res.get('qps', 0):.2f}", f"{hnswlib_res.get('qps', 0):.2f}", is_formatted=True)
-    print_row(f"Recall@{k}", f"{calico_res.get('recall', 0):.4f}", f"{hnswlib_res.get('recall', 0):.4f}", is_formatted=True)
+    print_row("--- Performance ---", "", "", "", is_formatted=True)
+    print_row("Build Time (s)", 
+              f"{calico_res.get('build_time', 0):.4f}", 
+              f"{hnswlib_res.get('build_time', 0):.4f}",
+              f"{usearch_res.get('build_time', 0):.4f}",
+              is_formatted=True)
+    print_row("Search Time (s)", 
+              f"{calico_res.get('search_time', 0):.4f}", 
+              f"{hnswlib_res.get('search_time', 0):.4f}",
+              f"{usearch_res.get('search_time', 0):.4f}",
+              is_formatted=True)
+    print_row("QPS (Queries/Sec)", 
+              f"{calico_res.get('qps', 0):.2f}", 
+              f"{hnswlib_res.get('qps', 0):.2f}",
+              f"{usearch_res.get('qps', 0):.2f}",
+              is_formatted=True)
+    print_row(f"Recall@{k}", 
+              f"{calico_res.get('recall', 0):.4f}", 
+              f"{hnswlib_res.get('recall', 0):.4f}",
+              f"{usearch_res.get('recall', 0):.4f}",
+              is_formatted=True)
     
     print_separator()
 
     # --- Memory ---
-    print_row("--- Memory Usage ---", "", "", is_formatted=True)
+    print_row("--- Memory Usage ---", "", "", "", is_formatted=True)
     print_row("Index Size", 
               format_bytes(calico_res.get('index_bytes')), 
               format_bytes(hnswlib_res.get('index_bytes')),
+              format_bytes(usearch_res.get('index_bytes')),
               is_formatted=True)
     print_row("Process RSS (after build)", 
               format_bytes(calico_res.get('rss_after_build')), 
               format_bytes(hnswlib_res.get('rss_after_build')),
+              format_bytes(usearch_res.get('rss_after_build')),
               is_formatted=True)
     
     print_separator()
     
     # --- Index Structure ---
-    print_row("--- Index Structure ---", "", "", is_formatted=True)
+    print_row("--- Index Structure ---", "", "", "", is_formatted=True)
     print_row("Node Count", 
               f"{calico_res.get('node_count', 'N/A'):,}", 
               f"{hnswlib_res.get('node_count', 'N/A'):,}",
+              f"{usearch_res.get('node_count', 'N/A'):,}",
               is_formatted=True)
-    print_row("Max Level", f"{calico_res.get('max_level', 'N/A')}", f"{hnswlib_res.get('max_level', 'N/A')}", is_formatted=True)
-    print_row("Index Capacity Usage", f"{calico_res.get('capacity_usage_pct', 'N/A'):.2f}%" if 'capacity_usage_pct' in calico_res else 'N/A', "N/A", is_formatted=True)
-    print_row("Page Utilization", f"{calico_res.get('page_utilization_pct', 'N/A'):.2f}%" if 'page_utilization_pct' in calico_res else 'N/A', "N/A", is_formatted=True)
+    print_row("Max Level", 
+              f"{calico_res.get('max_level', 'N/A')}", 
+              f"{hnswlib_res.get('max_level', 'N/A')}",
+              f"{usearch_res.get('max_level', 'N/A')}",
+              is_formatted=True)
+    print_row("Index Capacity Usage", 
+              f"{calico_res.get('capacity_usage_pct', 'N/A'):.2f}%" if 'capacity_usage_pct' in calico_res else 'N/A', 
+              "N/A",
+              "N/A",
+              is_formatted=True)
+    print_row("Page Utilization", 
+              f"{calico_res.get('page_utilization_pct', 'N/A'):.2f}%" if 'page_utilization_pct' in calico_res else 'N/A', 
+              "N/A",
+              "N/A",
+              is_formatted=True)
 
 
     print_separator()
 
     # --- Search Internals ---
-    print_row("--- Search Internals ---", "", "", is_formatted=True)
-    print_row("Total Distance Computations", f"{calico_res.get('dist_comps', 0):,}", f"{hnswlib_res.get('dist_comps', 0):,}", is_formatted=True)
-    print_row("Avg Dist Comps / Query", f"{calico_res.get('avg_dist_comps', 0):.2f}", f"{hnswlib_res.get('avg_dist_comps', 0):.2f}", is_formatted=True)
-    print_row("Total Hops", f"{calico_res.get('hops', 0):,}", f"{hnswlib_res.get('hops', 0):,}", is_formatted=True)
-    print_row("Avg Hops / Query", f"{calico_res.get('avg_hops', 0):.2f}", f"{hnswlib_res.get('avg_hops', 0):.2f}", is_formatted=True)
+    print_row("--- Search Internals ---", "", "", "", is_formatted=True)
+    print_row("Total Distance Computations", 
+              f"{calico_res.get('dist_comps', 0):,}", 
+              f"{hnswlib_res.get('dist_comps', 0):,}",
+              "N/A",
+              is_formatted=True)
+    print_row("Avg Dist Comps / Query", 
+              f"{calico_res.get('avg_dist_comps', 0):.2f}", 
+              f"{hnswlib_res.get('avg_dist_comps', 0):.2f}",
+              "N/A",
+              is_formatted=True)
+    print_row("Total Hops", 
+              f"{calico_res.get('hops', 0):,}", 
+              f"{hnswlib_res.get('hops', 0):,}",
+              "N/A",
+              is_formatted=True)
+    print_row("Avg Hops / Query", 
+              f"{calico_res.get('avg_hops', 0):.2f}", 
+              f"{hnswlib_res.get('avg_hops', 0):.2f}",
+              "N/A",
+              is_formatted=True)
     
     print_separator()
 
     # --- Cache Performance ---
-    print_row("--- Cache Performance (Search) ---", "", "", is_formatted=True)
+    print_row("--- Cache Performance (Search) ---", "", "", "", is_formatted=True)
     
     # Print all cache events dynamically
     for event in CACHE_EVENTS:
         print_row(event, 
                   format_num(calico_res.get(event, 'N/A')), 
-                  format_num(hnswlib_res.get(event, 'N/A')), 
+                  format_num(hnswlib_res.get(event, 'N/A')),
+                  format_num(usearch_res.get(event, 'N/A')),
                   is_formatted=True)
     
     # Print cache miss rate if available
     print_row("Cache Miss Rate", 
               f"{calico_res.get('cache_miss_rate_pct', 'N/A'):.2f}%" if isinstance(calico_res.get('cache_miss_rate_pct'), float) else 'N/A', 
-              f"{hnswlib_res.get('cache_miss_rate_pct', 'N/A'):.2f}%" if isinstance(hnswlib_res.get('cache_miss_rate_pct'), float) else 'N/A', 
+              f"{hnswlib_res.get('cache_miss_rate_pct', 'N/A'):.2f}%" if isinstance(hnswlib_res.get('cache_miss_rate_pct'), float) else 'N/A',
+              f"{usearch_res.get('cache_miss_rate_pct', 'N/A'):.2f}%" if isinstance(usearch_res.get('cache_miss_rate_pct'), float) else 'N/A',
               is_formatted=True)
 
     print_separator()
@@ -478,10 +630,11 @@ def print_comparison_table(calico_res, hnswlib_res, params):
     # --- Graph Structure per Level ---
     calico_graph_lines = calico_res.get('graph_stats', 'N/A').split('\n')
     hnswlib_graph_lines = hnswlib_res.get('graph_stats', 'N/A').split('\n')
+    usearch_graph_lines = ['N/A']  # USearch doesn't provide detailed graph stats
     
-    print_row("--- Graph Structure ---", "", "", is_formatted=True)
-    for calico_line, hnswlib_line in zip_longest(calico_graph_lines, hnswlib_graph_lines, fillvalue=""):
-        print(f"| {'':<{METRIC_COL_WIDTH}} | {calico_line.strip():<{CALICO_COL_WIDTH}} | {hnswlib_line.strip():<{HNSWLIB_COL_WIDTH}} |")
+    print_row("--- Graph Structure ---", "", "", "", is_formatted=True)
+    for calico_line, hnswlib_line, usearch_line in zip_longest(calico_graph_lines, hnswlib_graph_lines, usearch_graph_lines, fillvalue=""):
+        print(f"| {'':<{METRIC_COL_WIDTH}} | {calico_line.strip():<{LIB_COL_WIDTH}} | {hnswlib_line.strip():<{LIB_COL_WIDTH}} | {usearch_line.strip():<{LIB_COL_WIDTH}} |")
 
     print("-" * TOTAL_WIDTH)
 
@@ -549,8 +702,11 @@ if __name__ == "__main__":
     hnswlib_results = benchmark_hnswlib(
         X_base, X_query, ground_truth, hnsw_params, num_threads
     )
+    usearch_results = benchmark_usearch(
+        X_base, X_query, ground_truth, hnsw_params, num_threads
+    )
     
     # Print the final detailed comparison table
-    print_comparison_table(calico_results, hnswlib_results, hnsw_params)
+    print_comparison_table(calico_results, hnswlib_results, usearch_results, hnsw_params)
     
     print("\nCalico module unloading: Shutting down system...")
