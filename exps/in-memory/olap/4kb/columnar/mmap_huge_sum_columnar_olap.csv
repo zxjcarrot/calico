@@ -3,3 +3,12 @@ ts,queries_per_sec,rmb,wmb,system,threads,total_pages,operation,layout,selectivi
 5,108,0,0,traditional-array1,1,13107200,sum,columnar,0.1
 10,111,0,0,traditional-array1,1,13107200,sum,columnar,0.1
 15,104,0,0,traditional-array1,1,13107200,sum,columnar,0.1
+20,105,0,0,traditional-array1,1,13107200,sum,columnar,0.1
+25,124,0,0,traditional-array1,1,13107200,sum,columnar,0.1
+30,124,0,0,traditional-array1,1,13107200,sum,columnar,0.1
+35,131,0,0,traditional-array1,1,13107200,sum,columnar,0.1
+40,127,0,0,traditional-array1,1,13107200,sum,columnar,0.1
+45,129,0,0,traditional-array1,1,13107200,sum,columnar,0.1
+50,133,0,0,traditional-array1,1,13107200,sum,columnar,0.1
+55,133,0,0,traditional-array1,1,13107200,sum,columnar,0.1
+avg_queries_per_sec,23.8667,0,0,traditional-array1,1,13107200,sum,columnar,0.1

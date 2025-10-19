@@ -8,3 +8,71 @@ Running experiments with 4KB pages...
   Testing layout type: columnar
     Testing operation type: nonfiltered_count
     Testing operation type: sum
+  Testing layout type: row
+    Testing operation type: nonfiltered_count
+    Testing operation type: sum
+Completed experiments with 4KB pages
+
+Running experiments with 8KB pages...
+  Testing layout type: columnar
+    Testing operation type: nonfiltered_count
+    Testing operation type: sum
+  Testing layout type: row
+    Testing operation type: nonfiltered_count
+    Testing operation type: sum
+Completed experiments with 8KB pages
+
+Running experiments with 16KB pages...
+  Testing layout type: columnar
+    Testing operation type: nonfiltered_count
+    Testing operation type: sum
+  Testing layout type: row
+    Testing operation type: nonfiltered_count
+    Testing operation type: sum
+Completed experiments with 16KB pages
+
+Running experiments with 32KB pages...
+  Testing layout type: columnar
+    Testing operation type: nonfiltered_count
+    Testing operation type: sum
+  Testing layout type: row
+    Testing operation type: nonfiltered_count
+    Testing operation type: sum
+Completed experiments with 32KB pages
+
+Running experiments with 64KB pages...
+  Testing layout type: columnar
+    Testing operation type: nonfiltered_count
+    Testing operation type: sum
+  Testing layout type: row
+    Testing operation type: nonfiltered_count
+    Testing operation type: sum
+Completed experiments with 64KB pages
+
+Running experiments with 128KB pages...
+  Testing layout type: columnar
+    Testing operation type: nonfiltered_count
+    Testing operation type: sum
+  Testing layout type: row
+    Testing operation type: nonfiltered_count
+    Testing operation type: sum
+Completed experiments with 128KB pages
+
+Running experiments with 256KB pages...
+  Testing layout type: columnar
+    Testing operation type: nonfiltered_count
+    Testing operation type: sum
+  Testing layout type: row
+    Testing operation type: nonfiltered_count
+    Testing operation type: sum
+Completed experiments with 256KB pages
+
+Running experiments with 512KB pages...
+  Testing layout type: columnar
+    Testing operation type: nonfiltered_count
+    Testing operation type: sum
+  Testing layout type: row
+    Testing operation type: nonfiltered_count
+    Testing operation type: sum
+Completed experiments with 512KB pages
+
