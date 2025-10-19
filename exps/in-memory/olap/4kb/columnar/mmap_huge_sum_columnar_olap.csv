@@ -1,0 +1,5 @@
+ts,queries_per_sec,rmb,wmb,system,threads,total_pages,operation,layout,selectivity
+0,103,0,0,traditional-array1,1,13107200,sum,columnar,0.1
+5,108,0,0,traditional-array1,1,13107200,sum,columnar,0.1
+10,111,0,0,traditional-array1,1,13107200,sum,columnar,0.1
+15,104,0,0,traditional-array1,1,13107200,sum,columnar,0.1

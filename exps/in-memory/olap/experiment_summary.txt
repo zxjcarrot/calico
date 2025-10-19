@@ -1,0 +1,10 @@
+In-Memory OLAP Experiment Summary - Varying Page Sizes
+Generated on: Mon Oct 20 03:04:21 CST 2025
+Page sizes tested (KB): 4 8 16 32 64 128 256 512
+Fixed settings: THREADS=1, VIRTGB=54G, PHYSGB=54G, DATA_SIZE=50GB
+Using huge pages: NOHUGEPAGE_FRAME_MEM=0
+
+Running experiments with 4KB pages...
+  Testing layout type: columnar
+    Testing operation type: nonfiltered_count
+    Testing operation type: sum

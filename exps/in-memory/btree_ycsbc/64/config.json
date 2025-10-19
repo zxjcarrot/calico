@@ -1,0 +1,13 @@
+{
+  "description": "Configuration for 64 threads experiments",
+  "threads": 64,
+  "common_settings": {
+    "RNDREAD": 1,
+    "BLOCK": "/home/zxjcarrot/Workspace/calico",
+    "VIRTGB": "32G",
+    "PHYSGB": "24G", 
+    "THREADS": 64,
+    "DATASIZE": "1e8",
+    "PERF": 1
+  }
+}

@@ -1,0 +1,14 @@
+ts,queries_per_sec,rmb,wmb,system,threads,total_pages,operation,layout,selectivity
+0,17,0,0,traditional-hash-unordered,1,1638400,sum,row,0.1
+5,20,0,0,traditional-hash-unordered,1,1638400,sum,row,0.1
+10,17,0,0,traditional-hash-unordered,1,1638400,sum,row,0.1
+15,22,0,0,traditional-hash-unordered,1,1638400,sum,row,0.1
+20,22,0,0,traditional-hash-unordered,1,1638400,sum,row,0.1
+25,22,0,0,traditional-hash-unordered,1,1638400,sum,row,0.1
+30,21,0,0,traditional-hash-unordered,1,1638400,sum,row,0.1
+35,22,0,0,traditional-hash-unordered,1,1638400,sum,row,0.1
+40,22,0,0,traditional-hash-unordered,1,1638400,sum,row,0.1
+45,21,0,0,traditional-hash-unordered,1,1638400,sum,row,0.1
+50,19,0,0,traditional-hash-unordered,1,1638400,sum,row,0.1
+55,22,0,0,traditional-hash-unordered,1,1638400,sum,row,0.1
+avg_queries_per_sec,4.11667,0,0,traditional-hash-unordered,1,1638400,sum,row,0.1

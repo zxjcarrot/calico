@@ -1,0 +1,32 @@
+ts,visits,rmb,wmb,system,threads,nodes,neighbors_per_node
+0,2290000,0,0,traditional-array1,8,5000000,22
+1,2042000,0,0,traditional-array1,8,5000000,22
+2,1862000,0,0,traditional-array1,8,5000000,22
+3,1877000,0,0,traditional-array1,8,5000000,22
+4,1724000,0,0,traditional-array1,8,5000000,22
+5,1826000,0,0,traditional-array1,8,5000000,22
+6,1732000,0,0,traditional-array1,8,5000000,22
+7,1766000,0,0,traditional-array1,8,5000000,22
+8,1498000,0,0,traditional-array1,8,5000000,22
+9,1761000,0,0,traditional-array1,8,5000000,22
+10,1647000,0,0,traditional-array1,8,5000000,22
+11,1905000,0,0,traditional-array1,8,5000000,22
+12,1713000,0,0,traditional-array1,8,5000000,22
+13,1712000,0,0,traditional-array1,8,5000000,22
+14,1404000,0,0,traditional-array1,8,5000000,22
+15,1797000,0,0,traditional-array1,8,5000000,22
+16,1705000,0,0,traditional-array1,8,5000000,22
+17,1859000,0,0,traditional-array1,8,5000000,22
+18,1487000,0,0,traditional-array1,8,5000000,22
+19,1320000,0,0,traditional-array1,8,5000000,22
+20,1254000,0,0,traditional-array1,8,5000000,22
+21,663000,0,0,traditional-array1,8,5000000,22
+22,622000,0,0,traditional-array1,8,5000000,22
+23,699000,0,0,traditional-array1,8,5000000,22
+24,540000,0,0,traditional-array1,8,5000000,22
+25,507000,0,0,traditional-array1,8,5000000,22
+26,349000,0,0,traditional-array1,8,5000000,22
+27,195000,0,0,traditional-array1,8,5000000,22
+28,169000,0,0,traditional-array1,8,5000000,22
+bfs nodes=5000000 neighbors_per_node=22 nthreads=8 start_indices=[3775777,3195156,3760726,681363,4516344,470341,2872851,1864438]
+BFS completed: nthreads=8 avg_traversal_time=23990.1ms overall_time=29452ms total_visited=40000000

@@ -1,0 +1,126 @@
+Loading SIFT1M dataset (streaming mode for calico)...
+Base vectors: 1000000 vectors of dimension 128 (will be streamed in 5% batches)
+Query vectors shape: (10000, 128)
+Ground truth shape: (10000, 100)
+Importing calico_py module...
+Calico module loading: Initializing system...
+vmcache blk:./heapfile virtgb:8 physgb:4 traditional:0 mmap_os_pagecache:1 trad_hash:0 exmap:0 hugepage: 0 num_threads:2
+Calico system initialized.
+
+================================================================================
+Benchmarking Calico Configuration: mmap_oscache
+Threads: 104
+================================================================================
+Environment Configuration:
+  PHYSGB=4G
+  TRADITIONAL=2
+  TRADHASH=0
+  NOHUGEPAGE_FRAME_MEM=1
+  PREFETCH=0
+Streaming mode: Will load 1000000 vectors of dimension 128 in batches
+
+RSS before build: 70.49 MB (0.07 GB)
+
+Building index with M=16, ef_construction=200...
+Start building graph
+  Inserting 1000000 vectors in batches of 50000 (5.0%)...
+    Inserted 50000/1000000 vectors (5.0%)
+    Inserted 100000/1000000 vectors (10.0%)
+    Inserted 150000/1000000 vectors (15.0%)
+    Inserted 200000/1000000 vectors (20.0%)
+    Inserted 250000/1000000 vectors (25.0%)
+    Inserted 300000/1000000 vectors (30.0%)
+    Inserted 350000/1000000 vectors (35.0%)
+    Inserted 400000/1000000 vectors (40.0%)
+    Inserted 450000/1000000 vectors (45.0%)
+    Inserted 500000/1000000 vectors (50.0%)
+    Inserted 550000/1000000 vectors (55.0%)
+    Inserted 600000/1000000 vectors (60.0%)
+    Inserted 650000/1000000 vectors (65.0%)
+    Inserted 700000/1000000 vectors (70.0%)
+    Inserted 750000/1000000 vectors (75.0%)
+    Inserted 800000/1000000 vectors (80.0%)
+    Inserted 850000/1000000 vectors (85.0%)
+    Inserted 900000/1000000 vectors (90.0%)
+    Inserted 950000/1000000 vectors (95.0%)
+    Inserted 1000000/1000000 vectors (100.0%)
+Build time: 59.1295 seconds
+
+Index info and memory usage after build:
+=== HNSW Index Information ===
+Configuration Parameters:
+  Vector Dimension: 128
+  Max Neighbors (M): 16 (layers > 0)
+  Max Neighbors (M0): 32 (layer 0)
+  Construction ef: 200
+  Max Levels: 6
+
+Memory Layout:
+  Node Vector Size: 512 bytes
+  Max Neighbors Header Size: 12 bytes
+  Max Neighbors List Size: 448 bytes
+  Fixed Node Size: 972 bytes
+  Nodes Per Page: 4
+  Page Size: 4096 bytes
+
+Index Metadata:
+  Metadata PID: 1
+  Base PID: 2
+  Max Elements: 1000000
+  Current Node Count: 1000000
+  Current Max Level: 4
+  Entry Point Node ID: 41249
+
+Entry Point Node Details:
+  Node Level: 4
+  Node PID: 10314
+  Node Index: 1
+  Level 0 neighbors: 32
+  Level 1 neighbors: 16
+  Level 2 neighbors: 16
+  Level 3 neighbors: 16
+  Level 4 neighbors: 14
+
+Buffer Manager Statistics:
+  Total Allocations: 250002
+  Physical Pages Used: 0
+  Read Operations: 0
+  Write Operations: 0
+
+Storage Utilization:
+  Index Capacity Usage: 100.00%
+  Page Utilization: 100.00%
+
+=== End Index Information ===
+
+  Process RSS: 1.22 GB
+Query set: 10000 queries repeated 104x = 1040000 total queries
+
+Querying for k=10 nearest neighbors with ef_search=50, threads=104...
+CacheProfiler initialized with events: ['cache-misses', 'cache-references', 'L1-dcache-load-misses', 'LLC-load-misses']
+
+ Performance counter stats for process id '2678348':
+
+    15,560,908,891      cache-misses:u            #   78.038 % of all cache refs    
+    19,940,083,211      cache-references:u                                          
+     4,806,029,396      L1-dcache-load-misses:u                                     
+   <not supported>      LLC-load-misses:u                                           
+
+      17.779950773 seconds time elapsed
+
+
+Search time (1040000 queries): 17.7024 seconds (58749.09 QPS)
+Recall@10: 0.9531
+
+================================================================================
+Benchmark Summary for mmap_oscache
+================================================================================
+Build Time: 59.1295s
+Search Time: 17.7024s
+QPS: 58749.09
+Recall@10: 0.9531
+Avg Dist Comps/Query: 0.00
+Index Size: 0.00 B
+
+Calico module unloading: Shutting down system...
+Calico module unloading: Shutting down system...

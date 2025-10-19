@@ -1,0 +1,12 @@
+config_name,avg_throughput,llc_miss_per_op,dtlb_miss_per_op,cycles_per_op,insts_per_op,ipc
+calico_array_nohuge,3.2495e+07,n/a,2.98843,6398.35,1902.67,0.297369
+calico_array_huge,3.74405e+07,n/a,1.8418,5688.04,1911.12,0.335988
+calico_mmap_nohuge,3.79797e+07,n/a,2.86493,5464.81,1859.87,0.340335
+calico_mmap_huge,4.4007e+07,n/a,1.48248,4836.8,1859,0.384346
+calico_chained_hash_nohuge,6.1742e+06,n/a,13.6416,33634,2933.45,0.0872168
+calico_chained_hash_huge,6.48073e+06,n/a,10.8608,33187.8,2857.75,0.0861085
+calico_openaddr_hash_nohuge,5.00674e+06,n/a,9.12604,41066.9,3202.81,0.0779901
+calico_openaddr_hash_huge,5.63023e+06,n/a,5.2611,38277.8,3199.18,0.0835779
+calico_lockfree_hash_nohuge,2.36847e+07,n/a,5.80123,8720.21,2386.52,0.273677
+calico_lockfree_hash_huge,2.7909e+07,n/a,4.73791,7643.03,2393.79,0.313199
+leanstore,n/a,n/a,n/a,n/a,n/a,n/a

@@ -1,0 +1,15 @@
+ts,visits,rmb,wmb,system,threads,nodes,neighbors_per_node
+0,3001000,0,0,traditional-array1,8,5000000,22
+1,3095000,0,0,traditional-array1,8,5000000,22
+2,3274000,0,0,traditional-array1,8,5000000,22
+3,3283000,0,0,traditional-array1,8,5000000,22
+4,3291000,0,0,traditional-array1,8,5000000,22
+5,3288000,0,0,traditional-array1,8,5000000,22
+6,3300000,0,0,traditional-array1,8,5000000,22
+7,3333000,0,0,traditional-array1,8,5000000,22
+8,3255000,0,0,traditional-array1,8,5000000,22
+9,3312000,0,0,traditional-array1,8,5000000,22
+10,3313000,0,0,traditional-array1,8,5000000,22
+11,3280000,0,0,traditional-array1,8,5000000,22
+bfs nodes=5000000 neighbors_per_node=22 nthreads=8 start_indices=[3775777,3195156,3760726,681363,4516344,470341,2872851,1864438]
+BFS completed: nthreads=8 avg_traversal_time=12300.2ms overall_time=12638ms total_visited=40000000

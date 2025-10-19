@@ -1,0 +1,10 @@
+label,total,per_op
+instructions,141230122328,1765.38
+cycles,879768207885,10997.1
+llc_refs,n/a,n/a
+llc_misses,n/a,n/a
+dtlb_refs,4260683254,53.2585
+dtlb_misses,2359415556,29.4927
+derived_ipc,0.160531,n/a
+derived_llc_miss_rate,n/a,n/a
+derived_dtlb_miss_rate,0.553765,n/a

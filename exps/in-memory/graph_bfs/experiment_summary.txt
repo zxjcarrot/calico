@@ -1,0 +1,27 @@
+Graph BFS Experiment Summary - Multi-threaded
+Generated on: Mon Oct 13 07:29:38 CST 2025
+Thread counts tested: 1 4 8 16 32 64 128
+Common settings: GRAPH=1 RNDREAD=0 BLOCK=/home/zxjcarrot/Workspace/calico/heapfile VIRTGB=48G PHYSGB=24G DATASIZE=5e6 PERF=1
+Testing combinations: PREFETCH=0|1, NOHUGEPAGE_FRAME_MEM=0|1 for each configuration
+
+Running graph BFS experiments with 1 threads...
+Completed experiments with 1 threads
+
+Running graph BFS experiments with 4 threads...
+Completed experiments with 4 threads
+
+Running graph BFS experiments with 8 threads...
+Completed experiments with 8 threads
+
+Running graph BFS experiments with 16 threads...
+Completed experiments with 16 threads
+
+Running graph BFS experiments with 32 threads...
+Completed experiments with 32 threads
+
+Running graph BFS experiments with 64 threads...
+Completed experiments with 64 threads
+
+Running graph BFS experiments with 128 threads...
+Completed experiments with 128 threads
+

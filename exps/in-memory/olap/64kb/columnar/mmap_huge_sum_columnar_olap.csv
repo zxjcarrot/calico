@@ -1,0 +1,14 @@
+ts,queries_per_sec,rmb,wmb,system,threads,total_pages,operation,layout,selectivity
+0,87,0,0,traditional-array1,1,819200,sum,columnar,0.1
+5,89,0,0,traditional-array1,1,819200,sum,columnar,0.1
+10,95,0,0,traditional-array1,1,819200,sum,columnar,0.1
+15,91,0,0,traditional-array1,1,819200,sum,columnar,0.1
+20,89,0,0,traditional-array1,1,819200,sum,columnar,0.1
+25,88,0,0,traditional-array1,1,819200,sum,columnar,0.1
+30,90,0,0,traditional-array1,1,819200,sum,columnar,0.1
+35,92,0,0,traditional-array1,1,819200,sum,columnar,0.1
+40,89,0,0,traditional-array1,1,819200,sum,columnar,0.1
+45,90,0,0,traditional-array1,1,819200,sum,columnar,0.1
+50,91,0,0,traditional-array1,1,819200,sum,columnar,0.1
+55,91,0,0,traditional-array1,1,819200,sum,columnar,0.1
+avg_queries_per_sec,18.0333,0,0,traditional-array1,1,819200,sum,columnar,0.1

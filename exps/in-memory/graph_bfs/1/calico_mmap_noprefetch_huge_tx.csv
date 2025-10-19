@@ -1,0 +1,12 @@
+ts,visits,rmb,wmb,system,threads,nodes,neighbors_per_node
+0,495000,0,0,vmcache,1,5000000,22
+1,542000,0,0,vmcache,1,5000000,22
+2,545000,0,0,vmcache,1,5000000,22
+3,555000,0,0,vmcache,1,5000000,22
+4,545000,0,0,vmcache,1,5000000,22
+5,544000,0,0,vmcache,1,5000000,22
+6,542000,0,0,vmcache,1,5000000,22
+7,545000,0,0,vmcache,1,5000000,22
+8,554000,0,0,vmcache,1,5000000,22
+bfs nodes=5000000 neighbors_per_node=22 nthreads=1 start_indices=[0]
+BFS completed: nthreads=1 avg_traversal_time=9244ms overall_time=9247ms total_visited=5000000

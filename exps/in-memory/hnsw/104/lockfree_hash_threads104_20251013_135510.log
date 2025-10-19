@@ -1,0 +1,127 @@
+Loading SIFT1M dataset (streaming mode for calico)...
+Base vectors: 1000000 vectors of dimension 128 (will be streamed in 5% batches)
+Query vectors shape: (10000, 128)
+Ground truth shape: (10000, 100)
+Importing calico_py module...
+Calico module loading: Initializing system...
+vmcache blk:./heapfile virtgb:8 physgb:4 traditional:1 mmap_os_pagecache:0 trad_hash:4 exmap:0 hugepage: 1 num_threads:2
+Calico system initialized.
+
+================================================================================
+Benchmarking Calico Configuration: lockfree_hash
+Threads: 104
+================================================================================
+Environment Configuration:
+  PHYSGB=4G
+  TRADITIONAL=1
+  TRADHASH=4
+  NOHUGEPAGE_FRAME_MEM=0
+  PREFETCH=1
+Streaming mode: Will load 1000000 vectors of dimension 128 in batches
+
+RSS before build: 370.64 MB (0.36 GB)
+
+Building index with M=16, ef_construction=200...
+Start building graph
+  Inserting 1000000 vectors in batches of 50000 (5.0%)...
+    Inserted 50000/1000000 vectors (5.0%)
+    Inserted 100000/1000000 vectors (10.0%)
+    Inserted 150000/1000000 vectors (15.0%)
+    Inserted 200000/1000000 vectors (20.0%)
+    Inserted 250000/1000000 vectors (25.0%)
+    Inserted 300000/1000000 vectors (30.0%)
+    Inserted 350000/1000000 vectors (35.0%)
+    Inserted 400000/1000000 vectors (40.0%)
+    Inserted 450000/1000000 vectors (45.0%)
+    Inserted 500000/1000000 vectors (50.0%)
+    Inserted 550000/1000000 vectors (55.0%)
+    Inserted 600000/1000000 vectors (60.0%)
+    Inserted 650000/1000000 vectors (65.0%)
+    Inserted 700000/1000000 vectors (70.0%)
+    Inserted 750000/1000000 vectors (75.0%)
+    Inserted 800000/1000000 vectors (80.0%)
+    Inserted 850000/1000000 vectors (85.0%)
+    Inserted 900000/1000000 vectors (90.0%)
+    Inserted 950000/1000000 vectors (95.0%)
+    Inserted 1000000/1000000 vectors (100.0%)
+Build time: 69.1702 seconds
+
+Index info and memory usage after build:
+=== HNSW Index Information ===
+Configuration Parameters:
+  Vector Dimension: 128
+  Max Neighbors (M): 16 (layers > 0)
+  Max Neighbors (M0): 32 (layer 0)
+  Construction ef: 200
+  Max Levels: 6
+
+Memory Layout:
+  Node Vector Size: 512 bytes
+  Max Neighbors Header Size: 12 bytes
+  Max Neighbors List Size: 448 bytes
+  Fixed Node Size: 972 bytes
+  Nodes Per Page: 4
+  Page Size: 4096 bytes
+
+Index Metadata:
+  Metadata PID: 1
+  Base PID: 2
+  Max Elements: 1000000
+  Current Node Count: 1000000
+  Current Max Level: 5
+  Entry Point Node ID: 155370
+
+Entry Point Node Details:
+  Node Level: 5
+  Node PID: 38844
+  Node Index: 2
+  Level 0 neighbors: 24
+  Level 1 neighbors: 16
+  Level 2 neighbors: 16
+  Level 3 neighbors: 15
+  Level 4 neighbors: 16
+  Level 5 neighbors: 2
+
+Buffer Manager Statistics:
+  Total Allocations: 250002
+  Physical Pages Used: 250001
+  Read Operations: 0
+  Write Operations: 0
+
+Storage Utilization:
+  Index Capacity Usage: 100.00%
+  Page Utilization: 100.00%
+
+=== End Index Information ===
+
+  Process RSS: 4.69 GB
+Query set: 10000 queries repeated 104x = 1040000 total queries
+
+Querying for k=10 nearest neighbors with ef_search=50, threads=104...
+CacheProfiler initialized with events: ['cache-misses', 'cache-references', 'L1-dcache-load-misses', 'LLC-load-misses']
+
+ Performance counter stats for process id '2670948':
+
+    17,633,030,714      cache-misses:u            #   69.277 % of all cache refs    
+    25,453,058,357      cache-references:u                                          
+    20,736,613,901      L1-dcache-load-misses:u                                     
+   <not supported>      LLC-load-misses:u                                           
+
+      25.490238765 seconds time elapsed
+
+
+Search time (1040000 queries): 25.4101 seconds (40928.57 QPS)
+Recall@10: 0.9524
+
+================================================================================
+Benchmark Summary for lockfree_hash
+================================================================================
+Build Time: 69.1702s
+Search Time: 25.4101s
+QPS: 40928.57
+Recall@10: 0.9524
+Avg Dist Comps/Query: 0.00
+Index Size: 976.57 MB
+
+Calico module unloading: Shutting down system...
+Calico module unloading: Shutting down system...

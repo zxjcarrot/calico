@@ -1,0 +1,14 @@
+In-Memory Experiment Summary - Multi-threaded
+Generated on: Mon Oct 13 23:56:12 CST 2025
+Thread counts tested: 1 4 8
+Common settings: RNDREAD=1 BLOCK=/home/zxjcarrot/Workspace/calico/heapfile VIRTGB=32G PHYSGB=24G DATASIZE=1e8 PERF=1
+
+Running experiments with 1 threads...
+Completed experiments with 1 threads
+
+Running experiments with 4 threads...
+Completed experiments with 4 threads
+
+Running experiments with 8 threads...
+Completed experiments with 8 threads
+

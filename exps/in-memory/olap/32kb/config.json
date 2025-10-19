@@ -1,0 +1,17 @@
+{
+  "description": "Configuration for 32KB page size experiments",
+  "page_size_kb": 32,
+  "page_size_bytes": 32768,
+  "data_size_gb": 50,
+  "num_pages": 1638400,
+  "op_types": ["nonfiltered_count", "nonfiltered_sum"],
+  "layout_types": ["columnar", "row"],
+  "common_settings": {
+    "THREADS": 1,
+    "VIRTGB": "54G",
+    "PHYSGB": "54G",
+    "RUNFOR": 60,
+    "NUMPAGES": 1638400,
+    "SCANPAGES": 409600
+  }
+}
