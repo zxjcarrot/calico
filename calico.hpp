@@ -311,7 +311,7 @@ struct BufferManager {
 
     static constexpr u64 invalidFrame = std::numeric_limits<u64>::max();
     static constexpr PID invalidPID = std::numeric_limits<PID>::max();
-    static constexpr u32 freePartitionCount = 64;
+    static constexpr u32 freePartitionCount = 1;
 
     std::atomic<u64> physUsedCount;
     ResidentPageSet residentSet;
@@ -345,7 +345,7 @@ struct BufferManager {
     PID toPID(void* page);
     Page* toPtr(PID pid);
     Page* residentPtr(PID pid);
-    Page* residentPtr(PID pid, PageState& ps, u64 stateAndVersion);
+    Page* residentPtr(PID pid, u64 stateAndVersion);
     Page* preparePageForWrite(PID pid);
 
     void ensureFreePages();
@@ -365,6 +365,7 @@ struct BufferManager {
     
     IOInterface& getIOInterface();
 };
+typedef u64 KeyType;
 
 extern BufferManager* bm_ptr;
 // Define a convenience reference to avoid changing all code that uses bm
@@ -405,7 +406,7 @@ struct GuardO {
                 case PageState::Marked: {
                     u64 newV = PageState::sameVersion(v, PageState::Unlocked);
                     if (ps.stateAndVersion.compare_exchange_weak(v, newV)) {
-                        ptr = reinterpret_cast<T*>(bm.residentPtr(pid, ps, newV));
+                        ptr = reinterpret_cast<T*>(bm.residentPtr(pid, newV));
                         version = newV;
                         return;
                     }
@@ -420,7 +421,7 @@ struct GuardO {
                     }
                     break;
                 default:
-                    ptr = reinterpret_cast<T*>(bm.residentPtr(pid, ps, v));
+                    ptr = reinterpret_cast<T*>(bm.residentPtr(pid, v));
                     version = v;
                     return;
             }
@@ -545,7 +546,7 @@ struct GuardORelaxed {
                 case PageState::Marked:
                 case PageState::Locked:// we can live with stale data here, fallthrough
                 default:
-                    ptr = reinterpret_cast<T*>(bm.residentPtr(pid, ps, v));
+                    ptr = reinterpret_cast<T*>(bm.residentPtr(pid, v));
                     version = v;
                     return;
             }
@@ -630,7 +631,7 @@ struct GuardO_NoThrow {
                 case PageState::Marked: {
                     u64 newV = PageState::sameVersion(v, PageState::Unlocked);
                     if (ps.stateAndVersion.compare_exchange_weak(v, newV)) {
-                        ptr = reinterpret_cast<T*>(bm.residentPtr(pid, ps, newV));
+                        ptr = reinterpret_cast<T*>(bm.residentPtr(pid, newV));
                         version = newV;
                         return;
                     }
@@ -645,7 +646,7 @@ struct GuardO_NoThrow {
                     }
                     break;
                 default:
-                    ptr = reinterpret_cast<T*>(bm.residentPtr(pid, ps, v));
+                    ptr = reinterpret_cast<T*>(bm.residentPtr(pid, v));
                     version = v;
                     return;
             }

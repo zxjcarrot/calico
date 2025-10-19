@@ -51,10 +51,6 @@ bool PageState::packedMode = false;
 // Definition for LibaioInterface static member
 const u64 LibaioInterface::maxIOs;
 
-// Definition for IOUringInterface static members
-const u64 IOUringInterface::maxIOs;
-const u64 IOUringInterface::queueDepth;
-
 __attribute__((target("sse4.2"))) uint64_t hash64(uint64_t key, uint32_t seed) {
     uint64_t k = 0x8648DBDB;
     uint64_t crc = _mm_crc32_u64(seed, key);
@@ -79,14 +75,7 @@ static int exmapAction(int exmapfd, exmap_opcode op, u16 len) {
 
 // allocate memory using huge pages
 void* allocHuge(size_t size) {
-    //void* p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    //madvise(p, size, MADV_HUGEPAGE);
-    void* p = nullptr;
-    int ret = posix_memalign(&p, 2 * 1024 * 1024, size);
-    if (ret != 0) {
-        std::cerr << "posix_memalign failed: " << strerror(ret) << std::endl;
-        exit(EXIT_FAILURE);
-    }
+    void* p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     madvise(p, size, MADV_HUGEPAGE);
     return p;
 }
@@ -206,112 +195,6 @@ void LibaioInterface::readPages(const vector<PID>& pages, const vector<Page*>& d
     }
 }
 
-// io_uring implementation
-IOUringInterface::IOUringInterface(int blockfd, BufferManager* bm_ptr) : blockfd(blockfd), bm_ptr(bm_ptr) {
-    int ret = io_uring_queue_init(queueDepth, &ring, 0);
-    if (ret < 0) {
-        std::cerr << "io_uring_queue_init failed: " << strerror(-ret) << std::endl;
-        exit(EXIT_FAILURE);
-    }
-}
-
-IOUringInterface::~IOUringInterface() {
-    io_uring_queue_exit(&ring);
-}
-
-void IOUringInterface::writePages(const vector<PID>& pages) {
-    assert(pages.size() < maxIOs);
-    
-    // Prepare all write requests
-    for (u64 i = 0; i < pages.size(); i++) {
-        PID pid = pages[i];
-        Page* page = bm_ptr->preparePageForWrite(pid);
-        
-        struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
-        if (!sqe) {
-            std::cerr << "io_uring_get_sqe failed to get SQE" << std::endl;
-            exit(EXIT_FAILURE);
-        }
-        
-        io_uring_prep_write(sqe, blockfd, page, pageSize, pageSize * pid);
-        io_uring_sqe_set_data(sqe, (void*)(uintptr_t)i);
-    }
-    
-    // Submit all requests and wait for completions in one system call
-    int ret = io_uring_submit_and_wait(&ring, pages.size());
-    if (ret < 0) {
-        std::cerr << "io_uring_submit_and_wait failed: " << strerror(-ret) << std::endl;
-        exit(EXIT_FAILURE);
-    }
-    
-    // Reap all completions
-    for (u64 i = 0; i < pages.size(); i++) {
-        struct io_uring_cqe* cqe;
-        ret = io_uring_peek_cqe(&ring, &cqe);
-        if (ret < 0) {
-            std::cerr << "io_uring_peek_cqe failed: " << strerror(-ret) << std::endl;
-            exit(EXIT_FAILURE);
-        }
-        
-        if (cqe->res < 0) {
-            std::cerr << "write failed: " << strerror(-cqe->res) << std::endl;
-            exit(EXIT_FAILURE);
-        }
-        
-        io_uring_cqe_seen(&ring, cqe);
-    }
-}
-
-void IOUringInterface::readPages(const vector<PID>& pages, const vector<Page*>& destinations) {
-    assert(pages.size() == destinations.size());
-    assert(pages.size() < maxIOs);
-    
-    // Prepare all read requests
-    for (u64 i = 0; i < pages.size(); i++) {
-        PID pid = pages[i];
-        Page* dest = destinations[i];
-        
-        struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
-        if (!sqe) {
-            std::cerr << "io_uring_get_sqe failed to get SQE" << std::endl;
-            exit(EXIT_FAILURE);
-        }
-        
-        io_uring_prep_read(sqe, blockfd, dest, pageSize, pageSize * pid);
-        io_uring_sqe_set_data(sqe, (void*)(uintptr_t)i);
-    }
-    
-    // Submit all requests and wait for completions in one system call
-    int ret = io_uring_submit_and_wait(&ring, pages.size());
-    if (ret < 0) {
-        std::cerr << "io_uring_submit_and_wait failed: " << strerror(-ret) << std::endl;
-        exit(EXIT_FAILURE);
-    }
-    
-    // Reap all completions
-    for (u64 i = 0; i < pages.size(); i++) {
-        struct io_uring_cqe* cqe;
-        ret = io_uring_peek_cqe(&ring, &cqe);
-        if (ret < 0) {
-            std::cerr << "io_uring_peek_cqe failed: " << strerror(-ret) << std::endl;
-            exit(EXIT_FAILURE);
-        }
-        
-        if (cqe->res < 0) {
-            std::cerr << "read failed: " << strerror(-cqe->res) << std::endl;
-            exit(EXIT_FAILURE);
-        }
-        
-        io_uring_cqe_seen(&ring, cqe);
-    }
-    
-    // Mark pages as clean after successful read
-    for (u64 i = 0; i < pages.size(); i++) {
-        destinations[i]->dirty = false;
-        bm_ptr->readCount++;
-    }
-}
-
 u64 envOr(const char* env, u64 value) {
     if (getenv(env)) return atof(getenv(env));
     return value;
@@ -332,30 +215,19 @@ BufferManager::BufferManager(unsigned nthreads)
       physSize(envOrF("PHYSGB", 4) * gb),
       virtCount(virtSize / pageSize),
       physCount(physSize / pageSize),
-      residentSet(physCount),
-      numThreads(nthreads) {
+      residentSet(physCount) {
     assert(virtSize >= physSize);
     const char* path = getenv("BLOCK") ? getenv("BLOCK") : "/tmp/bm";
-    
-    // Check if we're using mmap with OS page cache before opening the file
-    u64 traditionalSetting = envOr("TRADITIONAL", 0);
-    useTraditional = (traditionalSetting == 1);
-    useMmapOSPageacche = (traditionalSetting == 2);
-    
-    // Disable O_DIRECT when using mmap with OS page cache to allow kernel buffering
-    int openFlags = O_RDWR;
-    if (!useMmapOSPageacche) {
-        openFlags |= O_DIRECT;
-    }
-    
-    blockfd = open(path, openFlags, S_IRWXU);
+    blockfd = open(path, O_RDWR | O_DIRECT, S_IRWXU);
     if (blockfd == -1) {
         cerr << "cannot open BLOCK device '" << path << "'" << endl;
         exit(EXIT_FAILURE);
     }
-    useExmap = (!useTraditional && !useMmapOSPageacche) && envOr("EXMAP", 0);
+
+    useTraditional = envOr("TRADITIONAL", 0);
+    useExmap = (!useTraditional) && envOr("EXMAP", 0);
     u64 tradHashSetting = useTraditional ? envOr("TRADHASH", 0) : 0;
-    if (!useTraditional && !useMmapOSPageacche)
+    if (!useTraditional)
         hashMode = HashMode::Array1Access;
     else if (tradHashSetting == 1)
         hashMode = HashMode::Unordered;
@@ -391,7 +263,8 @@ BufferManager::BufferManager(unsigned nthreads)
             u32 end = std::min<u32>(start + partitionFrameSpan, physCount);
             partition.frames.reserve(end - start);
             for (u32 frame = start; frame < end; frame++) partition.frames.push_back(frame);
-            if (!partition.frames.empty()) std::random_shuffle(partition.frames.begin(), partition.frames.end());
+            //if (!partition.frames.empty()) std::random_shuffle(partition.frames.begin(), partition.frames.end());
+            std::reverse(partition.frames.begin(), partition.frames.end());
             partition.top = partition.frames.size();
         }
         frameToPidArray.reset(new std::atomic<PID>[physCount]);
@@ -408,21 +281,11 @@ BufferManager::BufferManager(unsigned nthreads)
             frameToPidHash.reset();
         } else {
             if (hashMode == HashMode::Unordered) {
-                if (numThreads == -1) {
-                    pidToFrameHash = std::make_unique<ShardedUnorderedMap<PID, u64, 1>>();
-                    frameToPidHash = std::make_unique<ShardedUnorderedMap<u64, PID, 1>>();
-                } else {
-                    pidToFrameHash = std::make_unique<ShardedUnorderedMap<PID, u64>>();
-                    frameToPidHash = std::make_unique<ShardedUnorderedMap<u64, PID>>();
-                }
+                pidToFrameHash = std::make_unique<ShardedUnorderedMap<PID, u64>>();
+                frameToPidHash = std::make_unique<ShardedUnorderedMap<u64, PID>>();
             } else if (hashMode == HashMode::OpenAddress) {
-                if (numThreads == -1) {
-                    pidToFrameHash = std::make_unique<ShardedOpenAddressMap<PID, u64, 1>>();
-                    frameToPidHash = std::make_unique<ShardedOpenAddressMap<u64, PID, 1>>();
-                } else {
-                    pidToFrameHash = std::make_unique<ShardedOpenAddressMap<PID, u64>>();
-                    frameToPidHash = std::make_unique<ShardedOpenAddressMap<u64, PID>>();
-                }
+                pidToFrameHash = std::make_unique<ShardedOpenAddressMap<PID, u64>>();
+                frameToPidHash = std::make_unique<ShardedOpenAddressMap<u64, PID>>();
             } else if (hashMode == HashMode::Lockfree) {
                 pidToFrameHash = std::make_unique<LockFreeHashMap<PID, u64>>();
                 frameToPidHash = std::make_unique<LockFreeHashMap<u64, PID>>();
@@ -434,34 +297,7 @@ BufferManager::BufferManager(unsigned nthreads)
         }
         // round robin cursors will skip empty partitions automatically
     } else {
-        // by default vmcache uses no huge pages for virtMem
-        disableHugePageForFrameMem = envOr("NOHUGEPAGE_FRAME_MEM", 1);
-        if (useMmapOSPageacche) {
-            // For mmap+OS page cache mode, map the entire file directly using virtMem
-            // This is like vmcache's original approach, but without explicit eviction/page IO
-            virtMem = (Page*)mmap(NULL, virtAllocSize, PROT_READ | PROT_WRITE, MAP_SHARED, blockfd, 0);
-            if (virtMem == MAP_FAILED) {
-                std::cerr << "mmap failed for mmap+OS page cache mode: " << strerror(errno) << std::endl;
-                die("mmap virtMem for useMmapOSPageacche");
-            }
-            // madvise random
-            // int ret = madvise(virtMem, virtAllocSize, MADV_RANDOM);
-            // if (ret != 0) {
-            //     std::cerr << "madvise(MADV_RANDOM) failed with error: " << strerror(errno) << std::endl;
-            //     die("madvise MADV_RANDOM");
-            // }
-            // Let OS handle paging - no need for explicit eviction or readPage
-            int ret = 0;
-            if (disableHugePageForFrameMem) {
-                ret = madvise(virtMem, virtAllocSize, MADV_NOHUGEPAGE);
-            } else {
-                ret = madvise(virtMem, virtAllocSize, MADV_HUGEPAGE);
-            }
-            if (ret != 0) {
-                std::cerr << "madvise failed with error: " << strerror(errno) << std::endl;
-                exit(EXIT_FAILURE);
-            }
-        } else if (useExmap) {
+        if (useExmap) {
             exmapfd = open("/dev/exmap", O_RDWR);
             if (exmapfd < 0) die("open exmap");
 
@@ -481,15 +317,10 @@ BufferManager::BufferManager(unsigned nthreads)
             virtMem = (Page*)mmap(NULL, virtAllocSize, PROT_READ | PROT_WRITE, MAP_SHARED, exmapfd, 0);
         } else {
             virtMem = (Page*)mmap(NULL, virtAllocSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-            int ret = 0;
             if (disableHugePageForFrameMem) {
-                ret = madvise(virtMem, virtAllocSize, MADV_NOHUGEPAGE);
+                madvise(virtMem, virtAllocSize, MADV_NOHUGEPAGE);
             } else {
-                ret = madvise(virtMem, virtAllocSize, MADV_HUGEPAGE);
-            }
-            if (ret != 0) {
-                std::cerr << "madvise failed with error: " << strerror(errno) << std::endl;
-                exit(EXIT_FAILURE);
+                madvise(virtMem, virtAllocSize, MADV_HUGEPAGE);
             }
         }
         if (virtMem == MAP_FAILED) die("mmap failed");
@@ -509,20 +340,13 @@ BufferManager::BufferManager(unsigned nthreads)
          << " traditional:" << useTraditional << " mmap_os_pagecache:" << useMmapOSPageacche 
          << " trad_hash:" << static_cast<int>(hashMode) << " exmap:" << useExmap << " hugepage: " << (disableHugePageForFrameMem == 0)
          << endl;
-    // prefault the first PHYSGB worth of pages into the memory using 
 }
 
 BufferManager::~BufferManager() {}
 
 IOInterface& BufferManager::getIOInterface() {
-    static bool useIOUring = envOr("USE_IOURING", 1);
-    if (useIOUring) {
-        thread_local IOUringInterface instance(blockfd, this);
-        return instance;
-    } else {
-        thread_local LibaioInterface instance(blockfd, this);
-        return instance;
-    }
+    thread_local LibaioInterface instance(blockfd, this);
+    return instance;
 }
 
 bool BufferManager::isValidPtr(void* page) {
@@ -550,15 +374,15 @@ PID BufferManager::toPID(void* page) {
     return ptr - virtMem;
 }
 
-Page* BufferManager::residentPtr(PID pid) {
+inline Page* BufferManager::residentPtr(PID pid) {
     assert(pid < virtCount);
     if (!useTraditional) return virtMem + pid;
     PageState& ps = getPageState(pid);
     u64 stateAndVersion = ps.stateAndVersion.load(std::memory_order_acquire);
-    return residentPtr(pid, ps, stateAndVersion);
+    return residentPtr(pid, stateAndVersion);
 }
 
-Page* BufferManager::residentPtr(PID pid, PageState& ps, u64 stateAndVersion) {
+Page* BufferManager::residentPtr(PID pid, u64 stateAndVersion) {
     assert(pid < virtCount);
     if (!useTraditional) return virtMem + pid;
 
@@ -671,283 +495,14 @@ void BufferManager::lockPartition(u32 partition) {
 
 void BufferManager::unlockPartition(u32 partition) { freePartitions[partition].lock.clear(std::memory_order_release); }
 
-const char* systemName = nullptr;
-static void runGraphBenchmark(u64 nodeCount, u64 startIndex, unsigned nthreads) {
-    if (nodeCount == 0) {
-        std::cout << "graph_bfs nodes=0" << std::endl;
-        return;
-    }
-
-    u32 desiredNeighbors = static_cast<u32>(std::log(static_cast<double>(std::max<u64>(2, nodeCount))) / std::log(2.0));
-    desiredNeighbors = std::max<u32>(1, desiredNeighbors);
-    u32 maxNeighbors = GraphNodePage::maxNeighbors();
-    desiredNeighbors = std::min(desiredNeighbors, maxNeighbors);
-
-    std::vector<PID> nodePids;
-    nodePids.reserve(nodeCount);
-
-    std::cout << "bm.physcount * 9 = " << bm.physCount * 0.9 << std::endl;
-    // prefault the physical memory
-    for (u64 i = 0; i < nodeCount; i++) {
-        auto* page = reinterpret_cast<GraphNodePage*>(bm.allocPage());
-        PID pid = bm.toPID(page);
-        page->neighborCount = 0;
-        page->padding = 0;
-        nodePids.push_back(pid);
-        // if (i == 3774870) {
-        //     std::ifstream meminfo("/proc/meminfo");
-        //     if (meminfo.is_open()) {
-        //         std::string line;
-        //         std::cout << "==== /proc/meminfo ====" << std::endl;
-        //         while (std::getline(meminfo, line)) {
-        //             std::cout << line << std::endl;
-        //         }
-        //         std::cout << "=======================" << std::endl;
-        //         meminfo.close();
-        //     } else {
-        //         std::cerr << "Failed to open /proc/meminfo" << std::endl;
-        //     }
-        // }
-        page->dirty = false;
-        bm.unfixX(pid);
-    }
-
-    std::mt19937_64 rng(42);
-    std::uniform_int_distribution<u64> distNode(0, nodeCount - 1);
-    std::uniform_int_distribution<u64> valueDist(1, 1000);
-
-    // for (u64 i = 0; i < nodeCount; i++) {
-    //     GraphNodePage* page = reinterpret_cast<GraphNodePage*>(bm.fixX(nodePids[i]));
-    //     //auto* page = reinterpret_cast<GraphNodePage*>(bm.allocPage());
-    //     PID pid = bm.toPID(page);
-    //     page->neighborCount = 0;
-    //     page->padding = 0;
-    //     page->value = valueDist(rng);
-    //     page->dirty = true;
-    //     bm.unfixX(pid);
-    // }
-
-    for (u64 i = 0; i < nodeCount; i++) {
-        GraphNodePage* node = reinterpret_cast<GraphNodePage*>(bm.fixX(nodePids[i]));
-        node->neighborCount = desiredNeighbors;
-        node->padding = 0;
-        node->value = valueDist(rng);
-        PID* neighbors = node->neighborData();
-        for (u32 j = 0; j < desiredNeighbors; j++) neighbors[j] = nodePids[distNode(rng)];
-        node->dirty = true;
-        bm.unfixX(nodePids[i]);
-    }
-
-    cerr << "space: " << (bm.allocCount.load() * pageSize) / (float)bm.gb << " GB " << endl;
-    PID basePid = nodePids.front();
-    PID maxPid = nodePids.back();
-
-    bool enablePerf = envOr("PERF", 0);
-    bool enablePrefetch = envOr("PREFETCH", 1);
-    
-    // Prepare starting nodes for each thread
-    std::vector<u64> startIndices(nthreads);
-    if (nthreads == 1) {
-        // Single thread: use the provided startIndex
-        startIndices[0] = std::min<u64>(startIndex, nodeCount - 1);
-    } else {
-        // Multiple threads: randomly choose starting indices
-        std::mt19937_64 startRng(42);  // Fixed seed for reproducibility
-        std::uniform_int_distribution<u64> startDist(0, nodeCount - 1);
-        for (unsigned t = 0; t < nthreads; t++) {
-            startIndices[t] = startDist(startRng);
-        }
-    }
-    
-    // Results for each thread
-    std::vector<u64> threadVisitCounts(nthreads, 0);
-    std::vector<u64> threadTotalValues(nthreads, 0);
-    std::vector<u64> threadDurationsMs(nthreads, 0);
-    
-    // For periodic stats collection
-    std::atomic<bool> keepRunningGraph{true};
-    std::atomic<u64> globalVisitProgress{0};
-    
-    auto runBFS = [&](unsigned threadId) {
-        workerThreadId = threadId;
-        std::vector<uint8_t> visited(nodeCount, 0);
-        u64 clampedStart = startIndices[threadId];
-        PID startPid = nodePids[clampedStart];
-        visited[clampedStart] = 1;
-        
-        u64 visitCount = 0;
-        u64 totalValue = 0;
-        u64 localVisitProgress = 0;
-        const u64 visitBatchSize = 1000; // Batch updates to reduce atomic contention
-        
-        auto begin = std::chrono::steady_clock::now();
-        {
-            std::unique_ptr<perf::Scope> perfScope;
-            if (enablePerf) perfScope = std::make_unique<perf::Scope>();
-            {
-                GuardS<GraphNodePage> startNode(startPid);
-                totalValue += startNode->value;
-            }
-
-            std::queue<PID> frontier;
-            frontier.push(startPid);
-
-            while (!frontier.empty()) {
-                PID current = frontier.front();
-                frontier.pop();
-                visitCount++;
-                localVisitProgress++;
-                
-                // Batch update to global counter
-                if (localVisitProgress >= visitBatchSize) {
-                    globalVisitProgress.fetch_add(localVisitProgress, std::memory_order_relaxed);
-                    localVisitProgress = 0;
-                }
-
-                GuardS<GraphNodePage> node(current);
-                GraphNodePage* page = node.ptr;
-                const PID* neighbors = page->neighborData();
-                if (enablePrefetch) bm.prefetchPages(neighbors, page->neighborCount);
-                for (u32 i = 0; i < page->neighborCount; i++) {
-                    PID neighborPid = neighbors[i];
-                    u64 idx64 = neighborPid - basePid;
-                    u32 idx = static_cast<u32>(idx64);
-                    while(true) {
-                        try{
-                            u64 value = 0;
-                            {
-                                GuardO<GraphNodePage> neighborNode(neighborPid);
-                                // compute something
-                                value = neighborNode->value;
-                            }
-                            totalValue += value;
-                            if (!visited[idx]) {
-                                visited[idx] = 1;
-                                frontier.push(neighborPid);
-                            }
-                            break;
-                        } catch(OLCRestartException e) {}
-                    }
-                }
-            }
-            
-            // Flush any remaining local progress
-            if (localVisitProgress > 0) {
-                globalVisitProgress.fetch_add(localVisitProgress, std::memory_order_relaxed);
-            }
-        }
-        
-        auto end = std::chrono::steady_clock::now();
-        auto durationMs = std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count();
-        
-        threadVisitCounts[threadId] = visitCount;
-        threadTotalValues[threadId] = totalValue;
-        threadDurationsMs[threadId] = durationMs;
-    };
-
-    const char* txCsvPath = getenv("TX_CSV");
-    std::ofstream file;
-    std::ostream* out = &cerr;
-
-    if (txCsvPath) {
-        file.open(txCsvPath);
-        if (file.is_open()) {
-            out = &file;
-        } else {
-            cerr << "Error: Could not open TX_CSV file: " << txCsvPath << endl;
-        }
-    }
-
-    // Stats collection thread (similar to statFn)
-    auto graphStatFn = [&]() {
-
-
-        *out << "ts,visits,rmb,wmb,system,threads,nodes,neighbors_per_node" << endl;
-        u64 cnt = 0;
-        u64 totalVisits = 0;
-        
-        while (keepRunningGraph.load()) {
-            sleep(1);
-            float rmb = (bm.readCount.exchange(0) * pageSize) / (1024.0 * 1024);
-            float wmb = (bm.writeCount.exchange(0) * pageSize) / (1024.0 * 1024);
-            u64 visits = globalVisitProgress.exchange(0);
-            totalVisits += visits;
-            
-            if (!keepRunningGraph.load()) break;
-            
-            *out << cnt++ << "," << visits << "," << rmb << "," << wmb << "," 
-                 << systemName << "," << nthreads << "," << nodeCount << "," 
-                 << desiredNeighbors << endl;
-        }
-        
-        // Final flush for any remaining visits
-        u64 remainingVisits = globalVisitProgress.exchange(0);
-        totalVisits += remainingVisits;
-    };
-
-    // Reset counters before starting
-    bm.readCount = 0;
-    bm.writeCount = 0;
-    
-    // Start stats collection thread
-    std::thread statsThread(graphStatFn);
-
-    // Run BFS searches in parallel
-    auto overallBegin = std::chrono::steady_clock::now();
-    std::vector<std::thread> threads;
-    for (unsigned t = 0; t < nthreads; t++) {
-        threads.emplace_back(runBFS, t);
-    }
-    for (auto& thread : threads) {
-        thread.join();
-    }
-    auto overallEnd = std::chrono::steady_clock::now();
-    auto overallDurationMs = std::chrono::duration_cast<std::chrono::milliseconds>(overallEnd - overallBegin).count();
-    
-    // Stop stats collection thread
-    keepRunningGraph = false;
-    statsThread.join();
-    
-    // Calculate average traversal time
-    u64 totalTraversalTimeMs = 0;
-    u64 totalVisits = 0;
-    u64 totalValueSum = 0;
-    for (unsigned t = 0; t < nthreads; t++) {
-        totalTraversalTimeMs += threadDurationsMs[t];
-        totalVisits += threadVisitCounts[t];
-        totalValueSum += threadTotalValues[t];
-    }
-    double avgTraversalTimeMs = static_cast<double>(totalTraversalTimeMs) / nthreads;
-    
-    if (enablePerf) perf::Aggregator::instance().report(totalVisits);
-    
-
-    *out << "bfs nodes=" << nodeCount << " neighbors_per_node=" << desiredNeighbors 
-         << " nthreads=" << nthreads << " start_indices=[";
-    for (unsigned t = 0; t < nthreads; t++) {
-        *out << startIndices[t];
-        if (t < nthreads - 1) *out << ",";
-    }
-    *out << "]" << endl;
-
-
-    *out << "BFS completed: nthreads=" << nthreads 
-         << " avg_traversal_time=" << avgTraversalTimeMs << "ms"
-         << " overall_time=" << overallDurationMs << "ms" 
-         << " total_visited=" << totalVisits << endl;
-}
-
 void BufferManager::ensureFreePages() {
-    if (useMmapOSPageacche) return; // OS manages memory
     if (physUsedCount >= physCount * 0.95) evict();
 }
 
 // allocated new page and fix it
 Page* BufferManager::allocPage() {
-    if (!useMmapOSPageacche) {
-        physUsedCount++;
-        ensureFreePages();
-    }
+    physUsedCount++;
+    ensureFreePages();
     u64 pid = allocCount++;
     if (pid >= virtCount) {
         cerr << "VIRTGB is too low" << endl;
@@ -967,20 +522,13 @@ Page* BufferManager::allocPage() {
         }
     }
 
-    if (!useMmapOSPageacche) {
-        residentSet.insert(pid);
-    }
+    residentSet.insert(pid);
     page->dirty = true;
 
     return page;
 }
 
 Page* BufferManager::handleFault(PID pid) {
-    if (useMmapOSPageacche) {
-        // In mmap+OS page cache mode, OS handles faults automatically
-        // Just return the mapped address, no explicit I/O needed
-        return virtMem + pid;
-    }
     physUsedCount++;
     ensureFreePages();
     Page* page = acquireFrameForPid(pid);
@@ -993,35 +541,21 @@ Page* BufferManager::fixX(PID pid) {
     PageState& ps = getPageState(pid);
     for (u64 repeatCounter = 0;; repeatCounter++) {
         u64 stateAndVersion = ps.stateAndVersion.load();
-        u64 state = PageState::getState(stateAndVersion);
-        
-        if (useMmapOSPageacche) {
-            // In mmap+OS page cache mode, pages are never evicted by DB
-            // Only need to handle: Locked, Marked, Unlocked states
-            if (state == PageState::Marked || state == PageState::Unlocked) {
+        switch (PageState::getState(stateAndVersion)) {
+            case PageState::Evicted: {
                 if (ps.tryLockX(stateAndVersion)) {
-                    return residentPtr(pid, ps, stateAndVersion);
+                    Page* page = handleFault(pid);
+                    return page;
                 }
+                break;
             }
-            // For Locked state, just retry
-        } else {
-            // Original vmcache or traditional mode logic
-            switch (state) {
-                case PageState::Evicted: {
-                    if (ps.tryLockX(stateAndVersion)) {
-                        Page* page = handleFault(pid);
-                        return page;
-                    }
-                    break;
+            case PageState::Marked:
+            case PageState::Unlocked: {
+                if (ps.tryLockX(stateAndVersion)) {
+                    // u64 lockedState = PageState::sameVersion(stateAndVersion, PageState::Locked);
+                    return residentPtr(pid, stateAndVersion);
                 }
-                case PageState::Marked:
-                case PageState::Unlocked: {
-                    if (ps.tryLockX(stateAndVersion)) {
-                        // u64 lockedState = PageState::sameVersion(stateAndVersion, PageState::Locked);
-                        return residentPtr(pid, ps, stateAndVersion);
-                    }
-                    break;
-                }
+                break;
             }
         }
         yield(repeatCounter);
@@ -1032,42 +566,23 @@ Page* BufferManager::fixS(PID pid) {
     PageState& ps = getPageState(pid);
     for (u64 repeatCounter = 0;; repeatCounter++) {
         u64 stateAndVersion = ps.stateAndVersion;
-        u64 state = PageState::getState(stateAndVersion);
-        
-        if (useMmapOSPageacche) {
-            // In mmap+OS page cache mode, pages are never evicted by DB
-            // Only need to handle: Locked, Marked, Unlocked, and shared states
-            if (state == PageState::Locked) {
-                // Just retry
-            } else {
-                // Try to acquire shared lock (state can be Marked, Unlocked, or already shared)
+        switch (PageState::getState(stateAndVersion)) {
+            case PageState::Locked: {
+                break;
+            }
+            case PageState::Evicted: {
+                if (ps.tryLockX(stateAndVersion)) {
+                    handleFault(pid);
+                    ps.unlockX();
+                }
+                break;
+            }
+            default: {
                 if (ps.tryLockS(stateAndVersion)) {
                     u64 s = PageState::getState(stateAndVersion);
                     u64 nextState = (s < PageState::MaxShared) ? (s + 1) : 1;
                     u64 newState = PageState::sameVersion(stateAndVersion, nextState);
-                    return residentPtr(pid, ps, newState);
-                }
-            }
-        } else {
-            // Original vmcache or traditional mode logic
-            switch (state) {
-                case PageState::Locked: {
-                    break;
-                }
-                case PageState::Evicted: {
-                    if (ps.tryLockX(stateAndVersion)) {
-                        handleFault(pid);
-                        ps.unlockX();
-                    }
-                    break;
-                }
-                default: {
-                    if (ps.tryLockS(stateAndVersion)) {
-                        u64 s = PageState::getState(stateAndVersion);
-                        u64 nextState = (s < PageState::MaxShared) ? (s + 1) : 1;
-                        u64 newState = PageState::sameVersion(stateAndVersion, nextState);
-                        return residentPtr(pid, ps, newState);
-                    }
+                    return residentPtr(pid, newState);
                 }
             }
         }
@@ -1101,11 +616,6 @@ void BufferManager::readPage(PID pid, Page* dest) {
 }
 
 void BufferManager::evict() {
-    if (useMmapOSPageacche) {
-        // In mmap+OS page cache mode, OS handles all eviction
-        // No need for explicit eviction by the buffer manager
-        return;
-    }
     vector<PID> toEvict;
     toEvict.reserve(batch);
     vector<PID> toWrite;
@@ -1164,25 +674,15 @@ void BufferManager::evict() {
             exmapInterface[workerThreadId]->iov[i].len = 1;
         }
         if (exmapAction(exmapfd, EXMAP_OP_FREE, toEvict.size()) < 0) die("ioctl: EXMAP_OP_FREE");
-    } else if (!useTraditional && !useMmapOSPageacche) {
-        for (u64& pid : toEvict) {
-            int ret = madvise(virtMem + pid, pageSize, MADV_DONTNEED);
-            if (ret != 0) {
-                std::cerr << "madvise failed for PID: " << pid << " with error: " << strerror(errno) << std::endl;
-            } 
-            //else {
-            //     std::cout << "madvise succeeded on PID: " << pid << " addr " << (virtMem + pid) << " pageSize " << pageSize << std::endl;
-            // }
-        }
+    } else if (!useTraditional) {
+        for (u64& pid : toEvict) madvise(virtMem + pid, pageSize, MADV_DONTNEED);
     }
 
     // 5. remove from hash table and unlock
     for (u64& pid : toEvict) {
         if (useTraditional) releaseFrame(pid);
-        if (!useMmapOSPageacche) {
-            bool succ = residentSet.remove(pid);
-            assert(succ);
-        }
+        bool succ = residentSet.remove(pid);
+        assert(succ);
         getPageState(pid).unlockXEvicted();
     }
 
@@ -1190,9 +690,6 @@ void BufferManager::evict() {
 }
 
 void BufferManager::prefetchPages(const PID* pages, int n_pages, const u32* offsets_within_pages) {
-    if (useMmapOSPageacche) {
-        return; // mmap + os page cache does not support batch async prefetch.
-    }
     // if (!useTraditional) {
     //    // For mmap mode, all pages are always "resident"
     //    return;
@@ -1223,7 +720,7 @@ void BufferManager::prefetchPages(const PID* pages, int n_pages, const u32* offs
         if (state != PageState::Evicted) {
             if (offsets_within_pages != nullptr) {
                   // Touch the page to bring it into cache
-                  char *tmp = (((char*)residentPtr(pid, ps, stateAndVersion)) + offsets_within_pages[i]);
+                  char *tmp = (((char*)residentPtr(pid, stateAndVersion)) + offsets_within_pages[i]);
                   _mm_prefetch(reinterpret_cast<const char*>(tmp), _MM_HINT_T0);
                   _mm_prefetch(reinterpret_cast<const char*>(tmp) + 64, _MM_HINT_T0);
             }
@@ -1256,11 +753,10 @@ void BufferManager::prefetchPages(const PID* pages, int n_pages, const u32* offs
 
     // Batch read all pages that need to be loaded
     if (pidsToRead && !pidsToRead->empty()) {
-        constexpr size_t maxBatchSize = 256;  // Safe for both LibaioInterface and IOUringInterface
-        if (pidsToRead->size() >= maxBatchSize) {
+        if (pidsToRead->size() >= LibaioInterface::maxIOs) {
             // Split into multiple batches if too many pages
-            for (size_t i = 0; i < pidsToRead->size(); i += maxBatchSize) {
-                size_t batchSize = std::min(maxBatchSize, pidsToRead->size() - i);
+            for (size_t i = 0; i < pidsToRead->size(); i += LibaioInterface::maxIOs) {
+                size_t batchSize = std::min(LibaioInterface::maxIOs, pidsToRead->size() - i);
                 vector<PID> batch(pidsToRead->begin() + i, pidsToRead->begin() + i + batchSize);
                 vector<Page*> batchDest(destinations->begin() + i, destinations->begin() + i + batchSize);
                 getIOInterface().readPages(batch, batchDest);
@@ -1785,246 +1281,7 @@ bool BTree::remove(span<u8> key) {
     }
 }
 
-typedef u64 KeyType;
 
-void handleSEGFAULT(int signo, siginfo_t* info, void* extra) {
-    void* page = info->si_addr;
-    if (bm.isValidPtr(page)) {
-        cerr << "segfault restart " << bm.toPID(page) << endl;
-        throw OLCRestartException();
-    } else {
-        cerr << "segfault " << page << endl;
-        _exit(1);
-    }
-}
-
-int main(int argc, char** argv) {
-    unsigned nthreads = envOr("THREADS", 1);
-    bm_ptr = new BufferManager(nthreads);
-    if (bm.useExmap) {
-        struct sigaction action;
-        action.sa_flags = SA_SIGINFO;
-        action.sa_sigaction = handleSEGFAULT;
-        if (sigaction(SIGSEGV, &action, NULL) == -1) {
-            perror("sigusr: sigaction");
-            exit(1);
-        }
-    }
-    u64 n = envOr("DATASIZE", 10);
-    u64 runForSec = envOr("RUNFOR", 30);
-    bool isRndread = envOr("RNDREAD", 0);
-    double skewFactor = envOrDouble("SKEW", 0.0);  // Zipfian skew factor, 0.0 = uniform
-
-    u64 statDiff = 1e8;
-    atomic<u64> txProgress(0);
-    atomic<u64> txTotal(0);
-    atomic<bool> keepRunning(true);
-    const char* tradMode = "traditional-array";
-    if (bm.hashMode == BufferManager::HashMode::Array1Access)
-        tradMode = "traditional-array1";
-    else if (bm.hashMode == BufferManager::HashMode::Unordered)
-        tradMode = "traditional-hash-unordered";
-    else if (bm.hashMode == BufferManager::HashMode::OpenAddress)
-        tradMode = "traditional-hash-open";
-    else if (bm.hashMode == BufferManager::HashMode::Lockfree)
-        tradMode = "traditional-hash-lockfree";
-    systemName = bm.useTraditional ? tradMode : (bm.useExmap ? "exmap" : "vmcache");
-
-
-    if (envOr("GRAPH", 0)) {
-        u64 nodeCount = n;
-        u64 startIndex = envOr("GRAPHSTART", 0);
-        runGraphBenchmark(nodeCount, startIndex, nthreads);
-        return 0;
-    }
-    auto statFn = [&]() {
-        const char* txCsvPath = getenv("TX_CSV");
-        std::ofstream file;
-        std::ostream* out = &cout;
-
-        if (txCsvPath) {
-            file.open(txCsvPath);
-            if (file.is_open()) {
-                out = &file;
-            } else {
-                cerr << "Error: Could not open TX_CSV file: " << txCsvPath << endl;
-            }
-        }
-
-        *out << "ts,tx,rmb,wmb,system,threads,datasize,workload,batch,skew" << endl;
-        u64 cnt = 0;
-        u64 totalTx = 0;
-        for (uint64_t i = 0; i < runForSec; i++) {
-            sleep(1);
-            float rmb = (bm.readCount.exchange(0) * pageSize) / (1024.0 * 1024);
-            float wmb = (bm.writeCount.exchange(0) * pageSize) / (1024.0 * 1024);
-            u64 prog = txProgress.exchange(0);
-            totalTx += prog;
-            *out << cnt++ << "," << prog << "," << rmb << "," << wmb << "," << systemName << "," << nthreads << "," << n
-                 << "," << (isRndread ? "rndread" : "tpcc") << "," << bm.batch << "," << skewFactor << endl;
-        }
-        // Record average throughput
-        double avgThroughput = (runForSec > 0) ? (double)totalTx / runForSec : 0.0;
-        *out << "avg_throughput," << avgThroughput << ",0,0," << systemName << "," << nthreads << "," << n << ","
-             << (isRndread ? "rndread" : "tpcc") << "," << bm.batch << "," << skewFactor << endl;
-        keepRunning = false;
-    };
-
-    if (isRndread) {
-        bool enablePerf = envOr("PERF", 0);
-
-        // Print information about the key distribution being used
-        if (skewFactor > 0.0) {
-            cerr << "Using Zipfian key distribution with skew factor: " << skewFactor << endl;
-        } else {
-            cerr << "Using uniform random key distribution" << endl;
-        }
-
-        BTree bt;
-        bt.splitOrdered = true;
-
-        {
-            // insert
-            parallel_for(0, n, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
-                workerThreadId = worker;
-                array<u8, 120> payload;
-                // std::vector<u64> keys;
-                // keys.reserve(end-begin);
-                // for (u64 i=begin; i<end; i++)
-                //    keys.push_back(i);
-                // std::random_shuffle(keys.begin(), keys.end());
-                for (u64 i = begin; i < end; i++) {
-                    union {
-                        u64 v1;
-                        u8 k1[sizeof(u64)];
-                    };
-                    // v1 = __builtin_bswap64(keys[i-begin]);
-                    v1 = __builtin_bswap64(i);
-                    memcpy(payload.data(), k1, sizeof(u64));
-                    bt.insert({k1, sizeof(KeyType)}, {payload.data(), payload.size()});
-                }
-            });
-        }
-        cerr << "space: " << (bm.allocCount.load() * pageSize) / (float)bm.gb << " GB " << endl;
-
-        bm.readCount = 0;
-        bm.writeCount = 0;
-        thread statThread(statFn);
-
-        parallel_for(0, nthreads, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
-            workerThreadId = worker;
-            u64 cnt = 0;
-            u64 start = rdtsc();
-
-            std::unique_ptr<perf::Scope> perfScope;
-            if (enablePerf) perfScope = std::make_unique<perf::Scope>();
-
-            // Initialize key generator based on skew factor
-            std::unique_ptr<ScrambledZipfGenerator> zipfGen;
-            if (skewFactor > 0.0) {
-                zipfGen = std::make_unique<ScrambledZipfGenerator>(0, n, skewFactor);
-            }
-
-            while (keepRunning.load()) {
-                union {
-                    u64 v1;
-                    u8 k1[sizeof(u64)];
-                };
-
-                // Generate key using either uniform random or Zipfian distribution
-                if (skewFactor > 0.0) {
-                    v1 = __builtin_bswap64(zipfGen->rand());
-                } else {
-                    v1 = __builtin_bswap64(RandomGenerator::getRand<u64>(0, n));
-                }
-
-                array<u8, 120> payload;
-                bool succ =
-                    bt.lookup({k1, sizeof(u64)}, [&](span<u8> p) { memcpy(payload.data(), p.data(), p.size()); });
-                assert(succ);
-                assert(memcmp(k1, payload.data(), sizeof(u64)) == 0);
-
-                cnt++;
-                u64 stop = rdtsc();
-                if ((stop - start) > statDiff) {
-                    txProgress += cnt;
-                    txTotal += cnt;
-                    start = stop;
-                    cnt = 0;
-                }
-            }
-            txTotal += cnt;
-            txProgress += cnt;
-        });
-
-        statThread.join();
-        if (enablePerf) perf::Aggregator::instance().report(txTotal.load());
-        return 0;
-    }
-
-    // TPC-C
-    Integer warehouseCount = n;
-
-    vmcacheAdapter<warehouse_t> warehouse;
-    vmcacheAdapter<district_t> district;
-    vmcacheAdapter<customer_t> customer;
-    vmcacheAdapter<customer_wdl_t> customerwdl;
-    vmcacheAdapter<history_t> history;
-    vmcacheAdapter<neworder_t> neworder;
-    vmcacheAdapter<order_t> order;
-    vmcacheAdapter<order_wdc_t> order_wdc;
-    vmcacheAdapter<orderline_t> orderline;
-    vmcacheAdapter<item_t> item;
-    vmcacheAdapter<stock_t> stock;
-
-    TPCCWorkload<vmcacheAdapter> tpcc(warehouse, district, customer, customerwdl, history, neworder, order, order_wdc,
-                                      orderline, item, stock, true, warehouseCount, true);
-
-    {
-        tpcc.loadItem();
-        tpcc.loadWarehouse();
-
-        parallel_for(1, warehouseCount + 1, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
-            workerThreadId = worker;
-            for (Integer w_id = begin; w_id < end; w_id++) {
-                tpcc.loadStock(w_id);
-                tpcc.loadDistrinct(w_id);
-                for (Integer d_id = 1; d_id <= 10; d_id++) {
-                    tpcc.loadCustomer(w_id, d_id);
-                    tpcc.loadOrders(w_id, d_id);
-                }
-            }
-        });
-    }
-    cerr << "space: " << (bm.allocCount.load() * pageSize) / (float)bm.gb << " GB " << endl;
-
-    bm.readCount = 0;
-    bm.writeCount = 0;
-    thread statThread(statFn);
-
-    parallel_for(0, nthreads, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
-        workerThreadId = worker;
-        u64 cnt = 0;
-        u64 start = rdtsc();
-        while (keepRunning.load()) {
-            int w_id = tpcc.urand(1, warehouseCount);  // wh crossing
-            tpcc.tx(w_id);
-            cnt++;
-            u64 stop = rdtsc();
-            if ((stop - start) > statDiff) {
-                txProgress += cnt;
-                start = stop;
-                cnt = 0;
-            }
-        }
-        txProgress += cnt;
-    });
-
-    statThread.join();
-    cerr << "space: " << (bm.allocCount.load() * pageSize) / (float)bm.gb << " GB " << endl;
-
-    return 0;
-}
 
 void initialize_system() {
     if (bm_ptr == nullptr) {
@@ -2034,8 +1291,7 @@ void initialize_system() {
         setenv("VIRTGB", "24", 0);
         setenv("PHYSGB", "16", 0);
         
-        unsigned nthreads = envOr("THREADS", 2);
-        bm_ptr = new BufferManager(nthreads);
+        bm_ptr = new BufferManager();
     }
 }
 
