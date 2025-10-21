@@ -73,6 +73,122 @@ static int exmapAction(int exmapfd, exmap_opcode op, u16 len) {
     return ioctl(exmapfd, EXMAP_IOCTL_ACTION, &params_free);
 }
 
+// Calculate minimal number of bits needed to represent n
+static u32 bitsNeeded(u64 n) {
+    if (n == 0) return 1;
+    return 64 - __builtin_clzll(n - 1);
+}
+
+// TwoLevelPageStateArray implementation
+TwoLevelPageStateArray::TwoLevelPageStateArray(u64 virtCount) 
+    : total_entries(virtCount) {
+    
+    // Calculate minimal bits needed for total entries
+    u32 totalBits = bitsNeeded(virtCount);
+    
+    // Top bits = total - bottom bits
+    topBits = (totalBits > bottomBits) ? (totalBits - bottomBits) : 0;
+    num_top_slots = 1U << topBits;
+    entries_per_slot = 1U << bottomBits;
+    
+    std::cerr << "[TwoLevelPageStateArray] virtCount=" << virtCount 
+              << " totalBits=" << totalBits
+              << " topBits=" << topBits << " (" << num_top_slots << " slots)"
+              << " bottomBits=" << bottomBits << " (" << entries_per_slot << " entries/slot)"
+              << std::endl;
+    
+    // Allocate top-level array
+    size_t top_size = num_top_slots * sizeof(PageState*);
+    second_level_arrays = (PageState**)allocHuge(top_size);
+    
+    // Allocate each second-level array
+    size_t second_level_size = entries_per_slot * sizeof(PageState);
+    for (u32 i = 0; i < num_top_slots; i++) {
+        second_level_arrays[i] = (PageState*)allocHuge(second_level_size);
+        
+        // Initialize all entries in this second-level array
+        for (u32 j = 0; j < entries_per_slot; j++) {
+            second_level_arrays[i][j].init();
+        }
+    }
+}
+
+TwoLevelPageStateArray::~TwoLevelPageStateArray() {
+    if (second_level_arrays) {
+        size_t second_level_size = entries_per_slot * sizeof(PageState);
+        for (u32 i = 0; i < num_top_slots; i++) {
+            if (second_level_arrays[i]) {
+                munmap(second_level_arrays[i], second_level_size);
+            }
+        }
+        size_t top_size = num_top_slots * sizeof(PageState*);
+        munmap(second_level_arrays, top_size);
+    }
+}
+
+// ThreeLevelPageStateArray implementation
+ThreeLevelPageStateArray::ThreeLevelPageStateArray(u64 virtCount) 
+    : total_entries(virtCount) {
+    
+    // Calculate minimal bits needed for total entries
+    u32 totalBits = bitsNeeded(virtCount);
+    
+    // Top bits = total - middle - bottom bits
+    u32 usedBits = bottomBits + middleBits;
+    topBits = (totalBits > usedBits) ? (totalBits - usedBits) : 0;
+    num_top_slots = 1U << topBits;
+    num_middle_slots = 1U << middleBits;
+    entries_per_slot = 1U << bottomBits;
+    
+    std::cerr << "[ThreeLevelPageStateArray] virtCount=" << virtCount 
+              << " totalBits=" << totalBits
+              << " topBits=" << topBits << " (" << num_top_slots << " slots)"
+              << " middleBits=" << middleBits << " (" << num_middle_slots << " slots)"
+              << " bottomBits=" << bottomBits << " (" << entries_per_slot << " entries/slot)"
+              << std::endl;
+    
+    // Allocate top-level array
+    size_t top_size = num_top_slots * sizeof(PageState**);
+    top_level_arrays = (PageState***)allocHuge(top_size);
+    
+    // Allocate each middle-level array
+    size_t middle_size = num_middle_slots * sizeof(PageState*);
+    for (u32 i = 0; i < num_top_slots; i++) {
+        top_level_arrays[i] = (PageState**)allocHuge(middle_size);
+        
+        // Allocate each bottom-level array
+        size_t bottom_level_size = entries_per_slot * sizeof(PageState);
+        for (u32 j = 0; j < num_middle_slots; j++) {
+            top_level_arrays[i][j] = (PageState*)allocHuge(bottom_level_size);
+            
+            // Initialize all entries in this bottom-level array
+            for (u32 k = 0; k < entries_per_slot; k++) {
+                top_level_arrays[i][j][k].init();
+            }
+        }
+    }
+}
+
+ThreeLevelPageStateArray::~ThreeLevelPageStateArray() {
+    if (top_level_arrays) {
+        size_t bottom_level_size = entries_per_slot * sizeof(PageState);
+        size_t middle_size = num_middle_slots * sizeof(PageState*);
+        
+        for (u32 i = 0; i < num_top_slots; i++) {
+            if (top_level_arrays[i]) {
+                for (u32 j = 0; j < num_middle_slots; j++) {
+                    if (top_level_arrays[i][j]) {
+                        munmap(top_level_arrays[i][j], bottom_level_size);
+                    }
+                }
+                munmap(top_level_arrays[i], middle_size);
+            }
+        }
+        size_t top_size = num_top_slots * sizeof(PageState**);
+        munmap(top_level_arrays, top_size);
+    }
+}
+
 // allocate memory using huge pages
 void* allocHuge(size_t size) {
     void* p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -237,9 +353,13 @@ BufferManager::BufferManager(unsigned nthreads)
         hashMode = HashMode::Array;
     else if (tradHashSetting == 4)
         hashMode = HashMode::Lockfree;
+    else if (tradHashSetting == 5)
+        hashMode = HashMode::Array2Level;
+    else if (tradHashSetting == 6)
+        hashMode = HashMode::Array3Level;
     else
         hashMode = HashMode::Array1Access;
-    PageState::setPackedMode(hashMode == HashMode::Array1Access);
+    PageState::setPackedMode(hashMode == HashMode::Array1Access || hashMode == HashMode::Array2Level || hashMode == HashMode::Array3Level);
     virtMem = nullptr;
     frameMem = nullptr;
     bool disableHugePageForFrameMem = envOr("NOHUGEPAGE_FRAME_MEM", 0);
@@ -275,7 +395,7 @@ BufferManager::BufferManager(unsigned nthreads)
             if (virtCount * sizeof(std::atomic<u64>) >= 2 * mb)
                 madvise(pidToFrameArray.get(), virtCount * sizeof(std::atomic<u64>), MADV_HUGEPAGE);
             for (u64 i = 0; i < virtCount; i++) pidToFrameArray[i].store(invalidFrame, std::memory_order_relaxed);
-        } else if (hashMode == HashMode::Array1Access) {
+        } else if (hashMode == HashMode::Array1Access || hashMode == HashMode::Array2Level || hashMode == HashMode::Array3Level) {
             pidToFrameArray.reset();
             pidToFrameHash.reset();
             frameToPidHash.reset();
@@ -326,8 +446,21 @@ BufferManager::BufferManager(unsigned nthreads)
         if (virtMem == MAP_FAILED) die("mmap failed");
     }
 
-    pageState = (PageState*)allocHuge(virtCount * sizeof(PageState));
-    for (u64 i = 0; i < virtCount; i++) pageState[i].init();
+    // Allocate PageState array (single-level or two-level)
+    if (hashMode == HashMode::Array2Level) {
+        pageState = nullptr;
+        pageState2Level = std::make_unique<TwoLevelPageStateArray>(virtCount);
+        pageState3Level.reset();
+    } else if (hashMode == HashMode::Array3Level) {
+        pageState = nullptr;
+        pageState2Level.reset();
+        pageState3Level = std::make_unique<ThreeLevelPageStateArray>(virtCount);
+    } else {
+        pageState = (PageState*)allocHuge(virtCount * sizeof(PageState));
+        for (u64 i = 0; i < virtCount; i++) pageState[i].init();
+        pageState2Level.reset();
+        pageState3Level.reset();
+    }
 
     physUsedCount = 0;
     allocCount = 1;  // pid 0 reserved for meta data
@@ -335,7 +468,7 @@ BufferManager::BufferManager(unsigned nthreads)
     writeCount = 0;
     batch = envOr("BATCH", 64);
 
-    cerr << "vmcache "
+    cerr << "calico BufferManager initialized: "
          << "blk:" << path << " virtgb:" << virtSize / gb << " physgb:" << (float)physSize / gb
          << " traditional:" << useTraditional << " mmap_os_pagecache:" << useMmapOSPageacche 
          << " trad_hash:" << static_cast<int>(hashMode) << " exmap:" << useExmap << " hugepage: " << (disableHugePageForFrameMem == 0)
@@ -360,7 +493,7 @@ PID BufferManager::toPID(void* page) {
     if (useTraditional) {
         auto idx = ptr - frameMem;
         assert(idx >= 0 && static_cast<u64>(idx) < physCount);
-        if (hashMode == HashMode::Array || hashMode == HashMode::Array1Access) {
+        if (hashMode == HashMode::Array || hashMode == HashMode::Array1Access || hashMode == HashMode::Array2Level || hashMode == HashMode::Array3Level) {
             PID pid = frameToPidArray[static_cast<size_t>(idx)].load(std::memory_order_acquire);
             assert(pid != invalidPID);
             return pid;
@@ -386,7 +519,7 @@ Page* BufferManager::residentPtr(PID pid, u64 stateAndVersion) {
     assert(pid < virtCount);
     if (!useTraditional) return virtMem + pid;
 
-    if (hashMode == HashMode::Array1Access) {
+    if (hashMode == HashMode::Array1Access || hashMode == HashMode::Array2Level || hashMode == HashMode::Array3Level) {
         u64 frame = PageState::extractFrame(stateAndVersion);
         assert(frame != PageState::packedInvalidFrame);
         assert(frame < physCount);
@@ -442,8 +575,8 @@ Page* BufferManager::acquireFrameForPid(PID pid) {
     if (hashMode == HashMode::Array) {
         pidToFrameArray[pid].store(static_cast<u64>(frame), std::memory_order_release);
         frameToPidArray[frame].store(pid, std::memory_order_release);
-    } else if (hashMode == HashMode::Array1Access) {
-        pageState[pid].setFrameValue(frame);
+    } else if (hashMode == HashMode::Array1Access || hashMode == HashMode::Array2Level || hashMode == HashMode::Array3Level) {
+        getPageState(pid).setFrameValue(frame);
         frameToPidArray[frame].store(pid, std::memory_order_release);
     } else {
         u64 frameId = static_cast<u64>(frame);
@@ -460,10 +593,10 @@ void BufferManager::releaseFrame(PID pid) {
         frameId = pidToFrameArray[pid].exchange(invalidFrame, std::memory_order_acq_rel);
         assert(frameId != invalidFrame);
         frameToPidArray[static_cast<size_t>(frameId)].store(invalidPID, std::memory_order_release);
-    } else if (hashMode == HashMode::Array1Access) {
-        frameId = pageState[pid].getFrameValue();
+    } else if (hashMode == HashMode::Array1Access || hashMode == HashMode::Array2Level) {
+        frameId = getPageState(pid).getFrameValue();
         assert(frameId != PageState::packedInvalidFrame);
-        pageState[pid].clearFrameValue();
+        getPageState(pid).clearFrameValue();
         frameToPidArray[static_cast<size_t>(frameId)].store(invalidPID, std::memory_order_release);
     } else {
         bool ok = pidToFrameHash->erase(pid, frameId);

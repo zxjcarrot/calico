@@ -290,6 +290,49 @@ struct FreePartition {
     u32 top = 0;
 };
 
+// Two-level indirection for PageState array
+struct TwoLevelPageStateArray {
+    static constexpr u32 bottomBits = 19;  // Fixed at 23 bits for bottom-level index
+    
+    PageState** second_level_arrays;  // Top-level array of pointers to second-level arrays
+    u32 num_top_slots;                // Number of top-level slots (2^topBits)
+    u32 entries_per_slot;             // Number of entries per second-level array (2^bottomBits)
+    u32 topBits;                      // Number of bits for top-level index
+    u64 total_entries;                // Total number of entries
+    
+    TwoLevelPageStateArray(u64 virtCount);
+    ~TwoLevelPageStateArray();
+    
+    inline PageState& get(PID pid) {
+        u32 top_idx = static_cast<u32>(pid >> bottomBits);
+        u32 bottom_idx = static_cast<u32>(pid & ((1ULL << bottomBits) - 1));
+        return second_level_arrays[top_idx][bottom_idx];
+    }
+};
+
+// Three-level indirection for PageState array
+struct ThreeLevelPageStateArray {
+    static constexpr u32 bottomBits = 19;   // Fixed at 19 bits for bottom-level index
+    static constexpr u32 middleBits = 2;   // Fixed at 2 bits for middle-level index
+    
+    PageState*** top_level_arrays;    // Top-level array of pointers to middle-level arrays
+    u32 num_top_slots;                // Number of top-level slots (2^topBits)
+    u32 num_middle_slots;             // Number of middle-level slots per top slot (2^middleBits)
+    u32 entries_per_slot;             // Number of entries per bottom-level array (2^bottomBits)
+    u32 topBits;                      // Number of bits for top-level index
+    u64 total_entries;                // Total number of entries
+    
+    ThreeLevelPageStateArray(u64 virtCount);
+    ~ThreeLevelPageStateArray();
+    
+    inline PageState& get(PID pid) {
+        u32 top_idx = static_cast<u32>(pid >> (bottomBits + middleBits));
+        u32 middle_idx = static_cast<u32>((pid >> bottomBits) & ((1ULL << middleBits) - 1));
+        u32 bottom_idx = static_cast<u32>(pid & ((1ULL << bottomBits) - 1));
+        return top_level_arrays[top_idx][middle_idx][bottom_idx];
+    }
+};
+
 struct BufferManager {
     static const u64 mb = 1024ull * 1024;
     static const u64 gb = 1024ull * 1024 * 1024;
@@ -299,7 +342,7 @@ struct BufferManager {
     u64 physCount;
     struct exmap_user_interface* exmapInterface[maxWorkerThreads];
 
-    enum class HashMode { Array1Access = 0, Unordered = 1, OpenAddress = 2, Array = 3, Lockfree = 4 };
+    enum class HashMode { Array1Access = 0, Unordered = 1, OpenAddress = 2, Array = 3, Lockfree = 4, Array2Level = 5, Array3Level = 6 };
 
     bool useTraditional;
     bool useMmapOSPageacche;
@@ -322,7 +365,9 @@ struct BufferManager {
 
     Page* virtMem;
     Page* frameMem;
-    PageState* pageState;
+    PageState* pageState;                                    // Single-level array (for non-Array2Level/Array3Level modes)
+    std::unique_ptr<TwoLevelPageStateArray> pageState2Level; // Two-level array (for Array2Level mode)
+    std::unique_ptr<ThreeLevelPageStateArray> pageState3Level; // Three-level array (for Array3Level mode)
     std::unique_ptr<std::atomic<u64>[]> pidToFrameArray;
     std::unique_ptr<std::atomic<PID>[]> frameToPidArray;
     std::unique_ptr<PartitionedMap<PID, u64>> pidToFrameHash;
@@ -331,7 +376,15 @@ struct BufferManager {
     u32 partitionFrameSpan;
     u64 batch;
 
-    PageState& getPageState(PID pid) { return pageState[pid]; }
+    PageState& getPageState(PID pid) {
+        if (hashMode == HashMode::Array2Level) {
+            return pageState2Level->get(pid);
+        }
+        if (hashMode == HashMode::Array3Level) {
+            return pageState3Level->get(pid);
+        }
+        return pageState[pid];
+    }
 
     BufferManager(unsigned nthreads = 1);
     ~BufferManager();
