@@ -12,7 +12,7 @@ tpcc_sources = glob.glob('tpcc/*.pp')
 
 # Combine all C++ source files needed for the module.
 # You need bindings.cpp (for Python interface) and all your original source files.
-all_sources = ['bindings.cpp', 'calico.cpp', 'hnsw.cpp'] + tpcc_sources
+all_sources = ['bindings.cpp', 'calico.cpp', 'hnsw.cpp', 'diskann.cpp'] + tpcc_sources
 
 # Compiler arguments translated from your Makefile
 cpp_args = [
@@ -56,6 +56,6 @@ calico_module = Extension(
 setup(
     name='calico_py',
     version='0.1',
-    description='Python bindings for Calico Index HNSW',
+    description='Python bindings for Calico Index HNSW and DiskANN',
     ext_modules=[calico_module],
 )

@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "calico.hpp"
+#include "diskann.hpp"
 #include "distance.hpp"
 #include "hnsw.hpp"
 
@@ -111,7 +112,8 @@ PYBIND11_MODULE(calico_py, m) {
 
     py::class_<HnswIndexType>(m, "HnswIndex")
         .def(py::init<u64, size_t, size_t, bool>(), py::arg("max_elements"), py::arg("M") = 16,
-             py::arg("ef_construction") = 200, py::arg("enable_prefetch") = true, "Initializes a new, empty HNSW index with runtime parameters.")
+             py::arg("ef_construction") = 200, py::arg("enable_prefetch") = true,
+             "Initializes a new, empty HNSW index with runtime parameters.")
 
         .def(
             "add_points",
@@ -158,8 +160,7 @@ PYBIND11_MODULE(calico_py, m) {
                 std::vector<std::pair<float, u32>> result_vec;
                 if (stats) {
                     result_vec = self.searchKnn<true>(query_ptr, k, ef_search_param);
-                }
-                else {
+                } else {
                     result_vec = self.searchKnn<false>(query_ptr, k, ef_search_param);
                 }
 
@@ -210,8 +211,7 @@ PYBIND11_MODULE(calico_py, m) {
                 std::vector<std::vector<std::pair<float, u32>>> all_results_vec;
                 if (stats) {
                     all_results_vec = self.searchKnn_parallel<true>(query_span, k, ef_search_param, num_threads);
-                }
-                else {
+                } else {
                     all_results_vec = self.searchKnn_parallel(query_span, k, ef_search_param, num_threads);
                 }
 
@@ -244,7 +244,8 @@ PYBIND11_MODULE(calico_py, m) {
                 // --- 5. Return a tuple of the two NumPy arrays ---
                 return py::make_tuple(labels_arr, distances_arr);
             },
-            py::arg("queries"), py::arg("k"), py::arg("ef_search"), py::arg("num_threads") = 0, py::arg("stats") = false,
+            py::arg("queries"), py::arg("k"), py::arg("ef_search"), py::arg("num_threads") = 0,
+            py::arg("stats") = false,
             R"doc(
     Searches for the k-nearest neighbors for a batch of query vectors in parallel.
 
@@ -367,4 +368,198 @@ PYBIND11_MODULE(calico_py, m) {
         A dictionary with the following keys:
         - 'process_rss_bytes': Total physical memory (RSS) used by the Python process.
     )doc");
+
+    // =========================================================================================
+    // DiskANN Bindings Start
+    // =========================================================================================
+
+    py::class_<DiskANNBase::BuildParams>(m, "BuildParams")
+        .def(py::init<>())
+        // R_max_degree is now configured at index creation, so it's removed from BuildParams.
+        // It's still a member of the C++ struct, but we don't expose it here to avoid confusion.
+        .def_readwrite("L_build", &DiskANNBase::BuildParams::L_build)
+        .def_readwrite("alpha", &DiskANNBase::BuildParams::alpha)
+        .def_readwrite("num_threads", &DiskANNBase::BuildParams::num_threads);
+
+    py::class_<DiskANNBase::SearchParams>(m, "SearchParams")
+        .def(py::init<size_t>(), py::arg("L_search"))
+        .def_readwrite("L_search", &DiskANNBase::SearchParams::L_search)
+        .def_readwrite("beam_width", &DiskANNBase::SearchParams::beam_width);
+
+    py::class_<DiskANNBase, std::unique_ptr<DiskANNBase>>(m, "DiskANN")
+        .def(py::init([](size_t dimensions, uint64_t max_elements, size_t R_max_degree, bool is_dynamic) {
+                 // *** MODIFIED HERE ***
+                 // Pass the R_max_degree to the factory function.
+                 return create_index(dimensions, max_elements, R_max_degree, is_dynamic);
+             }),
+             py::arg("dimensions"), py::arg("max_elements"), py::arg("R_max_degree") = 64,
+             py::arg("is_dynamic") = false,
+             "Initializes a new, empty Vamana index with a specific dimension, capacity, and max graph degree (R).")
+
+        .def_property_readonly("dimensions", &DiskANNBase::get_dimensions, "Returns the dimension of the index.")
+        // *** ADDED HERE ***
+        .def_property_readonly("R", &DiskANNBase::get_R, "Returns the configured max graph degree (R) of the index.")
+
+        .def(
+            "build",  // Renamed from "add_items" to "build" for clarity, as it's a bulk-load operation.
+            [](DiskANNBase& self, py::array_t<float, py::array::c_style | py::array::forcecast> data,
+               const std::vector<std::vector<uint32_t>>& tags, const DiskANNBase::BuildParams& params) {
+                if (data.ndim() != 2 || (size_t)data.shape(1) != self.get_dimensions()) {
+                    throw std::invalid_argument("Data has incorrect dimension. Expected " +
+                                                std::to_string(self.get_dimensions()) + ", but got " +
+                                                std::to_string(data.shape(1)));
+                }
+                size_t num_points = data.shape(0);
+                if (tags.size() != num_points) {
+                    throw std::invalid_argument("The number of tag lists must match the number of data points.");
+                }
+                self.build(data.data(), tags, num_points, params);
+            },
+            py::arg("data"), py::arg("tags"), py::arg("params"),
+            "Builds the index from a NumPy array of vectors and a list of tag lists. This is a destructive operation "
+            "and can only be called once on a static index.")
+
+        .def(
+            "search",  // Renamed for consistency
+            [](DiskANNBase& self, py::array_t<float, py::array::c_style | py::array::forcecast> query, size_t K,
+               const DiskANNBase::SearchParams& params) -> py::tuple {
+                if (query.ndim() != 1 || (size_t)query.shape(0) != self.get_dimensions()) {
+                    throw std::invalid_argument("Query has incorrect dimension. Expected " +
+                                                std::to_string(self.get_dimensions()));
+                }
+
+                auto result_vec = self.search(query.data(), K, params);
+
+                py::array_t<uint32_t> labels(result_vec.size());
+                py::array_t<float> distances(result_vec.size());
+
+                auto labels_ptr = labels.mutable_data();
+                auto dists_ptr = distances.mutable_data();
+
+                for (size_t i = 0; i < result_vec.size(); ++i) {
+                    labels_ptr[i] = result_vec[i].second;
+                    dists_ptr[i] = result_vec[i].first;
+                }
+
+                return py::make_tuple(labels, distances);
+            },
+            py::arg("query"), py::arg("K"), py::arg("params"),
+            "Performs a K-Nearest Neighbor search. Returns a tuple of (labels, distances).")
+
+        .def(
+            "search_with_filter",
+            [](DiskANNBase& self, py::array_t<float, py::array::c_style | py::array::forcecast> query,
+               uint32_t filter_label, size_t K, const DiskANNBase::SearchParams& params) -> py::tuple {
+                if (query.ndim() != 1 || (size_t)query.shape(0) != self.get_dimensions()) {
+                    throw std::invalid_argument("Query has incorrect dimension. Expected " +
+                                                std::to_string(self.get_dimensions()));
+                }
+
+                auto result_vec = self.search_with_filter(query.data(), filter_label, K, params);
+
+                py::array_t<uint32_t> labels(result_vec.size());
+                py::array_t<float> distances(result_vec.size());
+
+                auto labels_ptr = labels.mutable_data();
+                auto dists_ptr = distances.mutable_data();
+
+                for (size_t i = 0; i < result_vec.size(); ++i) {
+                    labels_ptr[i] = result_vec[i].second;
+                    dists_ptr[i] = result_vec[i].first;
+                }
+
+                return py::make_tuple(labels, distances);
+            },
+            py::arg("query"), py::arg("filter_label"), py::arg("K"), py::arg("params"),
+            "Performs a filtered K-Nearest Neighbor search. Returns a tuple of (labels, distances).")
+
+        .def(
+            "search_knn_parallel",
+            [](DiskANNBase& self, py::array_t<float, py::array::c_style | py::array::forcecast> queries, size_t K,
+               const DiskANNBase::SearchParams& params, size_t num_threads) -> py::tuple {
+                if (queries.ndim() != 2 || (size_t)queries.shape(1) != self.get_dimensions()) {
+                    throw std::invalid_argument("Queries must be a 2D NumPy array with shape (num_queries, dim)");
+                }
+                size_t num_queries = queries.shape(0);
+                if (K == 0) throw std::invalid_argument("K must be > 0");
+
+                auto all_results_vec = self.search_parallel(queries.data(), num_queries, K, params, num_threads);
+
+                // --- Convert result to a pair of NumPy arrays ---
+                py::array_t<uint32_t> labels_arr({num_queries, K});
+                py::array_t<float> dists_arr({num_queries, K});
+
+                auto labels_ptr = labels_arr.mutable_data();
+                auto dists_ptr = dists_arr.mutable_data();
+
+                for (size_t i = 0; i < num_queries; ++i) {
+                    for (size_t j = 0; j < K; ++j) {
+                        if (j < all_results_vec[i].size()) {
+                            labels_ptr[i * K + j] = all_results_vec[i][j].second;
+                            dists_ptr[i * K + j] = all_results_vec[i][j].first;
+                        } else {
+                            labels_ptr[i * K + j] = -1;  // Sentinel for invalid
+                            dists_ptr[i * K + j] = std::numeric_limits<float>::infinity();
+                        }
+                    }
+                }
+                return py::make_tuple(labels_arr, dists_arr);
+            },
+            py::arg("queries"), py::arg("K"), py::arg("params"), py::arg("num_threads") = 0,
+            "Performs a parallel K-NN search for a batch of queries.")
+
+        .def(
+            "search_with_filter_parallel",
+            [](DiskANNBase& self, py::array_t<float, py::array::c_style | py::array::forcecast> queries,
+               uint32_t filter_label, size_t K, const DiskANNBase::SearchParams& params,
+               size_t num_threads) -> py::tuple {
+                if (queries.ndim() != 2 || (size_t)queries.shape(1) != self.get_dimensions()) {
+                    throw std::invalid_argument("Queries must be a 2D NumPy array with shape (num_queries, dim)");
+                }
+                size_t num_queries = queries.shape(0);
+                if (K == 0) throw std::invalid_argument("K must be > 0");
+
+                auto all_results_vec =
+                    self.search_with_filter_parallel(queries.data(), num_queries, filter_label, K, params, num_threads);
+
+                // --- Convert result to a pair of NumPy arrays (same logic as above) ---
+                py::array_t<uint32_t> labels_arr({num_queries, K});
+                py::array_t<float> dists_arr({num_queries, K});
+
+                auto labels_ptr = labels_arr.mutable_data();
+                auto dists_ptr = dists_arr.mutable_data();
+
+                for (size_t i = 0; i < num_queries; ++i) {
+                    for (size_t j = 0; j < K; ++j) {
+                        if (j < all_results_vec[i].size()) {
+                            labels_ptr[i * K + j] = all_results_vec[i][j].second;
+                            dists_ptr[i * K + j] = all_results_vec[i][j].first;
+                        } else {
+                            labels_ptr[i * K + j] = -1;  // Sentinel for invalid
+                            dists_ptr[i * K + j] = std::numeric_limits<float>::infinity();
+                        }
+                    }
+                }
+                return py::make_tuple(labels_arr, dists_arr);
+            },
+            py::arg("queries"), py::arg("filter_label"), py::arg("K"), py::arg("params"), py::arg("num_threads") = 0,
+            "Performs a parallel filtered K-NN search for a batch of queries.")
+
+        .def(
+            "insert_point",
+            [](DiskANNBase& self, py::array_t<float, py::array::c_style | py::array::forcecast> point,
+               const std::vector<uint32_t>& tags, uint32_t external_id) {
+                if (point.ndim() != 1 || (size_t)point.shape(0) != self.get_dimensions()) {
+                    throw std::invalid_argument("Point has incorrect dimension. Expected " +
+                                                std::to_string(self.get_dimensions()));
+                }
+                self.insert_point(point.data(), tags, external_id);
+            },
+            py::arg("point"), py::arg("tags"), py::arg("external_id"), "Inserts a single point into a dynamic index.")
+
+        .def("lazy_delete", &DiskANNBase::lazy_delete, py::arg("external_id"),
+             "Marks a point for deletion in a dynamic index. The point is removed from search results immediately.")
+
+        .def("consolidate_deletes", &DiskANNBase::consolidate_deletes, py::arg("params"),
+             "Repairs the graph structure around deleted nodes. This is a potentially long-running operation.");
 }
