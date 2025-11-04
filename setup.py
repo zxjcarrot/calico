@@ -41,7 +41,8 @@ cpp_args = [
     '-fnon-call-exceptions',
     '-fasynchronous-unwind-tables',
     '-march=native', # Recommended for performance
-    '-fPIC' # Required for creating a shared library (.so file)
+    '-fPIC', # Required for creating a shared library (.so file)
+    '-ffast-math' # fast math
 ] + openmp_compile_args # Add the OpenMP compile args
 
 # Linker arguments, if any are needed

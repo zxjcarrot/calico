@@ -69,6 +69,23 @@ public:
             curV = 1;
         }
     }
+
+    // Check if a node is visited. If not, mark it as visited.
+    // Returns true if the node was not visited before, false otherwise.
+    bool try_visit(uint32_t node_id) {
+        if (mass[node_id] != curV) {
+            mass[node_id] = curV;
+            return true;
+        }
+        return false;
+    }
+
+    // Explicitly un-visit a node (used for retries on I/O failure)
+    void unvisit(uint32_t node_id) {
+        if (mass[node_id] == curV) {
+            mass[node_id] = 0;  // Or curV - 1, depending on reset logic
+        }
+    }
     ~VisitedList() { delete[] mass; }
 };
 

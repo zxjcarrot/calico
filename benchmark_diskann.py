@@ -250,7 +250,9 @@ def benchmark_diskann_official(X_base, X_query, ground_truth, params, num_thread
         complexity=params['L_build'], # L_build
         graph_degree=params['R'],   # R
         alpha=params['alpha'],
-        num_threads=num_threads
+        num_threads=num_threads,
+        use_pq_build=False,
+        use_opq=False
     )
     
     build_time = time.time() - start_time

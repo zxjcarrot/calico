@@ -34,6 +34,7 @@ class DiskANNBase {
 
     virtual void build(const void* data, const std::vector<std::vector<uint32_t>>& tags, uint64_t num_points,
                        const BuildParams& params) = 0;
+    virtual void optimize_layout() = 0;  // OPTIMIZATION: New public API
     virtual std::vector<std::pair<float, uint32_t>> search(const void* query, size_t K, const SearchParams& params) = 0;
     virtual std::vector<std::pair<float, uint32_t>> search_with_filter(const void* query, uint32_t filter_label,
                                                                        size_t K, const SearchParams& params) = 0;
@@ -64,6 +65,7 @@ class DiskANN : public DiskANNBase {
 
     void build(const void* data, const std::vector<std::vector<uint32_t>>& tags, uint64_t num_points,
                const BuildParams& params) override;
+    void optimize_layout() override;
     std::vector<std::pair<float, uint32_t>> search(const void* query, size_t K, const SearchParams& params) override;
     std::vector<std::pair<float, uint32_t>> search_with_filter(const void* query, uint32_t filter_label, size_t K,
                                                                const SearchParams& params) override;
@@ -100,6 +102,7 @@ class DiskANN : public DiskANNBase {
         PID base_pid;
         uint64_t max_elements;
         std::atomic<uint64_t> node_count;
+        bool is_layout_optimized;  // OPTIMIZATION: Flag to indicate optimized layout
     };
 
     struct VamanaPage {
@@ -148,6 +151,7 @@ class DiskANN : public DiskANNBase {
     PID _base_pid;
     uint64_t _max_elements;
     size_t _R_max_degree;
+    bool _is_layout_optimized;  // OPTIMIZATION: Cache the state from metadata
 
     std::unordered_map<TagT, uint32_t> _medoids;
     std::unordered_map<uint32_t, uint32_t> _external_to_internal_map;
@@ -164,21 +168,29 @@ class DiskANN : public DiskANNBase {
     inline PID getNodePID(uint32_t node_id) const;
     inline uint32_t getNodeIndexInPage(uint32_t node_id) const;
 
+    // Direct accessors (can throw OLCRestartException)
     bool getNodeVector(uint32_t node_id, T* dest_vector) const;
     bool getNodeTags(uint32_t node_id, std::vector<TagT>& dest_tags) const;
     bool getNodeNeighbors(uint32_t node_id, std::vector<uint32_t>& dest_neighbors) const;
 
-    // --- OPTIMIZATION: New helper for batch vector fetching ---
-    bool getVectorsForPruning(const std::vector<uint32_t>& ids, std::vector<T>& vectors) const;
+    // --- OPTIMIZATION: Rewritten core algorithms for batching ---
+    bool get_vectors_batch(const std::vector<uint32_t>& ids, T* dest_buffer) const;
+    std::vector<std::pair<float, uint32_t>> greedy_search_batched(const std::vector<uint32_t>& start_nodes,
+                                                                  const T* query, size_t K, const SearchParams& params,
+                                                                  const TagT* filter_label);
+    void robust_prune_batched(uint32_t p_id, std::vector<std::pair<float, uint32_t>>& candidates, float alpha,
+                              bool filter_aware);
+    void connect_neighbors_batched(uint32_t node_id, const std::vector<uint32_t>& neighbors, const BuildParams& params,
+                                   bool filter_aware);
+
+    // Original search for comparison or specific cases if needed (e.g., dynamic insert)
+    std::vector<std::pair<float, uint32_t>> greedy_search_original(const std::vector<uint32_t>& start_nodes,
+                                                                   const T* query, size_t K, const SearchParams& params,
+                                                                   const TagT* filter_label);
+    void robust_prune_original(uint32_t p_id, std::vector<std::pair<float, uint32_t>>& candidates, float alpha,
+                               bool filter_aware);
 
     void compute_medoids(uint64_t num_points);
-    std::vector<std::pair<float, uint32_t>> greedy_search(const std::vector<uint32_t>& start_nodes, const T* query,
-                                                          size_t result_size, const SearchParams& params,
-                                                          const TagT* filter_label);
-    void robust_prune(uint32_t p_id, std::vector<std::pair<float, uint32_t>>& candidates, float alpha,
-                      bool filter_aware);
-    void connect_neighbors(uint32_t node_id, const std::vector<uint32_t>& neighbors, const BuildParams& params,
-                           bool filter_aware);
 };
 
 #endif  // DISKANN_HPP
