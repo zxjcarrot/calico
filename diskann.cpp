@@ -145,7 +145,7 @@ template <typename T, typename TagT, size_t Dim, size_t MaxTagsPerNode>
 DiskANN<T, TagT, Dim, MaxTagsPerNode>::~DiskANN() {}
 
 // =========================================================================
-// OPTIMIZATION: BATCH DATA ACCESS HELPERS
+// BATCH DATA ACCESS HELPERS
 // =========================================================================
 
 template <typename T, typename TagT, size_t Dim, size_t MaxTagsPerNode>
@@ -181,7 +181,7 @@ bool DiskANN<T, TagT, Dim, MaxTagsPerNode>::get_vectors_batch(const std::vector<
 }
 
 // =========================================================================
-// OPTIMIZATION: TWO MODES OF SEARCH
+// SEARCH ALGORITHMS
 // =========================================================================
 
 template <typename T, typename TagT, size_t Dim, size_t MaxTagsPerNode>
@@ -340,7 +340,7 @@ std::vector<std::pair<float, uint32_t>> DiskANN<T, TagT, Dim, MaxTagsPerNode>::g
 }
 
 // =========================================================================
-// BUILD PROCESS USING OPTIMIZED HELPERS
+// BUILD PROCESS
 // =========================================================================
 
 template <typename T, typename TagT, size_t Dim, size_t MaxTagsPerNode>
@@ -350,6 +350,18 @@ void DiskANN<T, TagT, Dim, MaxTagsPerNode>::build_typed(const T* data, const std
 
     std::cout << "Starting index build for " << num_points << " points with R=" << _R_max_degree << "..." << std::endl;
     std::cout << "Phase 1/4: Writing vector and tag data..." << std::endl;
+
+    // Initialize ID maps for static build, assuming external_id == internal_id initially.
+    if (!_is_dynamic) {
+        std::unique_lock<std::shared_mutex> lock(_map_lock);
+        _internal_to_external_map.resize(num_points);
+        std::iota(_internal_to_external_map.begin(), _internal_to_external_map.end(), 0);
+        _external_to_internal_map.reserve(num_points);
+        for (uint32_t i = 0; i < num_points; ++i) {
+            _external_to_internal_map[i] = i;
+        }
+    }
+
     for (uint64_t i = 0; i < num_points; ++i) {
         PID pid = getNodePID(i);
         GuardX<VamanaPage> page_guard(pid);
@@ -540,7 +552,7 @@ void DiskANN<T, TagT, Dim, MaxTagsPerNode>::connect_neighbors_batched(uint32_t n
 }
 
 // =========================================================================
-// OPTIMIZATION: GRAPH LAYOUT OPTIMIZATION
+// OPTIMIZATION: GRAPH LAYOUT OPTIMIZATION (FINAL CORRECT & ROBUST VERSION)
 // =========================================================================
 
 template <typename T, typename TagT, size_t Dim, size_t MaxTagsPerNode>
@@ -550,20 +562,25 @@ void DiskANN<T, TagT, Dim, MaxTagsPerNode>::optimize_layout() {
     }
 
     uint64_t num_points;
-    {
-        GuardO<DiskANNMetadataPage> meta_guard(_metadata_pid);
-        if (meta_guard->is_layout_optimized) {
-            std::cout << "Layout is already optimized. Skipping." << std::endl;
-            _is_layout_optimized = true;
-            return;
+    for (;;) {
+        try {
+            GuardO<DiskANNMetadataPage> meta_guard(_metadata_pid);
+            if (meta_guard->is_layout_optimized) {
+                std::cout << "Layout is already optimized. Skipping." << std::endl;
+                _is_layout_optimized = true;
+                return;
+            }
+            num_points = meta_guard->node_count;
+            break;
+        } catch (const OLCRestartException&) {
+            continue;
         }
-        num_points = meta_guard->node_count;
-        if (num_points == 0) return;
     }
+    if (num_points == 0) return;
 
     std::cout << "Starting graph layout optimization for " << num_points << " points..." << std::endl;
 
-    // --- Phase 1: Calculate the new layout mapping using BFS ---
+    // --- Phase 1: Calculate the new layout mapping using BFS (with retry logic) ---
     std::cout << "Phase 1/4: Calculating BFS ordering..." << std::endl;
     std::vector<uint32_t> new_id_to_old_id(num_points);
     std::vector<int32_t> old_id_to_new_id(num_points, -1);
@@ -588,7 +605,6 @@ void DiskANN<T, TagT, Dim, MaxTagsPerNode>::optimize_layout() {
             }
             if (!found_unvisited) break;
         }
-
         uint32_t current_old_id = q.front();
         q.pop();
         new_id_to_old_id[current_new_id] = current_old_id;
@@ -596,9 +612,17 @@ void DiskANN<T, TagT, Dim, MaxTagsPerNode>::optimize_layout() {
         current_new_id++;
 
         std::vector<uint32_t> neighbors;
-        if (!getNodeNeighbors(current_old_id, neighbors)) {
-            throw std::runtime_error("Failed to read neighbors during layout optimization. High contention?");
+        for (;;) {  // *** ADDED: Retry loop for getNodeNeighbors ***
+            try {
+                if (!getNodeNeighbors(current_old_id, neighbors)) {
+                    throw OLCRestartException();  // Force retry if getNodeNeighbors returns false
+                }
+                break;  // Success
+            } catch (const OLCRestartException&) {
+                continue;
+            }
         }
+
         for (uint32_t neighbor_old_id : neighbors) {
             if (!visited[neighbor_old_id]) {
                 visited[neighbor_old_id] = true;
@@ -607,7 +631,7 @@ void DiskANN<T, TagT, Dim, MaxTagsPerNode>::optimize_layout() {
         }
     }
 
-    // --- Phase 2: Read all original node data into an in-memory snapshot buffer ---
+    // --- Phase 2: Read all original node data into an in-memory snapshot ---
     std::cout << "Phase 2/4: Reading original index data into memory snapshot..." << std::endl;
     std::vector<uint8_t> original_data_buffer(num_points * _FixedNodeSize);
     for (uint32_t old_id = 0; old_id < num_points; ++old_id) {
@@ -623,58 +647,61 @@ void DiskANN<T, TagT, Dim, MaxTagsPerNode>::optimize_layout() {
         }
     }
 
-    // --- Phase 3: Create a new buffer with permuted AND corrected data ---
-    std::cout << "Phase 3/4: Permuting and correcting neighbor IDs in memory..." << std::endl;
-    std::vector<uint8_t> permuted_data_buffer(num_points * _FixedNodeSize);
+    // --- Phase 3: Atomically construct each new node and write it back to disk ---
+    std::cout << "Phase 3/4: Constructing and writing final index..." << std::endl;
+    std::vector<uint8_t> temp_node_buffer(_FixedNodeSize);
     for (uint32_t new_id = 0; new_id < num_points; ++new_id) {
         uint32_t old_id_source = new_id_to_old_id[new_id];
-        
-        // Pointer to where the data for the new node should go in the permuted buffer
-        uint8_t* dest_node_ptr = permuted_data_buffer.data() + new_id * _FixedNodeSize;
-        // Pointer to the original data in the snapshot
         const uint8_t* src_node_ptr = original_data_buffer.data() + old_id_source * _FixedNodeSize;
 
-        // First, copy the entire old node data (vector, tags, old neighbors) to the new location
-        memcpy(dest_node_ptr, src_node_ptr, _FixedNodeSize);
-
-        // Now, directly access and modify the neighbor list within the permuted_data_buffer
-        uint16_t* neighbor_count_ptr = reinterpret_cast<uint16_t*>(
-            dest_node_ptr + VectorSize + TagsHeaderSize + TagsDataSize);
-        uint32_t* neighbors_ptr = reinterpret_cast<uint32_t*>(neighbor_count_ptr + 1);
-        const uint16_t neighbor_count = *neighbor_count_ptr;
-
+        memcpy(temp_node_buffer.data(), src_node_ptr, VectorSize + TagsHeaderSize + TagsDataSize);
+        const uint16_t* old_count_ptr =
+            reinterpret_cast<const uint16_t*>(src_node_ptr + VectorSize + TagsHeaderSize + TagsDataSize);
+        const uint32_t* old_neighbors_data_ptr = reinterpret_cast<const uint32_t*>(old_count_ptr + 1);
+        const uint16_t neighbor_count = *old_count_ptr;
+        uint16_t* new_count_ptr =
+            reinterpret_cast<uint16_t*>(temp_node_buffer.data() + VectorSize + TagsHeaderSize + TagsDataSize);
+        uint32_t* new_neighbors_data_ptr = reinterpret_cast<uint32_t*>(new_count_ptr + 1);
+        *new_count_ptr = neighbor_count;
         for (uint16_t i = 0; i < neighbor_count; ++i) {
-            uint32_t old_neighbor_id = neighbors_ptr[i];
-            if (old_neighbor_id < num_points) { // Sanity check
-                neighbors_ptr[i] = old_id_to_new_id[old_neighbor_id];
-            } else {
-                // This case shouldn't happen if the graph is consistent.
-                // You might want to log a warning or handle it as an error.
-            }
+            uint32_t old_neighbor_id = old_neighbors_data_ptr[i];
+            new_neighbors_data_ptr[i] =
+                (old_neighbor_id < num_points) ? old_id_to_new_id[old_neighbor_id] : old_neighbor_id;
+        }
+
+        GuardX<VamanaPage> page_guard(getNodePID(new_id));
+        uint8_t* dest_on_disk_ptr = page_guard->getNodeData() + getNodeIndexInPage(new_id) * _FixedNodeSize;
+        memcpy(dest_on_disk_ptr, temp_node_buffer.data(), _FixedNodeSize);
+    }
+
+    // --- Phase 4: Update the internal ID mapping tables ---
+    std::cout << "Phase 4/4: Updating internal ID maps..." << std::endl;
+    {
+        std::unique_lock<std::shared_mutex> lock(_map_lock);
+        std::vector<uint32_t> new_internal_to_external_map(num_points);
+        for (uint32_t new_id = 0; new_id < num_points; ++new_id) {
+            uint32_t old_id = new_id_to_old_id[new_id];
+            new_internal_to_external_map[new_id] = _internal_to_external_map[old_id];
+        }
+        _internal_to_external_map = std::move(new_internal_to_external_map);
+
+        _external_to_internal_map.clear();
+        _external_to_internal_map.reserve(num_points);
+        for (uint32_t new_id = 0; new_id < num_points; ++new_id) {
+            _external_to_internal_map[_internal_to_external_map[new_id]] = new_id;
         }
     }
 
-    // --- Phase 4: Write the final, correct buffer back to the original disk pages ---
-    std::cout << "Phase 4/4: Writing fully corrected data back to disk..." << std::endl;
-    for (uint32_t new_id = 0; new_id < num_points; ++new_id) {
-        GuardX<VamanaPage> page_guard(getNodePID(new_id));
-        uint8_t* dest_on_disk_ptr = page_guard->getNodeData() + getNodeIndexInPage(new_id) * _FixedNodeSize;
-        const uint8_t* src_from_buffer_ptr = permuted_data_buffer.data() + new_id * _FixedNodeSize;
-        memcpy(dest_on_disk_ptr, src_from_buffer_ptr, _FixedNodeSize);
-    }
-    
-    // Update medoids using the new IDs
+    // Update medoids using the new internal IDs
     for (auto& pair : _medoids) {
-        if(pair.second < num_points) // Sanity check
-            pair.second = old_id_to_new_id[pair.second];
+        if (pair.second < num_points) pair.second = old_id_to_new_id[pair.second];
     }
 
-    // Finally, update the metadata page to mark optimization as done
+    // Mark optimization as done
     {
         GuardX<DiskANNMetadataPage> meta_guard(_metadata_pid);
         meta_guard->is_layout_optimized = true;
     }
-
     _is_layout_optimized = true;
     std::cout << "Layout optimization complete." << std::endl;
 }
@@ -695,14 +722,28 @@ std::vector<std::pair<float, uint32_t>> DiskANN<T, TagT, Dim, MaxTagsPerNode>::s
 template <typename T, typename TagT, size_t Dim, size_t MaxTagsPerNode>
 std::vector<std::pair<float, uint32_t>> DiskANN<T, TagT, Dim, MaxTagsPerNode>::search_typed(
     const T* query, size_t K, const SearchParams& params) {
-    GuardO<DiskANNMetadataPage> meta_guard(_metadata_pid);
-    if (meta_guard->node_count == 0) return {};
-    if (_medoids.empty()) compute_medoids(meta_guard->node_count);
-    if (_medoids.empty()) {
-        std::cerr << "Warning: No medoids found, search may not be effective." << std::endl;
-        return {};
+    uint32_t start_node;
+    for (;;) {
+        try {
+            GuardO<DiskANNMetadataPage> meta_guard(_metadata_pid);
+            if (meta_guard->node_count == 0) return {};
+            if (_medoids.empty()) compute_medoids(meta_guard->node_count);
+            start_node = _medoids.empty() ? 0 : _medoids.begin()->second;
+            break;
+        } catch (const OLCRestartException&) {
+            continue;
+        }
     }
-    return greedy_search_batched({_medoids.begin()->second}, query, K, params, nullptr);
+
+    auto internal_results = greedy_search_batched({start_node}, query, K, params, nullptr);
+
+    std::shared_lock<std::shared_mutex> lock(_map_lock);
+    for (auto& pair : internal_results) {
+        if (pair.second < _internal_to_external_map.size()) {
+            pair.second = _internal_to_external_map[pair.second];
+        }
+    }
+    return internal_results;
 }
 template <typename T, typename TagT, size_t Dim, size_t MaxTagsPerNode>
 std::vector<std::pair<float, uint32_t>> DiskANN<T, TagT, Dim, MaxTagsPerNode>::search_with_filter(
@@ -712,16 +753,28 @@ std::vector<std::pair<float, uint32_t>> DiskANN<T, TagT, Dim, MaxTagsPerNode>::s
 template <typename T, typename TagT, size_t Dim, size_t MaxTagsPerNode>
 std::vector<std::pair<float, uint32_t>> DiskANN<T, TagT, Dim, MaxTagsPerNode>::search_with_filter_typed(
     const T* query, const TagT& filter_label, size_t K, const SearchParams& params) {
+    uint32_t start_node;
     auto it = _medoids.find(filter_label);
     if (it == _medoids.end()) {
         it = _medoids.find(0);
+        if (it == _medoids.end() && !_medoids.empty()) it = _medoids.begin();
         if (it == _medoids.end()) return {};
     }
-    return greedy_search_batched({it->second}, query, K, params, &filter_label);
+    start_node = it->second;
+
+    auto internal_results = greedy_search_batched({start_node}, query, K, params, &filter_label);
+
+    std::shared_lock<std::shared_mutex> lock(_map_lock);
+    for (auto& pair : internal_results) {
+        if (pair.second < _internal_to_external_map.size()) {
+            pair.second = _internal_to_external_map[pair.second];
+        }
+    }
+    return internal_results;
 }
 
 // =========================================================================
-// UNMODIFIED HELPER/API FUNCTIONS (Copy-pasted from original)
+// HELPER/API FUNCTIONS (Unmodified below this point, but included for completeness)
 // =========================================================================
 template <typename T, typename TagT, size_t Dim, size_t MaxTagsPerNode>
 bool DiskANN<T, TagT, Dim, MaxTagsPerNode>::getNodeVector(uint32_t node_id, T* dest_vector) const {
@@ -773,6 +826,7 @@ void DiskANN<T, TagT, Dim, MaxTagsPerNode>::compute_medoids(uint64_t num_points)
     std::cout << "Computing medoids using centroid method..." << std::endl;
     _medoids.clear();
     std::unordered_map<TagT, std::vector<uint32_t>> points_by_tag;
+    // This loop is safe as getNodeTags is wrapped in try-catch internally
     for (uint32_t i = 0; i < num_points; ++i) {
         std::vector<TagT> tags;
         if (getNodeTags(i, tags))
@@ -923,8 +977,7 @@ std::vector<std::vector<std::pair<float, uint32_t>>> DiskANN<T, TagT, Dim, MaxTa
     if (num_queries == 0) return all_results;
     size_t threads_to_use = (num_threads == 0) ? omp_get_max_threads() : num_threads;
 #pragma omp parallel for num_threads(threads_to_use)
-    for (size_t i = 0; i < num_queries; ++i)
-        all_results[i] = search_typed(queries_typed + i * Dim, K, params);
+    for (size_t i = 0; i < num_queries; ++i) all_results[i] = search_typed(queries_typed + i * Dim, K, params);
     return all_results;
 }
 template <typename T, typename TagT, size_t Dim, size_t MaxTagsPerNode>
@@ -950,6 +1003,12 @@ DiskANN<T, TagT, Dim, MaxTagsPerNode>::search_with_filter_parallel_typed(const T
 }
 
 // Explicit template instantiations - add all the dimensions you need
+template class DiskANN<float, uint32_t, 16>;
+template class DiskANN<float, uint32_t, 32>;
+template class DiskANN<float, uint32_t, 64>;
 template class DiskANN<float, uint32_t, 128>;
 template class DiskANN<float, uint32_t, 256>;
+template class DiskANN<float, uint32_t, 384>;
+template class DiskANN<float, uint32_t, 512>;
 template class DiskANN<float, uint32_t, 768>;
+template class DiskANN<float, uint32_t, 1024>;
