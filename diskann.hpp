@@ -239,10 +239,12 @@ class DiskANN : public DiskANNBase {
     ConcurrentSet<uint32_t> _deleted_nodes;
     std::unique_ptr<VisitedListPool> _visited_list_pool;
 
+    // NEW: Cache for medoid vectors to avoid lock contention at search start
+    std::unordered_map<TagT, std::vector<T, AlignedAllocator<T, 32>>> _medoid_vectors_cache;
+
     ThreadPool* getOrCreateThreadPool(size_t num_threads) const;
     mutable std::unique_ptr<ThreadPool> _thread_pool;
     mutable std::mutex _pool_mutex;
-    std::unordered_map<TagT, std::vector<T, AlignedAllocator<T, 32>>> _medoid_vectors_cache;
 
    private:
     inline PID getNodePID(uint32_t node_id) const;
@@ -251,8 +253,6 @@ class DiskANN : public DiskANNBase {
     bool getNodeVector(uint32_t node_id, T* dest_vector) const;
     bool getNodeTags(uint32_t node_id, std::vector<TagT>& dest_tags) const;
     bool getNodeNeighbors(uint32_t node_id, std::vector<uint32_t>& dest_neighbors) const;
-
-    // --- OPTIMIZATION: Core data structures and algorithms ---
 
     struct NodeDataBatch {
         std::vector<T, AlignedAllocator<T, 32>> vectors;
@@ -268,7 +268,8 @@ class DiskANN : public DiskANNBase {
     bool get_nodes_data_batch(const std::vector<uint32_t>& ids, NodeDataBatch& data_batch) const;
     bool get_vectors_batch(const std::vector<uint32_t>& ids, T* dest_buffer) const;
 
-    std::vector<std::pair<float, uint32_t>> greedy_search_final(const std::vector<uint32_t>& start_nodes,
+    // MODIFIED: Signature updated to accept pre-fetched start node vector
+    std::vector<std::pair<float, uint32_t>> greedy_search_final(uint32_t start_node_id, const T* start_node_vec,
                                                                 const T* query, size_t K, const SearchParams& params,
                                                                 const TagT* filter_label);
 

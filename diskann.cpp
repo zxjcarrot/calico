@@ -15,9 +15,6 @@
 
 #include "calico.hpp"
 
-// This creates a global, static distance object, initialized once.
-// It will automatically select the best SIMD implementation (AVX2, etc.)
-// supported by the CPU, as determined by the official DiskANN utility functions.
 static std::unique_ptr<Distance<float>> distance_metric =
     std::unique_ptr<Distance<float>>(get_distance_function<float>(Metric::L2));
 
@@ -157,20 +154,10 @@ DiskANN<T, TagT, Dim, MaxTagsPerNode>::~DiskANN() {}
 // BATCH DATA ACCESS HELPERS (OPTIMIZED)
 // =========================================================================
 
-// --- OPTIMIZATION START ---
-// The original batch functions were inefficient because they acquired a page lock
-// for every single node ID. These new functions use PID Grouping. They first
-// group all node IDs by their page ID (PID), then lock each page only once
-// to retrieve all necessary data from it. This dramatically reduces the overhead
-// from interacting with the buffer manager (`calico`).
-
 template <typename T, typename TagT, size_t Dim, size_t MaxTagsPerNode>
 bool DiskANN<T, TagT, Dim, MaxTagsPerNode>::get_nodes_data_batch(const std::vector<uint32_t>& ids,
                                                                  NodeDataBatch& data_batch) const {
     if (ids.empty()) return true;
-
-    // A map from Page ID (PID) to a list of (node_id, original_index_in_ids_vector) pairs.
-    // The original_index is crucial for placing the fetched data correctly in the output buffers.
     std::map<PID, std::vector<std::pair<uint32_t, size_t>>> page_to_nodes_map;
     std::vector<PID> pids_to_prefetch;
     pids_to_prefetch.reserve(ids.size());
@@ -183,30 +170,19 @@ bool DiskANN<T, TagT, Dim, MaxTagsPerNode>::get_nodes_data_batch(const std::vect
         }
         page_to_nodes_map[pid].emplace_back(id, i);
     }
-
     if (!pids_to_prefetch.empty()) {
         bm.prefetchPages(pids_to_prefetch.data(), pids_to_prefetch.size());
     }
-
     data_batch.clear();
     data_batch.vectors.resize(ids.size() * Dim);
     data_batch.tag_counts.resize(ids.size());
-    // Reserve generously to reduce reallocations.
     data_batch.tags.reserve(ids.size() * MaxTagsPerNode / 2);
-
     try {
-        // Iterate through each page that contains requested nodes
         for (const auto& [pid, node_infos] : page_to_nodes_map) {
             GuardORelaxed<VamanaPage> page_guard(pid);
-
-            // For each node on this page, copy its data
             for (const auto& [node_id, original_index] : node_infos) {
                 NodeAccessor acc(page_guard.ptr, getNodeIndexInPage(node_id), this);
-
-                // Copy vector
                 memcpy(data_batch.vectors.data() + original_index * Dim, acc.getVector(), VectorSize);
-
-                // Copy tags
                 auto tags_span = acc.getTags();
                 data_batch.tag_counts[original_index] = tags_span.size();
                 data_batch.tags.insert(data_batch.tags.end(), tags_span.begin(), tags_span.end());
@@ -221,11 +197,9 @@ bool DiskANN<T, TagT, Dim, MaxTagsPerNode>::get_nodes_data_batch(const std::vect
 template <typename T, typename TagT, size_t Dim, size_t MaxTagsPerNode>
 bool DiskANN<T, TagT, Dim, MaxTagsPerNode>::get_vectors_batch(const std::vector<uint32_t>& ids, T* dest_buffer) const {
     if (ids.empty()) return true;
-
     std::map<PID, std::vector<std::pair<uint32_t, size_t>>> page_to_nodes_map;
     std::vector<PID> pids_to_prefetch;
     pids_to_prefetch.reserve(ids.size());
-
     for (size_t i = 0; i < ids.size(); ++i) {
         uint32_t id = ids[i];
         PID pid = getNodePID(id);
@@ -234,11 +208,9 @@ bool DiskANN<T, TagT, Dim, MaxTagsPerNode>::get_vectors_batch(const std::vector<
         }
         page_to_nodes_map[pid].emplace_back(id, i);
     }
-
     if (!pids_to_prefetch.empty()) {
         bm.prefetchPages(pids_to_prefetch.data(), pids_to_prefetch.size());
     }
-
     try {
         for (const auto& [pid, node_infos] : page_to_nodes_map) {
             GuardO<VamanaPage> page_guard(pid);
@@ -252,14 +224,13 @@ bool DiskANN<T, TagT, Dim, MaxTagsPerNode>::get_vectors_batch(const std::vector<
         return false;
     }
 }
-// --- OPTIMIZATION END ---
 
 // =========================================================================
 // SEARCH ALGORITHMS (OPTIMIZED)
 // =========================================================================
 template <typename T, typename TagT, size_t Dim, size_t MaxTagsPerNode>
 std::vector<std::pair<float, uint32_t>> DiskANN<T, TagT, Dim, MaxTagsPerNode>::greedy_search_final(
-    const std::vector<uint32_t>& start_nodes, const T* query, size_t K, const SearchParams& params,
+    uint32_t start_node_id, const T* start_node_vec, const T* query, size_t K, const SearchParams& params,
     const TagT* filter_label) {
     alignas(32) T aligned_query[Dim];
     memcpy(aligned_query, query, VectorSize);
@@ -274,27 +245,29 @@ std::vector<std::pair<float, uint32_t>> DiskANN<T, TagT, Dim, MaxTagsPerNode>::g
     best_L_nodes.clear();
     best_L_nodes.reserve(params.L_search);
 
-    for (uint32_t start_node : start_nodes) {
-        if (visited_nodes->try_visit(start_node)) {
-            alignas(32) T start_node_vec[Dim];
-            if (getNodeVector(start_node, start_node_vec)) {
-                float dist = distance_metric->compare(aligned_query, start_node_vec, Dim);
-                best_L_nodes.insert(Neighbor(start_node, dist));
+    // MODIFIED: Use the pre-fetched vector if available to avoid initial lock contention
+    if (visited_nodes->try_visit(start_node_id)) {
+        if (start_node_vec) {  // Use the cached vector if available
+            float dist = distance_metric->compare(aligned_query, start_node_vec, Dim);
+            best_L_nodes.insert(Neighbor(start_node_id, dist));
+        } else {  // Fallback to fetching from disk if cache missed
+            alignas(32) T vec_from_disk[Dim];
+            if (getNodeVector(start_node_id, vec_from_disk)) {
+                float dist = distance_metric->compare(aligned_query, vec_from_disk, Dim);
+                best_L_nodes.insert(Neighbor(start_node_id, dist));
             } else {
-                visited_nodes->unvisit(start_node); // Unvisit on failure
+                visited_nodes->unvisit(start_node_id);
             }
         }
     }
 
-    // ======================= REVISED HIGH-PERFORMANCE LOOP START =======================
-
+    // HIGH-PERFORMANCE BEAM EXPANSION LOOP
     std::vector<uint32_t> expansion_candidate_ids;
     std::vector<uint32_t> all_neighbors_from_beam;
     std::vector<uint32_t> unvisited_neighbors_ids;
     std::vector<PID> pids_to_prefetch;
 
     while (best_L_nodes.has_unexpanded_node()) {
-        // Step 1: Prefetch pages for the nodes we are about to expand in this beam.
         pids_to_prefetch.clear();
         size_t prefetch_count = 0;
         for (size_t i = best_L_nodes._cur; i < best_L_nodes.size() && prefetch_count < params.beam_width; ++i) {
@@ -306,17 +279,13 @@ std::vector<std::pair<float, uint32_t>> DiskANN<T, TagT, Dim, MaxTagsPerNode>::g
         if (!pids_to_prefetch.empty()) {
             bm.prefetchPages(pids_to_prefetch.data(), pids_to_prefetch.size());
         }
-        
-        // Step 2: Collect a batch of nodes to expand (the "beam").
-        // We repeatedly call closest_unexpanded, which correctly marks nodes and advances the internal cursor.
+
         expansion_candidate_ids.clear();
         for (size_t i = 0; i < params.beam_width && best_L_nodes.has_unexpanded_node(); ++i) {
             Neighbor candidate = best_L_nodes.closest_unexpanded();
             expansion_candidate_ids.push_back(candidate.id);
         }
-        
-        // Step 3: Batch-fetch neighbors for all candidates in the beam.
-        // The number of expensive getNodeNeighbors calls is now drastically reduced.
+
         all_neighbors_from_beam.clear();
         for (uint32_t candidate_id : expansion_candidate_ids) {
             std::vector<uint32_t> neighbors;
@@ -325,7 +294,6 @@ std::vector<std::pair<float, uint32_t>> DiskANN<T, TagT, Dim, MaxTagsPerNode>::g
             }
         }
 
-        // Step 4: Filter out visited nodes from the collected neighbors.
         unvisited_neighbors_ids.clear();
         unvisited_neighbors_ids.reserve(all_neighbors_from_beam.size());
         for (uint32_t neighbor_id : all_neighbors_from_beam) {
@@ -335,20 +303,16 @@ std::vector<std::pair<float, uint32_t>> DiskANN<T, TagT, Dim, MaxTagsPerNode>::g
         }
         if (unvisited_neighbors_ids.empty()) continue;
 
-        // Step 5: Batch-fetch vectors/data for all unique, unvisited neighbors.
-        // This part uses your existing, efficient batching logic.
         if (filter_label) {
             thread_local static NodeDataBatch data_batch;
             if (!get_nodes_data_batch(unvisited_neighbors_ids, data_batch)) {
                 for (uint32_t id : unvisited_neighbors_ids) visited_nodes->unvisit(id);
                 continue;
             }
-
             size_t tags_offset = 0;
             for (size_t i = 0; i < unvisited_neighbors_ids.size(); ++i) {
                 uint32_t id = unvisited_neighbors_ids[i];
                 uint16_t tag_count = data_batch.tag_counts[i];
-
                 bool has_label = false;
                 std::span<const TagT> current_tags(data_batch.tags.data() + tags_offset, tag_count);
                 for (const TagT& tag : current_tags) {
@@ -358,7 +322,6 @@ std::vector<std::pair<float, uint32_t>> DiskANN<T, TagT, Dim, MaxTagsPerNode>::g
                     }
                 }
                 tags_offset += tag_count;
-
                 if (has_label) {
                     const T* vector = data_batch.vectors.data() + i * Dim;
                     float dist = distance_metric->compare(aligned_query, vector, Dim);
@@ -368,12 +331,10 @@ std::vector<std::pair<float, uint32_t>> DiskANN<T, TagT, Dim, MaxTagsPerNode>::g
         } else {
             thread_local static std::vector<T, AlignedAllocator<T, 32>> neighbor_vectors;
             neighbor_vectors.resize(unvisited_neighbors_ids.size() * Dim);
-
             if (!get_vectors_batch(unvisited_neighbors_ids, neighbor_vectors.data())) {
                 for (uint32_t id : unvisited_neighbors_ids) visited_nodes->unvisit(id);
                 continue;
             }
-
             for (size_t i = 0; i < unvisited_neighbors_ids.size(); ++i) {
                 uint32_t id = unvisited_neighbors_ids[i];
                 const T* vector = neighbor_vectors.data() + i * Dim;
@@ -382,8 +343,6 @@ std::vector<std::pair<float, uint32_t>> DiskANN<T, TagT, Dim, MaxTagsPerNode>::g
             }
         }
     }
-
-    // ======================= REVISED HIGH-PERFORMANCE LOOP END =========================
 
     std::vector<std::pair<float, uint32_t>> results;
     size_t result_count = std::min((size_t)K, best_L_nodes.size());
@@ -439,8 +398,6 @@ std::vector<std::pair<float, uint32_t>> DiskANN<T, TagT, Dim, MaxTagsPerNode>::g
         }
         if (unvisited_neighbors_ids.empty()) continue;
 
-        // This function is only used during build, where performance is less critical than search.
-        // We can still use the optimized batch getter for a speedup.
         thread_local static std::vector<T, AlignedAllocator<T, 32>> neighbor_vectors;
         neighbor_vectors.resize(unvisited_neighbors_ids.size() * Dim);
         if (!get_vectors_batch(unvisited_neighbors_ids, neighbor_vectors.data())) {
@@ -466,8 +423,7 @@ std::vector<std::pair<float, uint32_t>> DiskANN<T, TagT, Dim, MaxTagsPerNode>::g
 }
 
 // =========================================================================
-// BUILD PROCESS & OTHER FUNCTIONS (UNCHANGED)
-// Note: build process also benefits from optimized get_vectors_batch
+// BUILD PROCESS & OTHER FUNCTIONS
 // =========================================================================
 
 template <typename T, typename TagT, size_t Dim, size_t MaxTagsPerNode>
@@ -578,7 +534,6 @@ void DiskANN<T, TagT, Dim, MaxTagsPerNode>::robust_prune_batched(uint32_t p_id,
     for (const auto& pair : candidates) candidate_ids.push_back(pair.second);
 
     std::vector<T, AlignedAllocator<T, 32>> candidate_vectors(candidate_ids.size() * Dim);
-    // Using the optimized batch function here will also speed up build time
     if (!get_vectors_batch(candidate_ids, candidate_vectors.data())) {
         if (candidates.size() > _R_max_degree) candidates.resize(_R_max_degree);
         return;
@@ -604,12 +559,6 @@ void DiskANN<T, TagT, Dim, MaxTagsPerNode>::robust_prune_batched(uint32_t p_id,
     candidates = new_neighbors;
 }
 
-// ... (rest of the file is identical to your original, as the main optimizations are in the search and batch-get
-// functions)
-// ... The rest of the file from connect_neighbors_batched onwards remains unchanged. I will paste it below for
-// completeness.
-// =========================================================================
-
 template <typename T, typename TagT, size_t Dim, size_t MaxTagsPerNode>
 void DiskANN<T, TagT, Dim, MaxTagsPerNode>::connect_neighbors_batched(uint32_t node_id,
                                                                       const std::vector<uint32_t>& neighbors,
@@ -624,7 +573,6 @@ void DiskANN<T, TagT, Dim, MaxTagsPerNode>::connect_neighbors_batched(uint32_t n
             try {
                 std::vector<uint32_t> neighbor_current_neighbors;
                 if (!getNodeNeighbors(neighbor_id, neighbor_current_neighbors)) throw OLCRestartException();
-
                 bool already_connected = false;
                 for (uint32_t n : neighbor_current_neighbors)
                     if (n == node_id) {
@@ -632,16 +580,13 @@ void DiskANN<T, TagT, Dim, MaxTagsPerNode>::connect_neighbors_batched(uint32_t n
                         break;
                     }
                 if (already_connected) break;
-
                 neighbor_current_neighbors.push_back(node_id);
-
                 if (neighbor_current_neighbors.size() > _R_max_degree) {
                     std::vector<T, AlignedAllocator<T, 32>> local_vectors(neighbor_current_neighbors.size() * Dim);
                     if (!get_vectors_batch(neighbor_current_neighbors, local_vectors.data()))
                         throw OLCRestartException();
                     alignas(32) T neighbor_vec_query[Dim];
                     if (!getNodeVector(neighbor_id, neighbor_vec_query)) throw OLCRestartException();
-
                     std::vector<std::pair<float, uint32_t>> candidates_to_prune;
                     candidates_to_prune.reserve(neighbor_current_neighbors.size());
                     for (size_t i = 0; i < neighbor_current_neighbors.size(); ++i) {
@@ -785,6 +730,8 @@ void DiskANN<T, TagT, Dim, MaxTagsPerNode>::optimize_layout() {
     for (auto& pair : _medoids) {
         if (pair.second < num_points) pair.second = old_id_to_new_id[pair.second];
     }
+    // After remapping IDs, the vector cache is invalid and must be repopulated.
+    compute_medoids(num_points);
     {
         GuardX<DiskANNMetadataPage> meta_guard(_metadata_pid);
         meta_guard->is_layout_optimized = true;
@@ -803,22 +750,33 @@ std::vector<std::pair<float, uint32_t>> DiskANN<T, TagT, Dim, MaxTagsPerNode>::s
                                                                                       const SearchParams& params) {
     return search_typed(static_cast<const T*>(query), K, params);
 }
+
 template <typename T, typename TagT, size_t Dim, size_t MaxTagsPerNode>
 std::vector<std::pair<float, uint32_t>> DiskANN<T, TagT, Dim, MaxTagsPerNode>::search_typed(
     const T* query, size_t K, const SearchParams& params) {
-    uint32_t start_node;
+    uint32_t start_node_id;
+    const T* start_node_vec = nullptr;
     for (;;) {
         try {
             GuardO<DiskANNMetadataPage> meta_guard(_metadata_pid);
             if (meta_guard->node_count == 0) return {};
             if (_medoids.empty()) compute_medoids(meta_guard->node_count);
-            start_node = _medoids.empty() ? 0 : _medoids.begin()->second;
+
+            auto it = _medoids.find(0);
+            if (it == _medoids.end() && !_medoids.empty()) it = _medoids.begin();
+            if (it == _medoids.end()) return {};
+
+            start_node_id = it->second;
+            auto cache_it = _medoid_vectors_cache.find(it->first);
+            if (cache_it != _medoid_vectors_cache.end()) {
+                start_node_vec = cache_it->second.data();
+            }
             break;
         } catch (const OLCRestartException&) {
             continue;
         }
     }
-    auto internal_results = greedy_search_final({start_node}, query, K, params, nullptr);
+    auto internal_results = greedy_search_final(start_node_id, start_node_vec, query, K, params, nullptr);
     std::shared_lock<std::shared_mutex> lock(_map_lock);
     for (auto& pair : internal_results) {
         if (pair.second < _internal_to_external_map.size()) {
@@ -827,23 +785,31 @@ std::vector<std::pair<float, uint32_t>> DiskANN<T, TagT, Dim, MaxTagsPerNode>::s
     }
     return internal_results;
 }
+
 template <typename T, typename TagT, size_t Dim, size_t MaxTagsPerNode>
 std::vector<std::pair<float, uint32_t>> DiskANN<T, TagT, Dim, MaxTagsPerNode>::search_with_filter(
     const void* query, uint32_t filter_label, size_t K, const SearchParams& params) {
     return search_with_filter_typed(static_cast<const T*>(query), filter_label, K, params);
 }
+
 template <typename T, typename TagT, size_t Dim, size_t MaxTagsPerNode>
 std::vector<std::pair<float, uint32_t>> DiskANN<T, TagT, Dim, MaxTagsPerNode>::search_with_filter_typed(
     const T* query, const TagT& filter_label, size_t K, const SearchParams& params) {
-    uint32_t start_node;
+    uint32_t start_node_id;
+    const T* start_node_vec = nullptr;
+
     auto it = _medoids.find(filter_label);
     if (it == _medoids.end()) {
         it = _medoids.find(0);
         if (it == _medoids.end() && !_medoids.empty()) it = _medoids.begin();
         if (it == _medoids.end()) return {};
     }
-    start_node = it->second;
-    auto internal_results = greedy_search_final({start_node}, query, K, params, &filter_label);
+    start_node_id = it->second;
+    auto cache_it = _medoid_vectors_cache.find(it->first);
+    if (cache_it != _medoid_vectors_cache.end()) {
+        start_node_vec = cache_it->second.data();
+    }
+    auto internal_results = greedy_search_final(start_node_id, start_node_vec, query, K, params, &filter_label);
     std::shared_lock<std::shared_mutex> lock(_map_lock);
     for (auto& pair : internal_results) {
         if (pair.second < _internal_to_external_map.size()) {
@@ -852,6 +818,7 @@ std::vector<std::pair<float, uint32_t>> DiskANN<T, TagT, Dim, MaxTagsPerNode>::s
     }
     return internal_results;
 }
+
 template <typename T, typename TagT, size_t Dim, size_t MaxTagsPerNode>
 bool DiskANN<T, TagT, Dim, MaxTagsPerNode>::getNodeVector(uint32_t node_id, T* dest_vector) const {
     try {
@@ -896,11 +863,13 @@ template <typename T, typename TagT, size_t Dim, size_t MaxTagsPerNode>
 inline uint32_t DiskANN<T, TagT, Dim, MaxTagsPerNode>::getNodeIndexInPage(uint32_t node_id) const {
     return node_id % _NodesPerPage;
 }
+
 template <typename T, typename TagT, size_t Dim, size_t MaxTagsPerNode>
 void DiskANN<T, TagT, Dim, MaxTagsPerNode>::compute_medoids(uint64_t num_points) {
     if (num_points == 0) return;
     std::cout << "Computing medoids using centroid method..." << std::endl;
     _medoids.clear();
+    _medoid_vectors_cache.clear();  // Clear the cache before re-computing
     std::unordered_map<TagT, std::vector<uint32_t>> points_by_tag;
     for (uint32_t i = 0; i < num_points; ++i) {
         std::vector<TagT> tags;
@@ -913,15 +882,12 @@ void DiskANN<T, TagT, Dim, MaxTagsPerNode>::compute_medoids(uint64_t num_points)
 
     for (auto const& [tag, points] : points_by_tag) {
         if (points.empty()) continue;
-
-        // --- Phase 1: Calculate Centroid ---
         std::vector<double> centroid(Dim, 0.0);
         size_t points_in_centroid = 0;
         const size_t BATCH_SIZE = 1024;
         std::vector<T, AlignedAllocator<T, 32>> vector_batch(BATCH_SIZE * Dim);
         std::vector<uint32_t> id_batch;
         id_batch.reserve(BATCH_SIZE);
-
         for (uint32_t point_id : points) {
             id_batch.push_back(point_id);
             if (id_batch.size() == BATCH_SIZE) {
@@ -941,21 +907,14 @@ void DiskANN<T, TagT, Dim, MaxTagsPerNode>::compute_medoids(uint64_t num_points)
                 points_in_centroid += id_batch.size();
             }
         }
-
         if (points_in_centroid == 0) continue;
         for (size_t d = 0; d < Dim; ++d) centroid[d] /= points_in_centroid;
-
-        // ======================= THE CORE FIX =======================
-        // Use AlignedAllocator to ensure centroid_T is 32-byte aligned for SIMD.
         std::vector<T, AlignedAllocator<T, 32>> centroid_T(Dim);
-        // ============================================================
         for (size_t d = 0; d < Dim; ++d) centroid_T[d] = static_cast<T>(centroid[d]);
 
-        // --- Phase 2: Find Medoid ---
         float min_dist_sq = std::numeric_limits<float>::max();
         uint32_t medoid_id = points[0];
         id_batch.clear();
-
         for (uint32_t point_id : points) {
             id_batch.push_back(point_id);
             if (id_batch.size() == BATCH_SIZE) {
@@ -984,24 +943,33 @@ void DiskANN<T, TagT, Dim, MaxTagsPerNode>::compute_medoids(uint64_t num_points)
                 }
             }
         }
-
+        TagT cache_key;
         if (tag == universal_tag_key) {
-            if (_medoids.find(0) == _medoids.end()) _medoids[0] = medoid_id;
+            if (_medoids.find(0) == _medoids.end()) {
+                _medoids[0] = medoid_id;
+                cache_key = 0;
+            }
         } else {
             _medoids[tag] = medoid_id;
+            cache_key = tag;
         }
 
-        TagT cache_key = (tag == universal_tag_key) ? 0 : tag;
         if (_medoids.count(cache_key) && _medoid_vectors_cache.find(cache_key) == _medoid_vectors_cache.end()) {
             _medoid_vectors_cache[cache_key].resize(Dim);
             if (!getNodeVector(_medoids[cache_key], _medoid_vectors_cache[cache_key].data())) {
-                // If fetching fails, remove the entry to avoid using bad data.
                 _medoid_vectors_cache.erase(cache_key);
                 std::cerr << "Warning: Failed to fetch and cache vector for medoid with tag " << cache_key << std::endl;
             }
         }
     }
-    if (_medoids.empty() && num_points > 0) _medoids[0] = num_points / 2;
+    if (_medoids.empty() && num_points > 0) {
+        _medoids[0] = num_points / 2;
+        // Also cache this fallback medoid
+        _medoid_vectors_cache[0].resize(Dim);
+        if (!getNodeVector(_medoids[0], _medoid_vectors_cache[0].data())) {
+            _medoid_vectors_cache.erase(0);
+        }
+    }
     std::cout << "Computed " << _medoids.size() << " medoids using centroid method." << std::endl;
 }
 

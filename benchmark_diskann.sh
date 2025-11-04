@@ -34,7 +34,7 @@ profile_target() {
     # 1. Start the Python script in the background. 
     #    It will build, load, print its PID, and then pause itself.
     echo "Starting Python script in background to prepare index..."
-    $PYTHON_CMD $BENCHMARK_SCRIPT --pause --profile "$target_name" > "$pid_capture_file" 2>&1 &
+    $PYTHON_CMD $BENCHMARK_SCRIPT --pause true --profile "$target_name" > "$pid_capture_file" 2>&1 &
     
     # Get the PID of the background Python process
     PYTHON_BG_PID=$!

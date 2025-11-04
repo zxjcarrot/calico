@@ -13,6 +13,7 @@
 #include <cstring> // For memset/memcpy
 #include <future>
 #include <queue>
+#include <sys/mman.h> // mmap
 
 // Basic types
 using uint32_t = unsigned int;
@@ -47,19 +48,24 @@ public:
 };
 
 // --- VisitedList for preventing cycles during graph traversal ---
-using vl_type = unsigned char;
+using vl_type = unsigned short;
 
 class VisitedList {
 public:
     vl_type curV;
     vl_type* mass;
     uint32_t numelements;
+    VisitedList* next = nullptr;
 
-    VisitedList(uint32_t numelements1) {
+    VisitedList(int numelements1) {
         curV = 1;
         numelements = numelements1;
-        mass = new vl_type[numelements];
-        memset(mass, 0, sizeof(vl_type) * numelements);
+        // use mmap and madvise huge page to allocate memory
+        mass = static_cast<vl_type*>(mmap(nullptr, sizeof(vl_type) * numelements, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+        if (mass == MAP_FAILED) {
+            throw std::runtime_error("Failed to allocate memory for VisitedList");
+        }
+        madvise(mass, sizeof(vl_type) * numelements, MADV_HUGEPAGE);
     }
 
     void reset() {
@@ -86,50 +92,69 @@ public:
             mass[node_id] = 0;  // Or curV - 1, depending on reset logic
         }
     }
-    ~VisitedList() { delete[] mass; }
+    ~VisitedList() { munmap(mass, sizeof(vl_type) * numelements); }
 };
 
-class VisitedListPool {
-private:
-    std::deque<VisitedList*> pool;
-    std::mutex poolguard;
-    uint32_t numelements;
+///////////////////////////////////////////////////////////
+//
+// Class for multi-threaded pool-management of VisitedLists
+//
+/////////////////////////////////////////////////////////
 
-public:
-    VisitedListPool(int initmaxpools, uint32_t numelements1) {
-        numelements = numelements1;
-        for (int i = 0; i < initmaxpools; i++)
-            pool.push_front(new VisitedList(numelements));
-    }
+class VisitedListPool {
+    int numelements;
+    // Single cached VisitedList per thread with RAII cleanup on thread exit
+    struct TLSCache {
+        VisitedList* ptr = nullptr;
+        ~TLSCache() { delete ptr; }
+    };
+    static thread_local TLSCache tls_cache;
+
+   public:
+    VisitedListPool(int /*initmaxpools*/, int numelements1) : numelements(numelements1) {}
 
     VisitedList* getFreeVisitedList() {
-        VisitedList* rez;
-        {
-            std::unique_lock<std::mutex> lock(poolguard);
-            if (pool.size() > 0) {
-                rez = pool.front();
-                pool.pop_front();
+        VisitedList*& cached = tls_cache.ptr;
+        if (cached) {
+            if (cached->numelements == static_cast<unsigned int>(numelements)) {
+                VisitedList* rez = cached;
+                cached = nullptr;
+                rez->next = nullptr;
+                rez->reset();
+                return rez;
             } else {
-                rez = new VisitedList(numelements);
+                // Cached list has different size; free it so we can allocate correct one
+                delete cached;
+                cached = nullptr;
             }
         }
+        // None available for this thread, allocate a new one with correct size
+        VisitedList* rez = new VisitedList(numelements);
         rez->reset();
         return rez;
     }
 
     void releaseVisitedList(VisitedList* vl) {
-        std::unique_lock<std::mutex> lock(poolguard);
-        pool.push_front(vl);
-    }
-
-    ~VisitedListPool() {
-        while (pool.size()) {
-            VisitedList* rez = pool.front();
-            pool.pop_front();
-            delete rez;
+        VisitedList*& cached = tls_cache.ptr;
+        // If we already have a cached one, delete it to avoid leaks (keep single cached instance)
+        if (cached && cached != vl) {
+            delete cached;
+            cached = nullptr;
+        }
+        // Only cache if dimensions match this pool's configuration; otherwise free
+        if (vl && vl->numelements == static_cast<unsigned int>(numelements)) {
+            cached = vl;
+        } else if (vl) {
+            delete vl;
         }
     }
+
+    // No dynamic resources owned by pool itself
+    ~VisitedListPool() = default;
 };
+
+// Definition of the thread_local cache (inline to avoid multiple definitions across TUs)
+inline thread_local VisitedListPool::TLSCache VisitedListPool::tls_cache{};
 
 class ThreadPool {
    public:
