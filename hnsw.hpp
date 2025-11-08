@@ -21,95 +21,7 @@ class ThreadPool;
 
 // --- HNSW Metadata ---
 
-typedef unsigned short vl_type;
-
-class VisitedList {
-   public:
-    vl_type curV;
-    vl_type* mass;
-    unsigned int numelements;
-    // Intrusive next pointer for lock-free free-list management
-    VisitedList* next = nullptr;
-
-    VisitedList(int numelements1) {
-        curV = -1;
-        numelements = numelements1;
-        // use mmap and madvise huge page to allocate memory
-        mass = static_cast<vl_type*>(mmap(nullptr, sizeof(vl_type) * numelements, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
-        if (mass == MAP_FAILED) {
-            throw std::runtime_error("Failed to allocate memory for VisitedList");
-        }
-        madvise(mass, sizeof(vl_type) * numelements, MADV_HUGEPAGE);
-    }
-
-    void reset() {
-        curV++;
-        if (curV == 0) {
-            memset(mass, 0, sizeof(vl_type) * numelements);
-            curV++;
-        }
-    }
-
-    ~VisitedList() { munmap(mass, sizeof(vl_type) * numelements); }
-};
-
-///////////////////////////////////////////////////////////
-//
-// Class for multi-threaded pool-management of VisitedLists
-//
-/////////////////////////////////////////////////////////
-
-class VisitedListPool {
-    int numelements;
-    // Single cached VisitedList per thread with RAII cleanup on thread exit
-    struct TLSCache {
-        VisitedList* ptr = nullptr;
-        ~TLSCache() { delete ptr; }
-    };
-    static thread_local TLSCache tls_cache;
-
-   public:
-    VisitedListPool(int /*initmaxpools*/, int numelements1) : numelements(numelements1) {}
-
-    VisitedList* getFreeVisitedList() {
-        VisitedList*& cached = tls_cache.ptr;
-        if (cached) {
-            if (cached->numelements == static_cast<unsigned int>(numelements)) {
-                VisitedList* rez = cached;
-                cached = nullptr;
-                rez->next = nullptr;
-                rez->reset();
-                return rez;
-            } else {
-                // Cached list has different size; free it so we can allocate correct one
-                delete cached;
-                cached = nullptr;
-            }
-        }
-        // None available for this thread, allocate a new one with correct size
-        VisitedList* rez = new VisitedList(numelements);
-        rez->reset();
-        return rez;
-    }
-
-    void releaseVisitedList(VisitedList* vl) {
-        VisitedList*& cached = tls_cache.ptr;
-        // If we already have a cached one, delete it to avoid leaks (keep single cached instance)
-        if (cached && cached != vl) {
-            delete cached;
-            cached = nullptr;
-        }
-        // Only cache if dimensions match this pool's configuration; otherwise free
-        if (vl && vl->numelements == static_cast<unsigned int>(numelements)) {
-            cached = vl;
-        } else if (vl) {
-            delete vl;
-        }
-    }
-
-    // No dynamic resources owned by pool itself
-    ~VisitedListPool() = default;
-};
+#include "utils.hpp"
 
 // Definition of the thread_local cache (inline to avoid multiple definitions across TUs)
 inline thread_local VisitedListPool::TLSCache VisitedListPool::tls_cache{};
@@ -217,6 +129,7 @@ struct HNSWStats {
     }
 };
 
+// --- HNSW Metadata ---
 struct HNSWMetadataPage {
     bool dirty;
     PID base_pid;                 // The starting Page ID for HNSW data pages.
