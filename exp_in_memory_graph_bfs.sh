@@ -15,7 +15,7 @@ THREAD_COUNTS=(1 4 8 16 32)
 # Common settings for all graph experiments
 export GRAPH=1
 export RNDREAD=0
-export BLOCK=/home/zxjcarrot/Workspace/calico/heapfile
+export BLOCK=/ssd/ssd0/xj/calico/heapfile
 export VIRTGB=48G
 export PHYSGB=24G
 export DATASIZE=5e6

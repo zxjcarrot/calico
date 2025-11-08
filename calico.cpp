@@ -197,7 +197,9 @@ void* allocHuge(size_t size) {
 }
 
 // use when lock is not free
-void yield(u64 counter) { _mm_pause(); }
+void yield(u64 counter) { 
+    //_mm_pause(); 
+}
 
 ResidentPageSet::ResidentPageSet(u64 maxCount) : count(next_pow2(maxCount * 1.5)), mask(count - 1), clockPos(0) {
     ht = (Entry*)allocHuge(count * sizeof(Entry));
@@ -332,8 +334,9 @@ BufferManager::BufferManager(unsigned nthreads)
       virtCount(virtSize / pageSize),
       physCount(physSize / pageSize),
       residentSet(physCount) {
+    numThreads = nthreads;
     assert(virtSize >= physSize);
-    const char* path = getenv("BLOCK") ? getenv("BLOCK") : "/tmp/bm";
+    const char* path = getenv("BLOCK") ? getenv("BLOCK") : "./heapfile";
     blockfd = open(path, O_RDWR | O_DIRECT, S_IRWXU);
     if (blockfd == -1) {
         cerr << "cannot open BLOCK device '" << path << "'" << endl;
@@ -390,6 +393,13 @@ BufferManager::BufferManager(unsigned nthreads)
         frameToPidArray.reset(new std::atomic<PID>[physCount]);
         for (u64 i = 0; i < physCount; i++) frameToPidArray[i].store(invalidPID, std::memory_order_relaxed);
 
+        if (hashMode == HashMode::Array || hashMode == HashMode::Array1Access) {
+            pid_locks = std::make_unique<pthread_rwlock_t[]>(NUM_LOCK_SHARDS);
+            for (u64 i = 0; i < NUM_LOCK_SHARDS; ++i) {
+                pthread_rwlock_init(&pid_locks[i], nullptr);
+            }
+        }
+
         if (hashMode == HashMode::Array) {
             pidToFrameArray.reset(new std::atomic<u64>[virtCount]);
             if (virtCount * sizeof(std::atomic<u64>) >= 2 * mb)
@@ -401,11 +411,21 @@ BufferManager::BufferManager(unsigned nthreads)
             frameToPidHash.reset();
         } else {
             if (hashMode == HashMode::Unordered) {
-                pidToFrameHash = std::make_unique<ShardedUnorderedMap<PID, u64>>();
-                frameToPidHash = std::make_unique<ShardedUnorderedMap<u64, PID>>();
+                if (numThreads == -1) {
+                    pidToFrameHash = std::make_unique<ShardedUnorderedMap<PID, u64>>();
+                    frameToPidHash = std::make_unique<ShardedUnorderedMap<u64, PID>>();
+                } else {
+                    pidToFrameHash = std::make_unique<ShardedUnorderedMap<PID, u64, 1>>();
+                    frameToPidHash = std::make_unique<ShardedUnorderedMap<u64, PID, 1>>();
+                }
             } else if (hashMode == HashMode::OpenAddress) {
-                pidToFrameHash = std::make_unique<ShardedOpenAddressMap<PID, u64>>();
-                frameToPidHash = std::make_unique<ShardedOpenAddressMap<u64, PID>>();
+                if (numThreads == -1) {
+                    pidToFrameHash = std::make_unique<ShardedOpenAddressMap<PID, u64>>();
+                    frameToPidHash = std::make_unique<ShardedOpenAddressMap<u64, PID>>();
+                } else {
+                    pidToFrameHash = std::make_unique<ShardedOpenAddressMap<PID, u64, 1>>();
+                    frameToPidHash = std::make_unique<ShardedOpenAddressMap<u64, PID, 1>>();
+                }
             } else if (hashMode == HashMode::Lockfree) {
                 pidToFrameHash = std::make_unique<LockFreeHashMap<PID, u64>>();
                 frameToPidHash = std::make_unique<LockFreeHashMap<u64, PID>>();
@@ -470,14 +490,31 @@ BufferManager::BufferManager(unsigned nthreads)
 
     cerr << "calico BufferManager initialized: "
          << "blk:" << path << " virtgb:" << virtSize / gb << " physgb:" << (float)physSize / gb
-         << " traditional:" << useTraditional << " mmap_os_pagecache:" << useMmapOSPageacche 
+         << " traditional:" << useTraditional << " mmap_os_pagecache:" << useMmapOSPageacche
          << " trad_hash:" << static_cast<int>(hashMode) << " exmap:" << useExmap << " hugepage: " << (disableHugePageForFrameMem == 0)
+         << " num_threads:" << numThreads
          << endl;
 }
 
-BufferManager::~BufferManager() {}
+BufferManager::~BufferManager() {
+    try {
+        flushAll();
+    } catch (const std::exception& ex) {
+        std::cerr << "BufferManager::~BufferManager flush error: " << ex.what() << std::endl;
+    } catch (...) {
+        std::cerr << "BufferManager::~BufferManager encountered an unknown error during flush." << std::endl;
+    }
+}
 
 IOInterface& BufferManager::getIOInterface() {
+    static bool useIOUring = envOr("USE_IOURING", 0);
+    // if (useIOUring) {
+    //     thread_local IOUringInterface instance(blockfd, this);
+    //     return instance;
+    // } else {
+    //     thread_local LibaioInterface instance(blockfd, this);
+    //     return instance;
+    // }
     thread_local LibaioInterface instance(blockfd, this);
     return instance;
 }
@@ -520,7 +557,11 @@ Page* BufferManager::residentPtr(PID pid, u64 stateAndVersion) {
     if (!useTraditional) return virtMem + pid;
 
     if (hashMode == HashMode::Array1Access || hashMode == HashMode::Array2Level || hashMode == HashMode::Array3Level) {
+        //pthread_rwlock_rdlock(&pid_locks[pid_lock_shard(pid)]);
         u64 frame = PageState::extractFrame(stateAndVersion);
+        // u64 v = ps.getFrameValue();
+        // u64 frame = PageState::extractFrame(v);
+        //pthread_rwlock_unlock(&pid_locks[pid_lock_shard(pid)]);
         assert(frame != PageState::packedInvalidFrame);
         assert(frame < physCount);
         return frameMem + static_cast<size_t>(frame);
@@ -528,7 +569,9 @@ Page* BufferManager::residentPtr(PID pid, u64 stateAndVersion) {
 
 
     if (hashMode == HashMode::Array) {
+        //pthread_rwlock_rdlock(&pid_locks[pid_lock_shard(pid)]);
         u64 frame = pidToFrameArray[pid].load(std::memory_order_acquire);
+        //pthread_rwlock_unlock(&pid_locks[pid_lock_shard(pid)]);
         assert(frame != invalidFrame);
         assert(frame < physCount);
         return frameMem + static_cast<size_t>(frame);
@@ -549,7 +592,10 @@ Page* BufferManager::preparePageForWrite(PID pid) {
     return page;
 }
 
-static thread_local u32 freePartitionCursor = 0;
+static thread_local u32 freePartitionCursor = []() -> u32 {
+    auto h = std::hash<std::thread::id>{}(std::this_thread::get_id());
+    return static_cast<u32>(h % BufferManager::freePartitionCount);
+}();
 
 u32 BufferManager::popFreeFrame() {
     for (u32 attempt = 0; attempt < freePartitionCount; ++attempt) {
@@ -573,11 +619,14 @@ Page* BufferManager::acquireFrameForPid(PID pid) {
     if (!useTraditional) return virtMem + pid;
     u32 frame = popFreeFrame();
     if (hashMode == HashMode::Array) {
+        //pthread_rwlock_wrlock(&pid_locks[pid_lock_shard(pid)]);
         pidToFrameArray[pid].store(static_cast<u64>(frame), std::memory_order_release);
         frameToPidArray[frame].store(pid, std::memory_order_release);
     } else if (hashMode == HashMode::Array1Access || hashMode == HashMode::Array2Level || hashMode == HashMode::Array3Level) {
+        //pthread_rwlock_wrlock(&pid_locks[pid_lock_shard(pid)]);
         getPageState(pid).setFrameValue(frame);
         frameToPidArray[frame].store(pid, std::memory_order_release);
+        //pthread_rwlock_unlock(&pid_locks[pid_lock_shard(pid)]);
     } else {
         u64 frameId = static_cast<u64>(frame);
         pidToFrameHash->insertOrAssign(pid, frameId);
@@ -590,14 +639,17 @@ void BufferManager::releaseFrame(PID pid) {
     if (!useTraditional) return;
     u64 frameId;
     if (hashMode == HashMode::Array) {
+        //pthread_rwlock_wrlock(&pid_locks[pid_lock_shard(pid)]);
         frameId = pidToFrameArray[pid].exchange(invalidFrame, std::memory_order_acq_rel);
         assert(frameId != invalidFrame);
         frameToPidArray[static_cast<size_t>(frameId)].store(invalidPID, std::memory_order_release);
     } else if (hashMode == HashMode::Array1Access || hashMode == HashMode::Array2Level) {
-        frameId = getPageState(pid).getFrameValue();
+        //pthread_rwlock_wrlock(&pid_locks[pid_lock_shard(pid)]);
+        frameId = pageState[pid].getFrameValue();
         assert(frameId != PageState::packedInvalidFrame);
         getPageState(pid).clearFrameValue();
         frameToPidArray[static_cast<size_t>(frameId)].store(invalidPID, std::memory_order_release);
+        //pthread_rwlock_unlock(&pid_locks[pid_lock_shard(pid)]);
     } else {
         bool ok = pidToFrameHash->erase(pid, frameId);
         assert(ok);
@@ -658,12 +710,34 @@ Page* BufferManager::allocPage() {
     residentSet.insert(pid);
     page->dirty = true;
 
+    updateAllocCountSnapshot(pid + 1);
+
     return page;
+}
+
+void BufferManager::updateAllocCountSnapshot(u64 latest_alloc) {
+    while (true) {
+        try {
+            GuardO<MetaDataPage> meta_guard(metadataPageId);
+            if (meta_guard->getAllocCountSnapshot() >= latest_alloc) {
+                return;
+            }
+
+            GuardX<MetaDataPage> meta_write(std::move(meta_guard));
+            if (meta_write->getAllocCountSnapshot() < latest_alloc) {
+                meta_write->setAllocCountSnapshot(latest_alloc);
+                meta_write->dirty = true;
+            }
+            return;
+        } catch (const OLCRestartException&) {
+            continue;
+        }
+    }
 }
 
 Page* BufferManager::handleFault(PID pid) {
     physUsedCount++;
-    ensureFreePages();
+    //ensureFreePages();
     Page* page = acquireFrameForPid(pid);
     readPage(pid, page);
     residentSet.insert(pid);
@@ -674,21 +748,36 @@ Page* BufferManager::fixX(PID pid) {
     PageState& ps = getPageState(pid);
     for (u64 repeatCounter = 0;; repeatCounter++) {
         u64 stateAndVersion = ps.stateAndVersion.load();
-        switch (PageState::getState(stateAndVersion)) {
-            case PageState::Evicted: {
+        u64 state = PageState::getState(stateAndVersion);
+        
+        if (useMmapOSPageacche) {
+            // In mmap+OS page cache mode, pages are never evicted by DB
+            // Only need to handle: Locked, Marked, Unlocked states
+            if (state == PageState::Marked || state == PageState::Unlocked) {
                 if (ps.tryLockX(stateAndVersion)) {
-                    Page* page = handleFault(pid);
-                    return page;
-                }
-                break;
-            }
-            case PageState::Marked:
-            case PageState::Unlocked: {
-                if (ps.tryLockX(stateAndVersion)) {
-                    // u64 lockedState = PageState::sameVersion(stateAndVersion, PageState::Locked);
                     return residentPtr(pid, stateAndVersion);
                 }
-                break;
+            }
+            // For Locked state, just retry
+        } else {
+            // Original vmcache or traditional mode logic
+            switch (state) {
+                case PageState::Evicted: {
+                    if (ps.tryLockX(stateAndVersion)) {
+                        Page* page = handleFault(pid);
+                        ensureFreePages();
+                        return page;
+                    }
+                    break;
+                }
+                case PageState::Marked:
+                case PageState::Unlocked: {
+                    if (ps.tryLockX(stateAndVersion)) {
+                        // u64 lockedState = PageState::sameVersion(stateAndVersion, PageState::Locked);
+                        return residentPtr(pid, stateAndVersion);
+                    }
+                    break;
+                }
             }
         }
         yield(repeatCounter);
@@ -699,23 +788,43 @@ Page* BufferManager::fixS(PID pid) {
     PageState& ps = getPageState(pid);
     for (u64 repeatCounter = 0;; repeatCounter++) {
         u64 stateAndVersion = ps.stateAndVersion;
-        switch (PageState::getState(stateAndVersion)) {
-            case PageState::Locked: {
-                break;
-            }
-            case PageState::Evicted: {
-                if (ps.tryLockX(stateAndVersion)) {
-                    handleFault(pid);
-                    ps.unlockX();
-                }
-                break;
-            }
-            default: {
+        u64 state = PageState::getState(stateAndVersion);
+        
+        if (useMmapOSPageacche) {
+            // In mmap+OS page cache mode, pages are never evicted by DB
+            // Only need to handle: Locked, Marked, Unlocked, and shared states
+            if (state == PageState::Locked) {
+                // Just retry
+            } else {
+                // Try to acquire shared lock (state can be Marked, Unlocked, or already shared)
                 if (ps.tryLockS(stateAndVersion)) {
                     u64 s = PageState::getState(stateAndVersion);
                     u64 nextState = (s < PageState::MaxShared) ? (s + 1) : 1;
                     u64 newState = PageState::sameVersion(stateAndVersion, nextState);
                     return residentPtr(pid, newState);
+                }
+            }
+        } else {
+            // Original vmcache or traditional mode logic
+            switch (state) {
+                case PageState::Locked: {
+                    break;
+                }
+                case PageState::Evicted: {
+                    if (ps.tryLockX(stateAndVersion)) {
+                        handleFault(pid);
+                        ps.unlockX();
+                        ensureFreePages();
+                    }
+                    break;
+                }
+                default: {
+                    if (ps.tryLockS(stateAndVersion)) {
+                        u64 s = PageState::getState(stateAndVersion);
+                        u64 nextState = (s < PageState::MaxShared) ? (s + 1) : 1;
+                        u64 newState = PageState::sameVersion(stateAndVersion, nextState);
+                        return residentPtr(pid, newState);
+                    }
                 }
             }
         }
@@ -748,6 +857,72 @@ void BufferManager::readPage(PID pid, Page* dest) {
     }
 }
 
+void BufferManager::flushAll() {
+    std::vector<PID> batch;
+    batch.reserve(LibaioInterface::maxIOs);
+    std::vector<PageState*> locked_states;
+    locked_states.reserve(LibaioInterface::maxIOs);
+    int flushed_pages = 0;
+    auto flush_batch = [&]() {
+        if (batch.empty()) return;
+        try {
+            getIOInterface().writePages(batch);
+            writeCount += batch.size();
+            flushed_pages += batch.size();
+        } catch (...) {
+            for (PageState* ps : locked_states) {
+                ps->unlockS();
+            }
+            batch.clear();
+            locked_states.clear();
+            throw;
+        }
+
+        for (PageState* ps : locked_states) {
+            ps->unlockS();
+        }
+        batch.clear();
+        locked_states.clear();
+    };
+
+    u64 max_pid = allocCount.load(std::memory_order_acquire);
+    for (PID pid = 0; pid < max_pid; ++pid) {
+        PageState& ps = getPageState(pid);
+
+        for (u64 repeatCounter = 0;; ++repeatCounter) {
+            u64 state_and_version = ps.stateAndVersion.load(std::memory_order_acquire);
+            u64 state = PageState::getState(state_and_version);
+
+            if (state == PageState::Evicted) {
+                break;
+            }
+            if (state == PageState::Locked) {
+                yield(repeatCounter);
+                continue;
+            }
+
+            if (ps.tryLockS(state_and_version)) {
+                Page* page_ptr = residentPtr(pid, state_and_version);
+                if (page_ptr->dirty) {
+                    batch.push_back(pid);
+                    locked_states.push_back(&ps);
+                } else {
+                    ps.unlockS();
+                }
+                break;
+            }
+            yield(repeatCounter);
+        }
+
+        if (batch.size() >= LibaioInterface::maxIOs) {
+            flush_batch();
+        }
+    }
+
+    flush_batch();
+    cerr << "BufferManager flushed " << flushed_pages << " pages." << endl;
+}
+
 void BufferManager::evict() {
     vector<PID> toEvict;
     toEvict.reserve(batch);
@@ -777,8 +952,10 @@ void BufferManager::evict() {
     }
 
     // 1. write dirty pages
-    getIOInterface().writePages(toWrite);
-    writeCount += toWrite.size();
+    if (toWrite.size() > 0) {
+        getIOInterface().writePages(toWrite);
+        writeCount += toWrite.size();
+    }
 
     // 2. try to lock clean page candidates
     toEvict.erase(std::remove_if(toEvict.begin(), toEvict.end(),
@@ -795,7 +972,7 @@ void BufferManager::evict() {
         u64 v = ps.stateAndVersion;
         if ((PageState::getState(v) == 1) &&
             ps.stateAndVersion.compare_exchange_weak(v, PageState::sameVersion(v, PageState::Locked)))
-            toEvict.push_back(pid);
+            toEvict.push_back(pid); // there were no new readers joined during the write-back, let's evict the page
         else
             ps.unlockS();
     }
@@ -823,6 +1000,15 @@ void BufferManager::evict() {
 }
 
 void BufferManager::prefetchPages(const PID* pages, int n_pages, const u32* offsets_within_pages) {
+    //if (!useTraditional || hashMode == HashMode::Array1Access || hashMode == HashMode::Array || hashMode == HashMode::Array2Level) {
+    // if (!useTraditional || hashMode == HashMode::Array1Access) {
+    //     for (int i = 0; i < n_pages; i++) {
+    //         PageState& ps = getPageState(pages[i]);
+    //         char * tmp = (char*)&ps;
+    //         _mm_prefetch(reinterpret_cast<const char*>(tmp), _MM_HINT_T0);
+    //     }
+    // }
+    
     // if (!useTraditional) {
     //    // For mmap mode, all pages are always "resident"
     //    return;
@@ -835,6 +1021,12 @@ void BufferManager::prefetchPages(const PID* pages, int n_pages, const u32* offs
     for (int i = 0; i < n_pages; i++) {
         PID pid = pages[i];
         assert(pid < virtCount);
+        if (i + 1 < n_pages) {
+            // Prefetch next PageState
+            PageState& next_ps = getPageState(pages[i + 1]);
+            char* tmp = (char*)&next_ps;
+            _mm_prefetch(reinterpret_cast<const char*>(tmp), _MM_HINT_T0);
+        }
 
         PageState& ps = getPageState(pid);
         u64 stateAndVersion = ps.stateAndVersion.load(std::memory_order_acquire);
@@ -854,8 +1046,8 @@ void BufferManager::prefetchPages(const PID* pages, int n_pages, const u32* offs
             if (offsets_within_pages != nullptr) {
                   // Touch the page to bring it into cache
                   char *tmp = (((char*)residentPtr(pid, stateAndVersion)) + offsets_within_pages[i]);
-                  _mm_prefetch(reinterpret_cast<const char*>(tmp), _MM_HINT_T0);
-                  _mm_prefetch(reinterpret_cast<const char*>(tmp) + 64, _MM_HINT_T0);
+                  _mm_prefetch(reinterpret_cast<const char*>(tmp), _MM_HINT_T2);
+                  _mm_prefetch(reinterpret_cast<const char*>(tmp) + 64, _MM_HINT_T2);
             }
             continue;
         }
@@ -1259,8 +1451,11 @@ static unsigned btreeslotcounter = 0;
 BTree::BTree() : splitOrdered(false) {
     GuardX<MetaDataPage> page(metadataPageId);
     AllocGuard<BTreeNode> rootNode(true);
-    slotId = btreeslotcounter++;
-    page->roots[slotId] = rootNode.pid;
+    {
+        slotId = btreeslotcounter++;
+        page->roots[slotId] = rootNode.pid;
+        page->dirty = true;
+    }
 }
 
 BTree::~BTree() {}
@@ -1293,10 +1488,14 @@ GuardS<BTreeNode> BTree::findLeafS(span<u8> key) {
 void BTree::trySplit(GuardX<BTreeNode>&& node, GuardX<BTreeNode>&& parent, span<u8> key, unsigned payloadLen) {
     // create new root if necessary
     if (parent.pid == metadataPageId) {
-        MetaDataPage* metaData = reinterpret_cast<MetaDataPage*>(parent.ptr);
+        GuardX<MetaDataPage> meta_guard(metadataPageId);
+
         AllocGuard<BTreeNode> newRoot(false);
         newRoot->upperInnerNode = node.pid;
-        metaData->roots[slotId] = newRoot.pid;
+        {
+            meta_guard->roots[slotId] = newRoot.pid;
+            meta_guard->dirty = true;
+        }
         parent = std::move(newRoot);
     }
 
@@ -1425,12 +1624,58 @@ void initialize_system() {
         setenv("PHYSGB", "16", 0);
         
         bm_ptr = new BufferManager();
+
+        // Restore allocCount from persisted metadata snapshot if available.
+        bool can_attempt_restore = true;
+        if (const char* block_path = getenv("BLOCK")) {
+            struct stat st {};
+            if (stat(block_path, &st) == 0) {
+                if (S_ISREG(st.st_mode) && st.st_size < static_cast<off_t>(pageSize)) {
+                    can_attempt_restore = false;
+                }
+            }
+        }
+
+        if (can_attempt_restore) {
+            for (;;) {
+                try {
+                    GuardO<MetaDataPage> meta_guard(metadataPageId);
+                    u64 stored_alloc = meta_guard->getAllocCountSnapshot();
+                    u64 current_alloc = bm_ptr->allocCount.load(std::memory_order_relaxed);
+                    if (stored_alloc > current_alloc) {
+                        bm_ptr->allocCount.store(stored_alloc, std::memory_order_relaxed);
+                        std::cerr << "[Calico Init] Restored allocCount from metadata: " << stored_alloc
+                                  << std::endl;
+                    }
+                    break;
+                } catch (const OLCRestartException&) {
+                    continue;
+                }
+            }
+        }
+    }
+}
+
+void flush_system() {
+    if (bm_ptr != nullptr) {
+        bool can_attempt_update = true;
+        if (const char* block_path = getenv("BLOCK")) {
+            struct stat st {};
+            if (stat(block_path, &st) == 0) {
+                if (S_ISREG(st.st_mode) && st.st_size < static_cast<off_t>(pageSize)) {
+                    can_attempt_update = false;
+                }
+            }
+        }
+
+        bm_ptr->flushAll();
     }
 }
 
 // This function will be called from Python to shut down the system
 void shutdown_system() {
     if (bm_ptr != nullptr) {
+        flush_system();
         delete bm_ptr;
         bm_ptr = nullptr;
     }

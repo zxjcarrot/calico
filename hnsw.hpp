@@ -11,6 +11,7 @@
 #include <span>
 #include <vector>
 #include <iomanip>  // For std::setprecision
+#include <mutex>
 
 #include "calico.hpp"
 #include "distance.hpp"
@@ -20,18 +21,25 @@ class ThreadPool;
 
 // --- HNSW Metadata ---
 
-typedef unsigned char vl_type;
+typedef unsigned short vl_type;
 
 class VisitedList {
    public:
     vl_type curV;
     vl_type* mass;
     unsigned int numelements;
+    // Intrusive next pointer for lock-free free-list management
+    VisitedList* next = nullptr;
 
     VisitedList(int numelements1) {
         curV = -1;
         numelements = numelements1;
-        mass = new vl_type[numelements];
+        // use mmap and madvise huge page to allocate memory
+        mass = static_cast<vl_type*>(mmap(nullptr, sizeof(vl_type) * numelements, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+        if (mass == MAP_FAILED) {
+            throw std::runtime_error("Failed to allocate memory for VisitedList");
+        }
+        madvise(mass, sizeof(vl_type) * numelements, MADV_HUGEPAGE);
     }
 
     void reset() {
@@ -42,7 +50,7 @@ class VisitedList {
         }
     }
 
-    ~VisitedList() { delete[] mass; }
+    ~VisitedList() { munmap(mass, sizeof(vl_type) * numelements); }
 };
 
 ///////////////////////////////////////////////////////////
@@ -52,44 +60,59 @@ class VisitedList {
 /////////////////////////////////////////////////////////
 
 class VisitedListPool {
-    std::deque<VisitedList*> pool;
-    std::mutex poolguard;
     int numelements;
+    // Single cached VisitedList per thread with RAII cleanup on thread exit
+    struct TLSCache {
+        VisitedList* ptr = nullptr;
+        ~TLSCache() { delete ptr; }
+    };
+    static thread_local TLSCache tls_cache;
 
    public:
-    VisitedListPool(int initmaxpools, int numelements1) {
-        numelements = numelements1;
-        for (int i = 0; i < initmaxpools; i++) pool.push_front(new VisitedList(numelements));
-    }
+    VisitedListPool(int /*initmaxpools*/, int numelements1) : numelements(numelements1) {}
 
     VisitedList* getFreeVisitedList() {
-        VisitedList* rez;
-        {
-            std::unique_lock<std::mutex> lock(poolguard);
-            if (pool.size() > 0) {
-                rez = pool.front();
-                pool.pop_front();
+        VisitedList*& cached = tls_cache.ptr;
+        if (cached) {
+            if (cached->numelements == static_cast<unsigned int>(numelements)) {
+                VisitedList* rez = cached;
+                cached = nullptr;
+                rez->next = nullptr;
+                rez->reset();
+                return rez;
             } else {
-                rez = new VisitedList(numelements);
+                // Cached list has different size; free it so we can allocate correct one
+                delete cached;
+                cached = nullptr;
             }
         }
+        // None available for this thread, allocate a new one with correct size
+        VisitedList* rez = new VisitedList(numelements);
         rez->reset();
         return rez;
     }
 
     void releaseVisitedList(VisitedList* vl) {
-        std::unique_lock<std::mutex> lock(poolguard);
-        pool.push_front(vl);
-    }
-
-    ~VisitedListPool() {
-        while (pool.size()) {
-            VisitedList* rez = pool.front();
-            pool.pop_front();
-            delete rez;
+        VisitedList*& cached = tls_cache.ptr;
+        // If we already have a cached one, delete it to avoid leaks (keep single cached instance)
+        if (cached && cached != vl) {
+            delete cached;
+            cached = nullptr;
+        }
+        // Only cache if dimensions match this pool's configuration; otherwise free
+        if (vl && vl->numelements == static_cast<unsigned int>(numelements)) {
+            cached = vl;
+        } else if (vl) {
+            delete vl;
         }
     }
+
+    // No dynamic resources owned by pool itself
+    ~VisitedListPool() = default;
 };
+
+// Definition of the thread_local cache (inline to avoid multiple definitions across TUs)
+inline thread_local VisitedListPool::TLSCache VisitedListPool::tls_cache{};
 
 // --- HNSW Stats ---
 struct HNSWStats {
@@ -208,8 +231,7 @@ struct HNSWMetadataPage {
 
 // --- HNSW Main Class ---
 
-template <size_t Dim,  // Vector dimension.
-          typename DistanceMetric = hnsw_distance::SIMDAcceleratedL2>
+template <typename DistanceMetric = hnsw_distance::SIMDAcceleratedL2>
 class HNSW {
    public:
     // Fixed-size node layout (no more slots/indirection):
@@ -217,6 +239,7 @@ class HNSW {
     // Node size is constant and computed at runtime
 
     // --- Runtime parameters (formerly template parameters) ---
+    const size_t Dim;             // Vector dimension (runtime constant)
     const size_t M;               // Max number of neighbors for layers > 0
     const size_t M0;              // Max number of neighbors for layer 0 (computed as 2*M)
     const size_t efConstruction;  // Number of neighbors to search during index construction
@@ -225,7 +248,7 @@ class HNSW {
     // --- Runtime size calculations for fixed-size nodes ---
     const size_t MaxNeighborsHeaderSize;  // MaxLevel * sizeof(u16) - level counts
     const size_t MaxNeighborsListSize;    // (M0 + (MaxLevel - 1) * M) * sizeof(u32) - neighbor IDs
-    static constexpr size_t VectorSize = Dim * sizeof(float);
+    const size_t VectorSize;                // Dim * sizeof(float)
     const size_t FixedNodeSize;  // VectorSize + MaxNeighborsHeaderSize + MaxNeighborsListSize
 
     // HNSW data page: uses fixed-size node grid layout for direct access.
@@ -259,6 +282,7 @@ class HNSW {
     double mult_factor;
     bool enable_prefetch_;
     std::unique_ptr<VisitedListPool> visited_list_pool_{nullptr};
+    bool recovered_from_disk_ = false;
     
     // `mutable` allows const methods like searchKnn to update stats.
     mutable HNSWStats stats_;
@@ -278,7 +302,8 @@ class HNSW {
 
    public:
     // Constructor with runtime parameters
-    HNSW(u64 max_elements, size_t M = 16, size_t ef_construction = 200, bool enable_prefetch = true);
+    HNSW(u64 max_elements, size_t dim, size_t M = 16, size_t ef_construction = 200, bool enable_prefetch = true,
+        bool skip_recovery = false);
     // Destructor - must be defined in .cpp where ThreadPool is complete
     ~HNSW();
 
@@ -286,10 +311,10 @@ class HNSW {
     // Helper function to estimate MaxLevel from max_elements
     static size_t estimateMaxLevel(u64 max_elements, size_t M);
 
-    inline float calculateDistance(const float* v1, const float* v2, size_t dim) const {
+    inline float calculateDistance(const float* v1, const float* v2) const {
         // This is now the single point for distance calculation counting.
         stats_.dist_comps.fetch_add(1, std::memory_order_relaxed);
-        return DistanceMetric::compare(v1, v2, dim);
+        return DistanceMetric::compare(v1, v2, Dim);
     }
 
    public:
@@ -312,12 +337,15 @@ class HNSW {
     HNSW(HNSW&&) = delete;
     HNSW& operator=(HNSW&&) = delete;
     PID getMetadataPid() const { return metadata_pid; }
+    size_t getDim() const { return Dim; }
 
     // Get buffer manager statistics
     u64 getBufferManagerAllocCount() const;
 
     // Print comprehensive index information
     std::string getIndexInfo() const;
+
+    bool wasRecovered() const { return recovered_from_disk_; }
 
    private:
     // --- Internal Helper Classes & Functions ---
@@ -356,12 +384,12 @@ class HNSW {
 
         static inline u32 getL0NeighborOffset(HNSW* hnsw, u32 graph_node_id) {
             return HNSWPage::HeaderSize + hnsw->getNodeIndexInPage(graph_node_id) * hnsw->FixedNodeSize +
-                   VectorSize + hnsw->MaxNeighborsHeaderSize;
+                   hnsw->VectorSize + hnsw->MaxNeighborsHeaderSize;
         }
 
         const u16* getLevelCounts() const {
             const u8* node_start = page->getNodeData() + node_offset;
-            return reinterpret_cast<const u16*>(node_start + VectorSize);
+            return reinterpret_cast<const u16*>(node_start + hnsw->VectorSize);
         }
 
         std::span<const u32> getNeighbors(u32 level, const HNSW* hnsw_instance) const {
@@ -370,7 +398,7 @@ class HNSW {
                 // directly return level 0 neighbors
                 const u8* node_start = page->getNodeData() + node_offset;
                 const u32* neighbor_ids_start =
-                    reinterpret_cast<const u32*>(node_start + VectorSize + hnsw_instance->MaxNeighborsHeaderSize);
+                    reinterpret_cast<const u32*>(node_start + hnsw_instance->VectorSize + hnsw_instance->MaxNeighborsHeaderSize);
                 u16 count_for_level = getLevelCounts()[0];
                 return {neighbor_ids_start, count_for_level};
             }
@@ -388,7 +416,7 @@ class HNSW {
 
             const u8* node_start = page->getNodeData() + node_offset;
             const u32* neighbor_ids_start =
-                reinterpret_cast<const u32*>(node_start + VectorSize + hnsw_instance->MaxNeighborsHeaderSize);
+                reinterpret_cast<const u32*>(node_start + hnsw_instance->VectorSize + hnsw_instance->MaxNeighborsHeaderSize);
             const u32* level_start_ptr = neighbor_ids_start + level_neighbor_offset_count;
             u16 count_for_level = counts_per_level[level];
             return {level_start_ptr, count_for_level};
@@ -419,12 +447,12 @@ class HNSW {
 
         u16* getLevelCounts() {
             u8* node_start = page->getNodeData() + node_offset;
-            return reinterpret_cast<u16*>(node_start + VectorSize);
+            return reinterpret_cast<u16*>(node_start + hnsw->VectorSize);
         }
 
         const u16* getLevelCounts() const {
             const u8* node_start = page->getNodeData() + node_offset;
-            return reinterpret_cast<const u16*>(node_start + VectorSize);
+            return reinterpret_cast<const u16*>(node_start + hnsw->VectorSize);
         }
 
         std::span<const u32> getNeighbors(u32 level, const HNSW* hnsw_instance) const {
@@ -441,7 +469,7 @@ class HNSW {
 
             const u8* node_start = page->getNodeData() + node_offset;
             const u32* neighbor_ids_start =
-                reinterpret_cast<const u32*>(node_start + VectorSize + hnsw_instance->MaxNeighborsHeaderSize);
+                reinterpret_cast<const u32*>(node_start + hnsw_instance->VectorSize + hnsw_instance->MaxNeighborsHeaderSize);
             const u32* level_start_ptr = neighbor_ids_start + level_neighbor_offset_count;
             u16 count_for_level = counts_per_level[level];
             return {level_start_ptr, count_for_level};
@@ -461,7 +489,7 @@ class HNSW {
 
             u8* node_start = page->getNodeData() + node_offset;
             u32* neighbor_ids_start =
-                reinterpret_cast<u32*>(node_start + VectorSize + hnsw_instance->MaxNeighborsHeaderSize);
+                reinterpret_cast<u32*>(node_start + hnsw_instance->VectorSize + hnsw_instance->MaxNeighborsHeaderSize);
             u32* level_start_ptr = neighbor_ids_start + level_neighbor_offset_count;
             size_t M_level = (level == 0) ? hnsw_instance->M0 : hnsw_instance->M;
 
@@ -494,7 +522,7 @@ class HNSW {
 
             u8* node_start = page->getNodeData() + node_offset;
             u32* neighbor_ids_start =
-                reinterpret_cast<u32*>(node_start + VectorSize + hnsw_instance->MaxNeighborsHeaderSize);
+                reinterpret_cast<u32*>(node_start + hnsw_instance->VectorSize + hnsw_instance->MaxNeighborsHeaderSize);
 
             // Get the pointer to the exact location to append the new neighbor
             u32* append_location = neighbor_ids_start + level_neighbor_offset_count + current_count;
