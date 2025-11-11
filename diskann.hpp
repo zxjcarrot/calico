@@ -246,6 +246,15 @@ class DiskANN : public DiskANNBase {
     mutable std::unique_ptr<ThreadPool> _thread_pool;
     mutable std::mutex _pool_mutex;
 
+    // Thread pools for parallel operations - reused across calls
+    mutable std::unique_ptr<class ThreadPool> search_thread_pool_{nullptr};
+    mutable size_t search_pool_size_{0};
+    mutable std::mutex search_pool_mutex_;
+
+    mutable std::unique_ptr<class ThreadPool> add_thread_pool_{nullptr};
+    mutable size_t add_pool_size_{0};
+    mutable std::mutex add_pool_mutex_;
+
    private:
     inline PID getNodePID(uint32_t node_id) const;
     inline uint32_t getNodeIndexInPage(uint32_t node_id) const;
@@ -282,6 +291,10 @@ class DiskANN : public DiskANNBase {
     void connect_neighbors_batched(uint32_t node_id, const std::vector<uint32_t>& neighbors, const BuildParams& params,
                                    bool filter_aware);
     void compute_medoids(uint64_t num_points);
+
+    // Helper method to get or create thread pool
+    class ThreadPool* getOrCreateSearchPool(size_t num_threads) const;
+    class ThreadPool* getOrCreateAddPool(size_t num_threads) const;
 };
 
 #endif  // DISKANN_HPP

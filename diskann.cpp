@@ -154,6 +154,27 @@ DiskANN<T, TagT, Dim, MaxTagsPerNode>::~DiskANN() {}
 // BATCH DATA ACCESS HELPERS (OPTIMIZED)
 // =========================================================================
 
+// --- Helper methods to get or create thread pools ---
+template <typename T, typename TagT, size_t Dim, size_t MaxTagsPerNode>
+ThreadPool* DiskANN<T, TagT, Dim, MaxTagsPerNode>::getOrCreateSearchPool(size_t num_threads) const {
+    std::lock_guard<std::mutex> lock(search_pool_mutex_);
+    if (!search_thread_pool_ || search_pool_size_ != num_threads) {
+        search_thread_pool_.reset(new ThreadPool(num_threads));
+        search_pool_size_ = num_threads;
+    }
+    return search_thread_pool_.get();
+}
+
+template <typename T, typename TagT, size_t Dim, size_t MaxTagsPerNode>
+ThreadPool* DiskANN<T, TagT, Dim, MaxTagsPerNode>::getOrCreateAddPool(size_t num_threads) const {
+    std::lock_guard<std::mutex> lock(add_pool_mutex_);
+    if (!add_thread_pool_ || add_pool_size_ != num_threads) {
+        add_thread_pool_.reset(new ThreadPool(num_threads));
+        add_pool_size_ = num_threads;
+    }
+    return add_thread_pool_.get();
+}
+
 template <typename T, typename TagT, size_t Dim, size_t MaxTagsPerNode>
 bool DiskANN<T, TagT, Dim, MaxTagsPerNode>::get_nodes_data_batch(const std::vector<uint32_t>& ids,
                                                                  NodeDataBatch& data_batch) const {
@@ -297,7 +318,9 @@ std::vector<std::pair<float, uint32_t>> DiskANN<T, TagT, Dim, MaxTagsPerNode>::g
         unvisited_neighbors_ids.clear();
         unvisited_neighbors_ids.reserve(all_neighbors_from_beam.size());
         for (uint32_t neighbor_id : all_neighbors_from_beam) {
-            if (!_deleted_nodes.contains(neighbor_id) && visited_nodes->try_visit(neighbor_id)) {
+            // if (!_deleted_nodes.contains(neighbor_id) && visited_nodes->try_visit(neighbor_id)) { // if need to
+            // support delete, then add similar logic here, but need to optimize performance
+            if (visited_nodes->try_visit(neighbor_id)) {
                 unvisited_neighbors_ids.push_back(neighbor_id);
             }
         }
@@ -777,7 +800,6 @@ std::vector<std::pair<float, uint32_t>> DiskANN<T, TagT, Dim, MaxTagsPerNode>::s
         }
     }
     auto internal_results = greedy_search_final(start_node_id, start_node_vec, query, K, params, nullptr);
-    std::shared_lock<std::shared_mutex> lock(_map_lock);
     for (auto& pair : internal_results) {
         if (pair.second < _internal_to_external_map.size()) {
             pair.second = _internal_to_external_map[pair.second];
@@ -810,7 +832,6 @@ std::vector<std::pair<float, uint32_t>> DiskANN<T, TagT, Dim, MaxTagsPerNode>::s
         start_node_vec = cache_it->second.data();
     }
     auto internal_results = greedy_search_final(start_node_id, start_node_vec, query, K, params, &filter_label);
-    std::shared_lock<std::shared_mutex> lock(_map_lock);
     for (auto& pair : internal_results) {
         if (pair.second < _internal_to_external_map.size()) {
             pair.second = _internal_to_external_map[pair.second];
@@ -1040,16 +1061,83 @@ std::vector<std::vector<std::pair<float, uint32_t>>> DiskANN<T, TagT, Dim, MaxTa
     const void* queries, size_t num_queries, size_t K, const SearchParams& params, size_t num_threads) {
     return search_parallel_typed(static_cast<const T*>(queries), num_queries, K, params, num_threads);
 }
+
 template <typename T, typename TagT, size_t Dim, size_t MaxTagsPerNode>
 std::vector<std::vector<std::pair<float, uint32_t>>> DiskANN<T, TagT, Dim, MaxTagsPerNode>::search_parallel_typed(
     const T* queries_typed, size_t num_queries, size_t K, const SearchParams& params, size_t num_threads) {
     std::vector<std::vector<std::pair<float, uint32_t>>> all_results(num_queries);
     if (num_queries == 0) return all_results;
-    size_t threads_to_use = (num_threads == 0) ? omp_get_max_threads() : num_threads;
-#pragma omp parallel for num_threads(threads_to_use)
-    for (size_t i = 0; i < num_queries; ++i) all_results[i] = search_typed(queries_typed + i * Dim, K, params);
+
+    uint32_t num_points = 0;
+    for (;;) {
+        try {
+            GuardO<DiskANNMetadataPage> meta_guard(_metadata_pid);
+            if (meta_guard->node_count == 0) return all_results;
+            num_points = static_cast<uint32_t>(meta_guard->node_count);
+            if (_medoids.empty()) {
+                compute_medoids(meta_guard->node_count);
+            }
+            break;
+        } catch (const OLCRestartException&) {
+            continue;
+        }
+    }
+
+    const size_t threads_to_use = (num_threads == 0) ? omp_get_max_threads() : num_threads;
+
+    std::vector<uint32_t> entry_points;
+    entry_points.reserve(threads_to_use);
+    if (!_medoids.empty()) {
+        for (const auto& kv : _medoids) {
+            if (entry_points.size() == threads_to_use) break;
+            entry_points.push_back(kv.second);
+        }
+    }
+    if (entry_points.size() < threads_to_use) {
+        std::mt19937 rng(1001);
+        std::uniform_int_distribution<uint32_t> dist(0, num_points - 1);
+        while (entry_points.size() < threads_to_use) entry_points.push_back(dist(rng));
+    }
+
+    std::vector<std::vector<T, AlignedAllocator<T, 32>>> entry_point_vectors(entry_points.size());
+    for (size_t i = 0; i < entry_points.size(); ++i) {
+        entry_point_vectors[i].resize(Dim);
+        getNodeVector(entry_points[i], entry_point_vectors[i].data());
+    }
+
+#pragma omp parallel num_threads(threads_to_use)
+    {
+        const size_t tid = static_cast<size_t>(omp_get_thread_num());
+        const size_t nT = static_cast<size_t>(omp_get_num_threads());
+
+        const size_t chunk = (num_queries + nT - 1) / nT;  // 向上取整
+        const size_t beg = tid * chunk;
+        const size_t end = std::min(num_queries, beg + chunk);
+
+        // 每线程固定一个起点与向量，减少起始竞争
+        const uint32_t start_node_id = entry_points[tid % entry_points.size()];
+        const T* start_node_vec = entry_point_vectors[tid % entry_point_vectors.size()].data();
+
+        for (size_t i = beg; i < end; ++i) {
+            // 核心搜索（完全锁无关）
+            auto res = greedy_search_final(start_node_id, start_node_vec, queries_typed + i * Dim, K, params,
+                                           /*filter_label=*/nullptr);
+
+            // 直接在本线程内完成 external 映射，避免第二个并行区
+            if (!_internal_to_external_map.empty()) {
+                for (auto& p : res) {
+                    if (p.second < _internal_to_external_map.size()) {
+                        p.second = _internal_to_external_map[p.second];
+                    }
+                }
+            }
+            all_results[i] = std::move(res);
+        }
+    }
+
     return all_results;
 }
+
 template <typename T, typename TagT, size_t Dim, size_t MaxTagsPerNode>
 std::vector<std::vector<std::pair<float, uint32_t>>> DiskANN<T, TagT, Dim, MaxTagsPerNode>::search_with_filter_parallel(
     const void* queries, size_t num_queries, uint32_t filter_label, size_t K, const SearchParams& params,
@@ -1065,10 +1153,42 @@ DiskANN<T, TagT, Dim, MaxTagsPerNode>::search_with_filter_parallel_typed(const T
                                                                          size_t num_threads) {
     std::vector<std::vector<std::pair<float, uint32_t>>> all_results(num_queries);
     if (num_queries == 0) return all_results;
+
+    // --- STAGE 1: SERIAL SETUP (ACQUIRE LOCKS ONCE) ---
+    uint32_t start_node_id;
+    const T* start_node_vec = nullptr;
+    // No need for OLCRestart loop here as medoid maps are read-only during search
+    auto it = _medoids.find(filter_label);
+    if (it == _medoids.end()) {
+        it = _medoids.find(0);
+        if (it == _medoids.end() && !_medoids.empty()) it = _medoids.begin();
+        if (it == _medoids.end()) return {};
+    }
+    start_node_id = it->second;
+    auto cache_it = _medoid_vectors_cache.find(it->first);
+    if (cache_it != _medoid_vectors_cache.end()) {
+        start_node_vec = cache_it->second.data();
+    }
+
+    // --- STAGE 2: PARALLEL COMPUTE (ENTIRELY LOCK-FREE) ---
     size_t threads_to_use = (num_threads == 0) ? omp_get_max_threads() : num_threads;
-#pragma omp parallel for num_threads(threads_to_use)
-    for (size_t i = 0; i < num_queries; ++i)
-        all_results[i] = search_with_filter_typed(queries_typed + i * Dim, filter_label, K, params);
+#pragma omp parallel for num_threads(threads_to_use) schedule(dynamic)
+    for (size_t i = 0; i < num_queries; ++i) {
+        all_results[i] =
+            greedy_search_final(start_node_id, start_node_vec, queries_typed + i * Dim, K, params, &filter_label);
+    }
+
+    if (!_internal_to_external_map.empty()) {
+#pragma omp parallel for num_threads(threads_to_use) schedule(dynamic)
+        for (size_t i = 0; i < num_queries; ++i) {
+            for (auto& pair : all_results[i]) {
+                if (pair.second < _internal_to_external_map.size()) {
+                    pair.second = _internal_to_external_map[pair.second];
+                }
+            }
+        }
+    }
+
     return all_results;
 }
 

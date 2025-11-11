@@ -57,9 +57,21 @@ def run_calico_profile(X_base, X_query, params, num_threads, pause):
     print("Calico index build complete.")
     build_time = time.time() - start_time
     print(f"Build time: {build_time:.4f} seconds")
+    
+    print("Warming up memory mappings...")
+    start_warmup = time.time()
+    X_query_float32 = np.ascontiguousarray(X_query, dtype=np.float32)
+    # Create a dummy query and search for it. A single search will touch many pages.
+    # Running it a few times with different queries can help warm up more of the graph.
+    # Alternatively, you can write a dedicated C++ function to just iterate
+    # through the raw buffer. But a dummy search is often easiest.
+    dummy_search_params = calico_py.SearchParams(L_search=params["L_search"])
+    for i in range(10): # Run a few dummy searches to touch different parts of the graph
+        index.search(X_query_float32[i], 1, dummy_search_params) # Note: search_knn is the single-threaded version
+    print(f"Memory warm-up finished in {time.time() - start_warmup:.4f}s")
 
     # Prepare search data
-    X_query_float32 = np.ascontiguousarray(X_query, dtype=np.float32)
+   
     search_params = calico_py.SearchParams(L_search=params["L_search"])
     k = params["k"]
 
