@@ -145,7 +145,20 @@ def run_official_full_profile(args, params):
     start_time = time.time()
     
     # Note: We build in-memory to mirror the Calico workflow
-    diskannpy.build_memory_index(
+    # diskannpy.build_memory_index(
+    #     data=X_base_float32,
+    #     distance_metric="l2",
+    #     vector_dtype=np.float32,
+    #     index_directory=index_dir,
+    #     index_prefix="sift_diskann",
+    #     complexity=params["L_build"],
+    #     graph_degree=params["R"],
+    #     alpha=params["alpha"],
+    #     num_threads=args.threads,
+    #     use_pq_build=False,
+    #     use_opq=False,
+    # )
+    diskannpy.build_disk_index(
         data=X_base_float32,
         distance_metric="l2",
         vector_dtype=np.float32,
@@ -153,21 +166,29 @@ def run_official_full_profile(args, params):
         index_prefix="sift_diskann",
         complexity=params["L_build"],
         graph_degree=params["R"],
-        alpha=params["alpha"],
         num_threads=args.threads,
-        use_pq_build=False,
-        use_opq=False,
+        pq_disk_bytes=256,
+        search_memory_maximum=16,
+        build_memory_maximum=16,
     )
     build_time = time.time() - start_time
     print(f"Official DiskANN in-memory build finished in {build_time:.4f}s.")
     print("Loading Official DiskANN index from disk...")
-    index = diskannpy.StaticMemoryIndex(
+    # index = diskannpy.StaticMemoryIndex(
+    #     distance_metric="l2",
+    #     vector_dtype=np.float32,
+    #     index_directory=index_dir,
+    #     index_prefix="sift_diskann",
+    #     num_threads=args.threads,
+    #     initial_search_complexity=params["L_search"],
+    # )
+    index = diskannpy.StaticDiskIndex(
         distance_metric="l2",
         vector_dtype=np.float32,
         index_directory=index_dir,
         index_prefix="sift_diskann",
         num_threads=args.threads,
-        initial_search_complexity=params["L_search"],
+        num_nodes_to_cache=1000000000
     )
     # --- Part 2: Search Preparation ---
     print("Loading query data for search...")
