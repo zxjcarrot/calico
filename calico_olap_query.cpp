@@ -9,6 +9,10 @@
 #include <cassert>
 #include <chrono>
 #include <cmath>
+
+// Global configuration for row size (initialized from environment variable)
+static size_t g_numColumns = 10;  // Default: 10 columns × 8 bytes = 80 bytes per row
+static size_t g_rowSize = 80;     // Default row size in bytes
 #include <fstream>
 #include <iostream>
 #include <numeric>
@@ -73,9 +77,10 @@ struct OLAPPageColumnar {
     // Header is 64 bytes, so data size is pageSize - 64
     static constexpr size_t headerSize = 64;
     static constexpr size_t dataSize = pageSize - headerSize;  
-    static constexpr size_t numColumns = 10;  
-    static constexpr size_t recordSize = sizeof(u64) * numColumns;  
-    static constexpr size_t maxRecords() { return dataSize / recordSize; }
+    // numColumns and recordSize are now configurable via g_numColumns and g_rowSize
+    static size_t numColumns() { return g_numColumns; }
+    static size_t recordSize() { return g_rowSize; }
+    static size_t maxRecords() { return dataSize / g_rowSize; }
 
     u8 data[dataSize];
     
@@ -114,24 +119,29 @@ struct OLAPPageRow {
     // Header is 64 bytes
     static constexpr size_t headerSize = 64;
     static constexpr size_t dataSize = pageSize - headerSize;
-    static constexpr size_t numColumns = 10;
     
     // Row-oriented tuple structure
     struct Tuple {
-        u64 columns[numColumns];  // All 10 columns in a single tuple
+        u64 columns[128];  // Maximum: 4096 bytes / 8 bytes per u64 = 512 u64s, use 128 for safety
+        
+        // Access column by index (only first g_numColumns are valid)
+        u64& operator[](size_t idx) { return columns[idx]; }
+        const u64& operator[](size_t idx) const { return columns[idx]; }
     };
     
-    static constexpr size_t tupleSize = sizeof(Tuple);
-    static constexpr size_t maxRecords() { return dataSize / tupleSize; }
+    // numColumns and tupleSize are now configurable
+    static size_t numColumns() { return g_numColumns; }
+    static size_t tupleSize() { return g_rowSize; }
+    static size_t maxRecords() { return dataSize / g_rowSize; }
     
     u8 data[dataSize];
     
     // Row accessor - get tuple at index
     Tuple* tuple(size_t idx) {
-        return reinterpret_cast<Tuple*>(data + idx * tupleSize);
+        return reinterpret_cast<Tuple*>(data + idx * tupleSize());
     }
     const Tuple* tuple(size_t idx) const {
-        return reinterpret_cast<const Tuple*>(data + idx * tupleSize);
+        return reinterpret_cast<const Tuple*>(data + idx * tupleSize());
     }
 };
 
@@ -184,8 +194,8 @@ PID initializePagesColumnar(u64 numPages, unsigned nthreads) {
         page->pageId = i;
         page->sumValue = 0;
 
-        // Initialize records in columnar layout - 10 columns per tuple
-        for (size_t colIdx = 0; colIdx < OLAPPageColumnar::numColumns; colIdx++) {
+        // Initialize records in columnar layout - configurable number of columns per tuple
+        for (size_t colIdx = 0; colIdx < OLAPPageColumnar::numColumns(); colIdx++) {
             u64* col = page->column(colIdx);
             for (size_t j = 0; j < OLAPPageColumnar::maxRecords(); j++) {
                 if (colIdx == 0) {
@@ -240,10 +250,10 @@ PID initializePagesRow(u64 numPages, unsigned nthreads) {
         page->pageId = i;
         page->sumValue = 0;
 
-        // Initialize records in row-oriented layout - each tuple has 10 columns
+        // Initialize records in row-oriented layout - configurable number of columns per tuple
         for (size_t j = 0; j < OLAPPageRow::maxRecords(); j++) {
             OLAPPageRow::Tuple* t = page->tuple(j);
-            for (size_t colIdx = 0; colIdx < OLAPPageRow::numColumns; colIdx++) {
+            for (size_t colIdx = 0; colIdx < OLAPPageRow::numColumns(); colIdx++) {
                 if (colIdx == 0) {
                     // Column 0: unique key
                     t->columns[colIdx] = i * OLAPPageRow::maxRecords() + j;
@@ -683,6 +693,24 @@ void runOLAPBenchmark(const OLAPConfig& config, PID firstPageId) {
 }
 
 int main(int argc, char** argv) {
+    // Initialize row size configuration from environment variable
+    g_rowSize = envOr("ROWSIZE", 80ul);  // Default: 80 bytes per row
+    
+    // Validate row size
+    if (g_rowSize < 8 || g_rowSize > 4096) {
+        cerr << "Error: ROWSIZE must be between 8 and 4096 bytes" << endl;
+        return 1;
+    }
+    if (g_rowSize % 8 != 0) {
+        cerr << "Error: ROWSIZE must be a multiple of 8 bytes" << endl;
+        return 1;
+    }
+    
+    // Calculate number of columns based on row size
+    g_numColumns = g_rowSize / sizeof(u64);
+    
+    cerr << "Row configuration: size=" << g_rowSize << "B, columns=" << g_numColumns << endl;
+    
     // Read configuration from environment variables
     OLAPConfig config;
     config.numPages = envOr("NUMPAGES", 1000000ul);

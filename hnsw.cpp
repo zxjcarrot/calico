@@ -21,8 +21,8 @@
 
 
 // --- Helper methods to get or create thread pools ---
-template <size_t Dim, typename DistanceMetric>
-ThreadPool* HNSW<Dim, DistanceMetric>::getOrCreateSearchPool(size_t num_threads) const {
+template <typename DistanceMetric>
+ThreadPool* HNSW<DistanceMetric>::getOrCreateSearchPool(size_t num_threads) const {
     std::lock_guard<std::mutex> lock(search_pool_mutex_);
     if (!search_thread_pool_ || search_pool_size_ != num_threads) {
         search_thread_pool_.reset(new ThreadPool(num_threads));
@@ -31,8 +31,8 @@ ThreadPool* HNSW<Dim, DistanceMetric>::getOrCreateSearchPool(size_t num_threads)
     return search_thread_pool_.get();
 }
 
-template <size_t Dim, typename DistanceMetric>
-ThreadPool* HNSW<Dim, DistanceMetric>::getOrCreateAddPool(size_t num_threads) const {
+template <typename DistanceMetric>
+ThreadPool* HNSW<DistanceMetric>::getOrCreateAddPool(size_t num_threads) const {
     std::lock_guard<std::mutex> lock(add_pool_mutex_);
     if (!add_thread_pool_ || add_pool_size_ != num_threads) {
         add_thread_pool_.reset(new ThreadPool(num_threads));
@@ -42,8 +42,8 @@ ThreadPool* HNSW<Dim, DistanceMetric>::getOrCreateAddPool(size_t num_threads) co
 }
 
 // --- Helper function to estimate MaxLevel ---
-template <size_t Dim, typename DistanceMetric>
-size_t HNSW<Dim, DistanceMetric>::estimateMaxLevel(u64 max_elements, size_t M) {
+template <typename DistanceMetric>
+size_t HNSW<DistanceMetric>::estimateMaxLevel(u64 max_elements, size_t M) {
     // The random level generation uses: level = -log(uniform_random) / log(M)
     // For max_elements, the expected maximum level is approximately log(max_elements) / log(M)
     if (max_elements <= 1) return 1;
@@ -57,70 +57,207 @@ size_t HNSW<Dim, DistanceMetric>::estimateMaxLevel(u64 max_elements, size_t M) {
 }
 
 // --- HNSW Constructor Implementation ---
-template <size_t Dim, typename DistanceMetric>
-HNSW<Dim, DistanceMetric>::HNSW(u64 max_elements, size_t M_param, size_t ef_construction_param, bool enable_prefetch_param)
-    : M(M_param),
-      M0(2 * M_param),  // M0 = 2 * M as requested
-      efConstruction(ef_construction_param),
-      MaxLevel(estimateMaxLevel(max_elements, M_param)),
-      MaxNeighborsHeaderSize(MaxLevel * sizeof(u16)),
-      MaxNeighborsListSize((M0 + (MaxLevel - 1) * M) * sizeof(u32)),
-      FixedNodeSize(VectorSize + MaxNeighborsHeaderSize + MaxNeighborsListSize),
-      MaxNodesPerPage((pageSize - HNSWPage::HeaderSize) / FixedNodeSize),
-      NodesPerPage(MaxNodesPerPage),
-      enable_prefetch_(enable_prefetch_param) {
+template <typename DistanceMetric>
+HNSW<DistanceMetric>::HNSW(u64 max_elements, size_t dim, size_t M_param, size_t ef_construction_param,
+                           bool enable_prefetch_param, bool skip_recovery_param)
+        : Dim(dim),
+          M(M_param),
+          M0(2 * M_param),  // M0 = 2 * M as requested
+          efConstruction(ef_construction_param),
+          MaxLevel(estimateMaxLevel(max_elements, M_param)),
+          MaxNeighborsHeaderSize(MaxLevel * sizeof(u16)),
+          MaxNeighborsListSize((M0 + (MaxLevel - 1) * M) * sizeof(u32)),
+          VectorSize(dim * sizeof(float)),
+          FixedNodeSize(VectorSize + MaxNeighborsHeaderSize + MaxNeighborsListSize),
+          MaxNodesPerPage((pageSize - HNSWPage::HeaderSize) / FixedNodeSize),
+          NodesPerPage(MaxNodesPerPage),
+          enable_prefetch_(enable_prefetch_param) {
+    if (Dim == 0) {
+        throw std::runtime_error("HNSW dimension must be greater than zero.");
+    }
+
+    printf("HNSW Initialization: Dim=%zu, M=%zu, M0=%zu, efConstruction=%zu, MaxLevel=%zu, FixedNodeSize=%zu bytes, NodesPerPage=%zu\n",
+           Dim, M, M0, efConstruction, MaxLevel, FixedNodeSize, MaxNodesPerPage);
     // Validate that we can fit at least one node per page
     if (MaxNodesPerPage == 0) {
         throw std::runtime_error(
             "Page size is too small to fit even one node with the given parameters. "
             "Consider reducing M or vector dimension.");
     }
-    visited_list_pool_ = std::unique_ptr<VisitedListPool>(new VisitedListPool(1, max_elements));
-
-    AllocGuard<HNSWMetadataPage> meta_guard;
-    this->metadata_pid = meta_guard.pid;
-
     this->max_elements_ = max_elements;
     mult_factor = 1.0 / std::log(1.0 * M);
+    recovered_from_disk_ = false;
 
-    meta_guard->dirty = false;
-    meta_guard->base_pid = -1;
-    meta_guard->max_elements = max_elements;
-    meta_guard->node_count.store(0);
-    meta_guard->enter_point_node_id = HNSWMetadataPage::invalid_node_id;
-    meta_guard->max_level.store(0);
+    GuardX<MetaDataPage> meta_page_guard(metadataPageId);
+    MetaDataPage* meta_page_ptr = meta_page_guard.ptr;
+    HNSWMetaInfo* meta_info = &meta_page_ptr->hnsw_meta;
+    const bool has_existing_meta = meta_info->isValid();
+    const bool params_match = has_existing_meta &&
+                              meta_info->max_elements == max_elements && meta_info->dim == Dim && meta_info->M == M &&
+                              meta_info->ef_construction == efConstruction &&
+                              meta_info->max_level == MaxLevel &&
+                              meta_info->enable_prefetch == static_cast<u8>(enable_prefetch_param);
 
-    u64 total_pages = (max_elements + NodesPerPage - 1) / NodesPerPage;
-    if (total_pages > 0) {
-        AllocGuard<HNSWPage> first_page_guard;
-        meta_guard->base_pid = first_page_guard.pid;
-        first_page_guard->dirty = false;
-        first_page_guard->node_count = 0;
-        first_page_guard->dirty = true;
-
-        for (u64 i = 1; i < total_pages; ++i) {
-            AllocGuard<HNSWPage> page_guard;
-            page_guard->dirty = false;
-            page_guard->node_count = 0;
-            page_guard->dirty = true;
+    std::cout << "[HNSW Recovery] skip_recovery=" << (skip_recovery_param ? "true" : "false")
+              << " has_existing_meta=" << (has_existing_meta ? "true" : "false") << std::endl;
+    if (has_existing_meta) {
+    std::cout << "[HNSW Recovery] stored meta: max_elements=" << meta_info->max_elements
+          << " dim=" << meta_info->dim << " M=" << meta_info->M
+          << " ef_construction=" << meta_info->ef_construction
+          << " max_level=" << meta_info->max_level
+          << " enable_prefetch=" << static_cast<u32>(meta_info->enable_prefetch)
+          << " metadata_pid=" << meta_info->metadata_pid
+          << " base_pid=" << meta_info->base_pid
+          << " valid_flag=" << static_cast<u32>(meta_info->valid) << std::endl;
+    }
+    std::cout << "[HNSW Recovery] params_match=" << (params_match ? "true" : "false") << std::endl;
+    if (has_existing_meta && !params_match) {
+        if (meta_info->max_elements != max_elements) {
+            std::cout << "[HNSW Recovery] mismatch: stored max_elements=" << meta_info->max_elements
+                      << " requested=" << max_elements << std::endl;
+        }
+        if (meta_info->dim != Dim) {
+            std::cout << "[HNSW Recovery] mismatch: stored dim=" << meta_info->dim << " requested=" << Dim
+                      << std::endl;
+        }
+        if (meta_info->M != M) {
+            std::cout << "[HNSW Recovery] mismatch: stored M=" << meta_info->M << " requested=" << M << std::endl;
+        }
+        if (meta_info->ef_construction != efConstruction) {
+            std::cout << "[HNSW Recovery] mismatch: stored ef_construction=" << meta_info->ef_construction
+                      << " requested=" << efConstruction << std::endl;
+        }
+        if (meta_info->max_level != MaxLevel) {
+            std::cout << "[HNSW Recovery] mismatch: stored max_level=" << meta_info->max_level
+                      << " requested=" << MaxLevel << std::endl;
+        }
+        if (meta_info->enable_prefetch != static_cast<u8>(enable_prefetch_param)) {
+            std::cout << "[HNSW Recovery] mismatch: stored enable_prefetch="
+                      << static_cast<u32>(meta_info->enable_prefetch)
+                      << " requested=" << (enable_prefetch_param ? 1 : 0) << std::endl;
         }
     }
 
-    this->base_pid = meta_guard->base_pid;
-    meta_guard->dirty = true;
+    bool recovered = false;
+    if (!skip_recovery_param && params_match) {
+        this->metadata_pid = meta_info->metadata_pid;
+        this->base_pid = meta_info->base_pid;
+        this->max_elements_ = meta_info->max_elements;
+        recovered = true;
+        recovered_from_disk_ = true;
+        std::cout << "[HNSW Recovery] Recovered existing index. metadata_pid=" << this->metadata_pid
+                  << " base_pid=" << this->base_pid << std::endl;
+        try {
+            GuardO<HNSWMetadataPage> meta_guard(this->metadata_pid);
+            auto persisted_nodes = meta_guard->node_count.load(std::memory_order_acquire);
+            auto persisted_level = meta_guard->max_level.load(std::memory_order_acquire);
+            std::cout << "[HNSW Recovery] persisted node_count=" << persisted_nodes
+                      << " max_level=" << persisted_level
+                      << " entry_point=" << meta_guard->enter_point_node_id << std::endl;
+        } catch (const OLCRestartException&) {
+            std::cout << "[HNSW Recovery] metadata read retry failed during logging" << std::endl;
+        }
+    } else {
+        if (has_existing_meta) {
+            meta_info->valid = 0;
+            meta_page_guard->dirty = true;
+            std::cout << "[HNSW Recovery] Existing metadata invalidated for rebuild" << std::endl;
+        }
+
+        const bool can_reuse_storage = has_existing_meta && meta_info->dim == Dim && meta_info->M == M &&
+                                       meta_info->ef_construction == efConstruction &&
+                                       meta_info->max_level == MaxLevel && meta_info->max_elements >= max_elements;
+        std::cout << "[HNSW Recovery] can_reuse_storage=" << (can_reuse_storage ? "true" : "false")
+                  << std::endl;
+
+        if (can_reuse_storage && meta_info->metadata_pid != BufferManager::invalidPID &&
+            meta_info->base_pid != BufferManager::invalidPID) {
+            this->metadata_pid = meta_info->metadata_pid;
+            this->base_pid = meta_info->base_pid;
+
+            GuardX<HNSWMetadataPage> meta_guard(this->metadata_pid);
+            meta_guard->max_elements = max_elements;
+            meta_guard->node_count.store(0);
+            meta_guard->enter_point_node_id = HNSWMetadataPage::invalid_node_id;
+            meta_guard->max_level.store(0);
+            meta_guard->dirty = true;
+            std::cout << "[HNSW Recovery] Reusing metadata page " << this->metadata_pid << " and base_pid "
+                      << this->base_pid << "; counters reset" << std::endl;
+
+            u64 total_pages = (max_elements + NodesPerPage - 1) / NodesPerPage;
+            for (u64 i = 0; i < total_pages; ++i) {
+                GuardX<HNSWPage> page_guard(this->base_pid + i);
+                page_guard->node_count = 0;
+                page_guard->dirty = true;
+            }
+            std::cout << "[HNSW Recovery] Reset " << total_pages << " data pages" << std::endl;
+        } else {
+            meta_page_guard.release();
+
+            AllocGuard<HNSWMetadataPage> meta_guard;
+            this->metadata_pid = meta_guard.pid;
+
+            meta_guard->dirty = false;
+            meta_guard->base_pid = -1;
+            meta_guard->max_elements = max_elements;
+            meta_guard->node_count.store(0);
+            meta_guard->enter_point_node_id = HNSWMetadataPage::invalid_node_id;
+            meta_guard->max_level.store(0);
+
+            u64 total_pages = (max_elements + NodesPerPage - 1) / NodesPerPage;
+            if (total_pages > 0) {
+                AllocGuard<HNSWPage> first_page_guard;
+                meta_guard->base_pid = first_page_guard.pid;
+                first_page_guard->dirty = false;
+                first_page_guard->node_count = 0;
+                first_page_guard->dirty = true;
+
+                for (u64 i = 1; i < total_pages; ++i) {
+                    AllocGuard<HNSWPage> page_guard;
+                    page_guard->dirty = false;
+                    page_guard->node_count = 0;
+                    page_guard->dirty = true;
+                }
+            }
+
+            this->base_pid = meta_guard->base_pid;
+            meta_guard->dirty = true;
+            std::cout << "[HNSW Recovery] Allocated new metadata page " << this->metadata_pid
+                      << " base_pid=" << this->base_pid << " total_pages=" << total_pages << std::endl;
+
+            meta_page_guard = GuardX<MetaDataPage>(metadataPageId);
+            meta_page_ptr = meta_page_guard.ptr;
+            meta_info = &meta_page_ptr->hnsw_meta;
+        }
+
+        meta_info->magic_value = HNSWMetaInfo::magic;
+        meta_info->metadata_pid = this->metadata_pid;
+        meta_info->base_pid = this->base_pid;
+        meta_info->max_elements = this->max_elements_;
+        meta_info->dim = Dim;
+        meta_info->M = M;
+        meta_info->ef_construction = efConstruction;
+        meta_info->max_level = MaxLevel;
+        meta_info->enable_prefetch = static_cast<u8>(enable_prefetch_param);
+        meta_info->valid = 1;
+        meta_page_guard->dirty = true;
+        std::cout << "[HNSW Recovery] Metadata page updated and marked valid" << std::endl;
+    }
+
+    visited_list_pool_ = std::unique_ptr<VisitedListPool>(new VisitedListPool(4, this->max_elements_));
 }
 
 // --- HNSW Destructor Implementation ---
-template <size_t Dim, typename DistanceMetric>
-HNSW<Dim, DistanceMetric>::~HNSW() {
+template <typename DistanceMetric>
+HNSW<DistanceMetric>::~HNSW() {
     visited_list_pool_.reset(nullptr);
     search_thread_pool_.reset(nullptr);
     add_thread_pool_.reset(nullptr);
 }
 
 // --- Helper Functions (searchLayer, searchBaseLayer)---
-template <size_t Dim, typename DistanceMetric>
-u32 HNSW<Dim, DistanceMetric>::getRandomLevel() {
+template <typename DistanceMetric>
+u32 HNSW<DistanceMetric>::getRandomLevel() {
     thread_local static std::mt19937 level_generator(std::hash<std::thread::id>{}(std::this_thread::get_id()));
     //static std::default_random_engine level_generator(100);
     std::uniform_real_distribution<double> distribution(0.0, 1.0);
@@ -128,9 +265,9 @@ u32 HNSW<Dim, DistanceMetric>::getRandomLevel() {
     return std::min(static_cast<u32>(r), static_cast<u32>(MaxLevel - 1));
 }
 
-template <size_t Dim, typename DistanceMetric>
+template <typename DistanceMetric>
 template <bool stats>
-std::pair<float, u32> HNSW<Dim, DistanceMetric>::findBestEntryPointForLevel(const float* query, u32 entry_point_id, int level, float entry_point_dist) {
+std::pair<float, u32> HNSW<DistanceMetric>::findBestEntryPointForLevel(const float* query, u32 entry_point_id, int level, float entry_point_dist) {
     u32 current_node_id = entry_point_id;
     float min_dist = entry_point_dist; // Use the pre-calculated distance
 
@@ -152,7 +289,7 @@ std::pair<float, u32> HNSW<Dim, DistanceMetric>::findBestEntryPointForLevel(cons
         u32 best_neighbor_id = current_node_id;
 
         try {
-            GuardO<HNSWPage> current_page_guard(getNodePID(current_node_id));
+            GuardS<HNSWPage> current_page_guard(getNodePID(current_node_id));
             NodeAccessor current_acc(current_page_guard.ptr, getNodeIndexInPage(current_node_id), this);
 
             // The first node is marked as visited here.
@@ -199,7 +336,7 @@ std::pair<float, u32> HNSW<Dim, DistanceMetric>::findBestEntryPointForLevel(cons
 
                     float neighbor_dist;
                     if (stats) {
-                        neighbor_dist = this->calculateDistance(query, neighbor_acc.getVector(), Dim);
+                        neighbor_dist = this->calculateDistance(query, neighbor_acc.getVector());
                     } else {
                         neighbor_dist = DistanceMetric::compare(query, neighbor_acc.getVector(), Dim);
                     }
@@ -215,16 +352,16 @@ std::pair<float, u32> HNSW<Dim, DistanceMetric>::findBestEntryPointForLevel(cons
         } catch (const OLCRestartException&) {
             // If a concurrent modification happens, stop the greedy search at this level
             // and proceed with the best node found so far.
-            changed = false;
+            // changed = false;
         }
     }
 
     return {min_dist, current_node_id};
 }
 
-template <size_t Dim, typename DistanceMetric>
+template <typename DistanceMetric>
 template <bool stats>
-std::pair<float, u32> HNSW<Dim, DistanceMetric>::searchBaseLayer(const float* query, u32 entry_point_id, int start_level, int end_level) {
+std::pair<float, u32> HNSW<DistanceMetric>::searchBaseLayer(const float* query, u32 entry_point_id, int start_level, int end_level) {
     u32 current_entry_point_id = entry_point_id;
     float current_dist;
     
@@ -233,7 +370,7 @@ std::pair<float, u32> HNSW<Dim, DistanceMetric>::searchBaseLayer(const float* qu
         GuardO<HNSWPage> initial_guard(getNodePID(current_entry_point_id));
         NodeAccessor initial_acc(initial_guard.ptr, getNodeIndexInPage(current_entry_point_id), this);
         if (stats) {
-            current_dist = this->calculateDistance(query, initial_acc.getVector(), Dim);
+            current_dist = this->calculateDistance(query, initial_acc.getVector());
         } else {
             current_dist = DistanceMetric::compare(query, initial_acc.getVector(), Dim);
         }
@@ -252,9 +389,9 @@ std::pair<float, u32> HNSW<Dim, DistanceMetric>::searchBaseLayer(const float* qu
     return {current_dist, current_entry_point_id};
 }
 
-template <size_t Dim, typename DistanceMetric>
+template <typename DistanceMetric>
 template <bool stats>
-std::vector<std::pair<float, u32>> HNSW<Dim, DistanceMetric>::searchLayer(
+std::vector<std::pair<float, u32>> HNSW<DistanceMetric>::searchLayer(
     const float* query, u32 entry_point_id, u32 level, size_t ef,
     std::optional<std::pair<float, u32>> initial_entry_dist_pair) { // Added optional parameter
     
@@ -279,7 +416,7 @@ std::vector<std::pair<float, u32>> HNSW<Dim, DistanceMetric>::searchLayer(
             NodeAccessor acc(page_guard.ptr, getNodeIndexInPage(entry_point_id), this);
             float dist;
             if (stats) {
-                dist = this->calculateDistance(query, acc.getVector(), Dim);
+                dist = this->calculateDistance(query, acc.getVector());
             } else {
                 dist = DistanceMetric::compare(query, acc.getVector(), Dim);
             }
@@ -319,7 +456,13 @@ std::vector<std::pair<float, u32>> HNSW<Dim, DistanceMetric>::searchLayer(
             if (current_acc.getLevel() < level) continue;
 
             auto neighbors = current_acc.getNeighbors(level, this);
-
+            // if (!neighbors.empty() && enable_prefetch_) {
+            //     for (const u32& neighbor_id : neighbors) { 
+            //         //PageState& next_ps = bm.getPageState(getNodePID(neighbor_id));
+            //         _mm_prefetch(reinterpret_cast<const char*>(&visited_array[neighbor_id]), _MM_HINT_T2);
+            //         //_mm_prefetch(reinterpret_cast<const char*>(&next_ps), _MM_HINT_T2);
+            //     }
+            // }
             // Prefetch all neighbors' vector data at once before processing
             // only prefetch aggressively for lower levels as the top levels have exponentially fewer nodes and are likely to be cached
             if (level <= 2 && !neighbors.empty() && enable_prefetch_) {
@@ -328,13 +471,50 @@ std::vector<std::pair<float, u32>> HNSW<Dim, DistanceMetric>::searchLayer(
                 // }
                 pages_to_prefetch.clear();
                 offsets_within_pages.clear();
-                for (const u32& neighbor_id : neighbors) {
+                // unroll the following loop for better performance
+                size_t i;
+                for (i = 0; i < neighbors.size();) {
+                    const u32& neighbor_id1 = neighbors[i];
+                    if (!(visited_array[neighbor_id1] == visited_array_tag)) {
+                        pages_to_prefetch.push_back(getNodePID(neighbor_id1));
+                        offsets_within_pages.push_back(NodeAccessor::getVectorOffset(this, neighbor_id1));
+                    }
+                    const u32& neighbor_id2 = neighbors[i + 1];
+                    if (!(visited_array[neighbor_id2] == visited_array_tag)) {
+                        pages_to_prefetch.push_back(getNodePID(neighbor_id2));
+                        offsets_within_pages.push_back(NodeAccessor::getVectorOffset(this, neighbor_id2));
+                    }
+                    const u32& neighbor_id3 = neighbors[i + 2];
+                    if (!(visited_array[neighbor_id3] == visited_array_tag)) {
+                        pages_to_prefetch.push_back(getNodePID(neighbor_id3));
+                        offsets_within_pages.push_back(NodeAccessor::getVectorOffset(this, neighbor_id3));
+                    }
+                    const u32& neighbor_id4 = neighbors[i + 3];
+                    if (!(visited_array[neighbor_id4] == visited_array_tag)) {
+                        pages_to_prefetch.push_back(getNodePID(neighbor_id4));
+                        offsets_within_pages.push_back(NodeAccessor::getVectorOffset(this, neighbor_id4));
+                    }
+                    if (i + 4 >= neighbors.size()) {
+                        break;
+                    }
+                    i += 4;
+                }
+                for (; i < neighbors.size(); ++i) {
+                    const u32& neighbor_id = neighbors[i];
                     if (!(visited_array[neighbor_id] == visited_array_tag)) {
                         pages_to_prefetch.push_back(getNodePID(neighbor_id));
                         offsets_within_pages.push_back(NodeAccessor::getVectorOffset(this, neighbor_id));
                     }
                 }
+
                 bm.prefetchPages(pages_to_prefetch.data(), pages_to_prefetch.size(), offsets_within_pages.data());
+                // for (const u32& neighbor_id : neighbors) {
+                //     if (!(visited_array[neighbor_id] == visited_array_tag)) {
+                //         pages_to_prefetch.push_back(getNodePID(neighbor_id));
+                //         offsets_within_pages.push_back(NodeAccessor::getVectorOffset(this, neighbor_id));
+                //     }
+                // }
+                //bm.prefetchPages(pages_to_prefetch.data(), pages_to_prefetch.size(), offsets_within_pages.data());
             }
             // u32 next_neighbor_id = neighbors[0];
             // _mm_prefetch(reinterpret_cast<const char*>(&visited_array[next_neighbor_id]), _MM_HINT_T0);
@@ -343,12 +523,14 @@ std::vector<std::pair<float, u32>> HNSW<Dim, DistanceMetric>::searchLayer(
             // bm.prefetchPages(&page_to_prefetch, 1, &next_neighbor_off);
             for (size_t i = 0; i < neighbors.size(); ++i) {
                 const u32& neighbor_id = neighbors[i];
-                // if (i + 1 < neighbors.size()) {
+                // if (i + 1 < neighbors.size() && enable_prefetch_) {
                 //     u32 next_neighbor_id = neighbors[i + 1];
-                //     _mm_prefetch(reinterpret_cast<const char*>(&visited_array[next_neighbor_id]), _MM_HINT_T0);
+                //     //_mm_prefetch(reinterpret_cast<const char*>(&visited_array[next_neighbor_id]), _MM_HINT_T0);
                 //     PID page_to_prefetch = getNodePID(next_neighbor_id);
                 //     u32 next_neighbor_off = NodeAccessor::getVectorOffset(this, next_neighbor_id);
-                //     bm.prefetchPages(&page_to_prefetch, 1, &next_neighbor_off);
+                //     char* pg = (char*)bm.toPtr(page_to_prefetch); // ensure the page is resident
+                //     //mm_prefetch
+                //     _mm_prefetch(reinterpret_cast<const char*>(pg + next_neighbor_off), _MM_HINT_T0);
                 // }
 
                 if (!(visited_array[neighbor_id] == visited_array_tag)) {
@@ -357,7 +539,7 @@ std::vector<std::pair<float, u32>> HNSW<Dim, DistanceMetric>::searchLayer(
                     NodeAccessor neighbor_acc(neighbor_page_guard.ptr, getNodeIndexInPage(neighbor_id), this);
                     float neighbor_dist;
                     if (stats) {
-                        neighbor_dist = this->calculateDistance(query, neighbor_acc.getVector(), Dim);
+                        neighbor_dist = this->calculateDistance(query, neighbor_acc.getVector());
                     } else {
                         neighbor_dist = DistanceMetric::compare(query, neighbor_acc.getVector(), Dim);
                     }
@@ -390,18 +572,161 @@ std::vector<std::pair<float, u32>> HNSW<Dim, DistanceMetric>::searchLayer(
     return results;
 }
 
-template <size_t Dim, typename DistanceMetric>
-inline PID HNSW<Dim, DistanceMetric>::getNodePID(u32 node_id) const {
+// template <typename DistanceMetric>
+// template <bool stats>
+// std::vector<std::pair<float, u32>> HNSW<DistanceMetric>::searchLayer(
+//     const float* query, u32 entry_point_id, u32 level, size_t ef,
+//     std::optional<std::pair<float, u32>> initial_entry_dist_pair) { // Added optional parameter
+    
+//     VisitedList* visited_nodes = visited_list_pool_->getFreeVisitedList();
+//     vl_type* visited_array = visited_nodes->mass;
+//     vl_type visited_array_tag = visited_nodes->curV;
+    
+//     std::priority_queue<std::pair<float, u32>> top_candidates; // Max-heap to keep the best results
+//     std::priority_queue<std::pair<float, u32>, std::vector<std::pair<float, u32>>, std::greater<std::pair<float, u32>>>
+//         candidate_queue; // Min-heap to explore candidates
+
+//     // --- Use pre-calculated distance if available ---
+//     if (initial_entry_dist_pair && initial_entry_dist_pair->second == entry_point_id) {
+//         float dist = initial_entry_dist_pair->first;
+//         top_candidates.push({dist, entry_point_id});
+//         candidate_queue.push({dist, entry_point_id});
+//         visited_array[entry_point_id] = visited_array_tag;
+//     } else {
+//         // Fallback: calculate distance if not provided or if IDs don't match
+//         try {
+//             GuardO<HNSWPage> page_guard(getNodePID(entry_point_id));
+//             NodeAccessor acc(page_guard.ptr, getNodeIndexInPage(entry_point_id), this);
+//             float dist;
+//             if (stats) {
+//                 dist = this->calculateDistance(query, acc.getVector(), Dim);
+//             } else {
+//                 dist = DistanceMetric::compare(query, acc.getVector(), Dim);
+//             }
+//             top_candidates.push({dist, entry_point_id});
+//             candidate_queue.push({dist, entry_point_id});
+//             visited_array[entry_point_id] = visited_array_tag;
+//         } catch (const OLCRestartException&) {
+//             // Cannot even start the search, return empty.
+//             visited_list_pool_->releaseVisitedList(visited_nodes);
+//             return {};
+//         }
+//     }
+    
+//     // The rest of the beam search logic remains the same.
+//     std::vector<PID> pages_to_prefetch;
+//     std::vector<u32> offsets_within_pages;
+//     std::vector<u32> neighbors;
+//     pages_to_prefetch.reserve(32);
+//     offsets_within_pages.reserve(32);
+//     neighbors.reserve(32);
+    
+//     while (!candidate_queue.empty()) {
+//         auto current_pair = candidate_queue.top();
+//         candidate_queue.pop();
+
+//         if (top_candidates.size() >= ef && current_pair.first > top_candidates.top().first) {
+//             break; // All further candidates are worse than the worst in our result set.
+//         }
+        
+//         if (stats) {
+//             stats_.search_hops.fetch_add(1, std::memory_order_relaxed);
+//         }
+
+//         u32 current_id = current_pair.second;
+//         bool skip = false;
+//         while(true) {
+//             neighbors.clear();
+//             try {
+//             GuardS<HNSWPage> current_page_guard(getNodePID(current_id));
+//                 NodeAccessor current_acc(current_page_guard.ptr, getNodeIndexInPage(current_id), this);
+
+//                 if (current_acc.getLevel() < level) {
+//                     skip = true;
+//                     break;
+//                 }
+
+//                 auto neighbors_ref = current_acc.getNeighbors(level, this);
+//                 // copy neighbors_ref to neighbors
+//                 neighbors.insert(neighbors.end(), neighbors_ref.begin(), neighbors_ref.end());
+//             } catch (const OLCRestartException&) {
+//                 continue;
+//             }
+//             break;
+//         }
+//         if (skip) {
+//             continue;
+//         }
+
+
+//         // Prefetch all neighbors' vector data at once before processing
+//         // only prefetch aggressively for lower levels as the top levels have exponentially fewer nodes and are likely to be cached
+//         if (level <= 2 && !neighbors.empty() && enable_prefetch_) {
+//             // for (const u32& neighbor_id : neighbors) { 
+//             //     _mm_prefetch(reinterpret_cast<const char*>(&visited_array[neighbor_id]), _MM_HINT_T0);
+//             // }
+//             pages_to_prefetch.clear();
+//             offsets_within_pages.clear();
+//             for (const u32& neighbor_id : neighbors) {
+//                 if (!(visited_array[neighbor_id] == visited_array_tag)) {
+//                     pages_to_prefetch.push_back(getNodePID(neighbor_id));
+//                     offsets_within_pages.push_back(NodeAccessor::getVectorOffset(this, neighbor_id));
+//                 }
+//             }
+//             bm.prefetchPages(pages_to_prefetch.data(), pages_to_prefetch.size(), offsets_within_pages.data());
+//         }
+//         for (size_t i = 0; i < neighbors.size(); ++i) {
+//             const u32& neighbor_id = neighbors[i];
+
+//             if (!(visited_array[neighbor_id] == visited_array_tag)) {
+//                 try{
+//                     GuardO<HNSWPage> neighbor_page_guard(getNodePID(neighbor_id));
+//                     NodeAccessor neighbor_acc(neighbor_page_guard.ptr, getNodeIndexInPage(neighbor_id), this);
+//                     float neighbor_dist;
+//                     if (stats) {
+//                         neighbor_dist = this->calculateDistance(query, neighbor_acc.getVector(), Dim);
+//                     } else {
+//                         neighbor_dist = DistanceMetric::compare(query, neighbor_acc.getVector(), Dim);
+//                     }
+
+//                     if (top_candidates.size() < ef || neighbor_dist < top_candidates.top().first) {
+//                         candidate_queue.push({neighbor_dist, neighbor_id});
+//                         top_candidates.push({neighbor_dist, neighbor_id});
+//                         if (top_candidates.size() > ef) {
+//                             top_candidates.pop();
+//                         }
+//                     }
+//                 } catch (const OLCRestartException&) {
+//                     continue; // skip this node
+//                 }
+//                 visited_array[neighbor_id] = visited_array_tag;
+//             }
+//         }
+//     }
+
+//     std::vector<std::pair<float, u32>> results;
+//     results.reserve(top_candidates.size());
+//     while (!top_candidates.empty()) {
+//         results.push_back(top_candidates.top());
+//         top_candidates.pop();
+//     }
+//     std::reverse(results.begin(), results.end());
+//     visited_list_pool_->releaseVisitedList(visited_nodes);
+//     return results;
+// }
+
+template <typename DistanceMetric>
+inline PID HNSW<DistanceMetric>::getNodePID(u32 node_id) const {
     return base_pid + (node_id / NodesPerPage);
 }
 
-template <size_t Dim, typename DistanceMetric>
-inline u32 HNSW<Dim, DistanceMetric>::getNodeIndexInPage(u32 node_id) const {
+template <typename DistanceMetric>
+inline u32 HNSW<DistanceMetric>::getNodeIndexInPage(u32 node_id) const {
     return node_id % NodesPerPage;
 }
 
-template <size_t Dim, typename DistanceMetric>
-std::vector<std::pair<float, u32>> HNSW<Dim, DistanceMetric>::selectNeighborsHeuristic(
+template <typename DistanceMetric>
+std::vector<std::pair<float, u32>> HNSW<DistanceMetric>::selectNeighborsHeuristic(
     const float* query, const std::vector<std::pair<float, u32>>& candidates, size_t M_limit) {
     if (candidates.size() <= M_limit) {
         return candidates;
@@ -448,8 +773,8 @@ std::vector<std::pair<float, u32>> HNSW<Dim, DistanceMetric>::selectNeighborsHeu
     return result;
 }
 
-template <size_t Dim, typename DistanceMetric>
-void HNSW<Dim, DistanceMetric>::addPoint_internal(const float* point, u32 new_node_id) {
+template <typename DistanceMetric>
+void HNSW<DistanceMetric>::addPoint_internal(const float* point, u32 new_node_id) {
     const u32 new_node_level = getRandomLevel();
     PID new_node_pid = getNodePID(new_node_id);
 
@@ -649,8 +974,8 @@ void HNSW<Dim, DistanceMetric>::addPoint_internal(const float* point, u32 new_no
 }
 
 // --- Parallel and Single Add/Search Functions (unchanged) ---
-template <size_t Dim, typename DistanceMetric>
-void HNSW<Dim, DistanceMetric>::addPoint_parallel(std::span<const float> points, size_t num_threads) {
+template <typename DistanceMetric>
+void HNSW<DistanceMetric>::addPoint_parallel(std::span<const float> points, size_t num_threads) {
     if (points.empty()) return;
     if (points.size() % Dim != 0) {
         throw std::invalid_argument("Total number of floats in points span is not a multiple of the vector dimension.");
@@ -680,19 +1005,21 @@ void HNSW<Dim, DistanceMetric>::addPoint_parallel(std::span<const float> points,
         
         // Atomic counter for work distribution - each thread will fetch_add(1) to get next point index
         std::atomic<size_t> point_counter{0};
-        
+        // Pre-partition work: each thread gets a contiguous range of points.
+        size_t chunk = num_points / threads_to_use;
+        size_t remainder = num_points % threads_to_use;
+
         for (size_t thread_idx = 0; thread_idx < threads_to_use; ++thread_idx) {
-            futures.emplace_back(pool->enqueue([this, points_data = points.data(), start_id, num_points, &point_counter]() {
-                size_t point_idx;
-                // print every 10%th point added by all threads
-                while ((point_idx = point_counter.fetch_add(1, std::memory_order_relaxed)) < num_points) {
-                    const float* point_vector = points_data + point_idx * Dim;
-                    u32 node_id = start_id + point_idx;
-                    this->addPoint_internal(point_vector, node_id);
-                    if (point_idx % (num_points / 10 + 1) == 0) {
-                        std::cout << "Added point " << point_idx + 1 << " / " << num_points << std::endl;
-                    }
-                }
+            size_t start = thread_idx * chunk + std::min(thread_idx, remainder);
+            size_t extra = (thread_idx < remainder) ? 1 : 0;
+            size_t end = start + chunk + extra; // [start, end)
+
+            futures.emplace_back(pool->enqueue([this, points_data = points.data(), start_id, num_points, start, end]() {
+            for (size_t point_idx = start; point_idx < end; ++point_idx) {
+                const float* point_vector = points_data + point_idx * Dim;
+                u32 node_id = start_id + point_idx;
+                this->addPoint_internal(point_vector, node_id);
+            }
             }));
         }
         
@@ -702,8 +1029,8 @@ void HNSW<Dim, DistanceMetric>::addPoint_parallel(std::span<const float> points,
     }
 }
 
-template <size_t Dim, typename DistanceMetric>
-void HNSW<Dim, DistanceMetric>::addPoint(const float* point, u32& node_id_out) {
+template <typename DistanceMetric>
+void HNSW<DistanceMetric>::addPoint(const float* point, u32& node_id_out) {
     u32 new_node_id;
     {
         GuardX<HNSWMetadataPage> meta_guard(metadata_pid);
@@ -718,9 +1045,9 @@ void HNSW<Dim, DistanceMetric>::addPoint(const float* point, u32& node_id_out) {
     addPoint_internal(point, new_node_id);
 }
 
-template <size_t Dim, typename DistanceMetric>
+template <typename DistanceMetric>
 template <bool stats>
-std::vector<std::pair<float, u32>> HNSW<Dim, DistanceMetric>::searchKnn(const float* query, size_t k,
+std::vector<std::pair<float, u32>> HNSW<DistanceMetric>::searchKnn(const float* query, size_t k,
                                                                         size_t ef_search_param) {
     // --- 1. Get the global entry point ---
     u32 enter_point_id;
@@ -763,9 +1090,9 @@ std::vector<std::pair<float, u32>> HNSW<Dim, DistanceMetric>::searchKnn(const fl
     return candidates;
 }
 
-template <size_t Dim, typename DistanceMetric>
+template <typename DistanceMetric>
 template <bool stats>
-std::vector<std::vector<std::pair<float, u32>>> HNSW<Dim, DistanceMetric>::searchKnn_parallel(
+std::vector<std::vector<std::pair<float, u32>>> HNSW<DistanceMetric>::searchKnn_parallel(
     std::span<const float> queries, size_t k, size_t ef_search_param, size_t num_threads) {
     if (queries.empty()) return {};
     if (queries.size() % Dim != 0) {
@@ -797,23 +1124,23 @@ std::vector<std::vector<std::pair<float, u32>>> HNSW<Dim, DistanceMetric>::searc
     return all_results;
 }
 
-template <size_t Dim, typename DistanceMetric>
-u64 HNSW<Dim, DistanceMetric>::getBufferManagerAllocCount() const {
+template <typename DistanceMetric>
+u64 HNSW<DistanceMetric>::getBufferManagerAllocCount() const {
     return bm.allocCount.load();
 }
 
-template <size_t Dim, typename DistanceMetric>
-HNSWStats HNSW<Dim, DistanceMetric>::getStats() const {
+template <typename DistanceMetric>
+HNSWStats HNSW<DistanceMetric>::getStats() const {
     return stats_;
 }
 
-template <size_t Dim, typename DistanceMetric>
-std::string HNSW<Dim, DistanceMetric>::getIndexInfo() const {
+template <typename DistanceMetric>
+std::string HNSW<DistanceMetric>::getIndexInfo() const {
     std::ostringstream info;
 
     info << "=== HNSW Index Information ===\n";
 
-    // Template parameters (compile-time configuration)
+    // Configuration parameters
     info << "Configuration Parameters:\n";
     info << "  Vector Dimension: " << Dim << "\n";
     info << "  Max Neighbors (M): " << M << " (layers > 0)\n";
@@ -914,18 +1241,18 @@ std::string HNSW<Dim, DistanceMetric>::getIndexInfo() const {
 }
 
 // --- Explicit Template Instantiation ---
-template class HNSW<128, hnsw_distance::SIMDAcceleratedL2>;
+template class HNSW<hnsw_distance::SIMDAcceleratedL2>;
 
 // Explicit instantiation for templated member functions
-template std::vector<std::pair<float, u32>> HNSW<128, hnsw_distance::SIMDAcceleratedL2>::searchKnn<true>(const float* query, size_t k, size_t ef_search_param);
-template std::vector<std::pair<float, u32>> HNSW<128, hnsw_distance::SIMDAcceleratedL2>::searchKnn<false>(const float* query, size_t k, size_t ef_search_param);
-template std::vector<std::vector<std::pair<float, u32>>> HNSW<128, hnsw_distance::SIMDAcceleratedL2>::searchKnn_parallel<true>(std::span<const float> queries, size_t k, size_t ef_search_param, size_t num_threads);
-template std::vector<std::vector<std::pair<float, u32>>> HNSW<128, hnsw_distance::SIMDAcceleratedL2>::searchKnn_parallel<false>(std::span<const float> queries, size_t k, size_t ef_search_param, size_t num_threads);
+template std::vector<std::pair<float, u32>> HNSW<hnsw_distance::SIMDAcceleratedL2>::searchKnn<true>(const float* query, size_t k, size_t ef_search_param);
+template std::vector<std::pair<float, u32>> HNSW<hnsw_distance::SIMDAcceleratedL2>::searchKnn<false>(const float* query, size_t k, size_t ef_search_param);
+template std::vector<std::vector<std::pair<float, u32>>> HNSW<hnsw_distance::SIMDAcceleratedL2>::searchKnn_parallel<true>(std::span<const float> queries, size_t k, size_t ef_search_param, size_t num_threads);
+template std::vector<std::vector<std::pair<float, u32>>> HNSW<hnsw_distance::SIMDAcceleratedL2>::searchKnn_parallel<false>(std::span<const float> queries, size_t k, size_t ef_search_param, size_t num_threads);
 
 // Explicit instantiation for internal templated helper methods
-template std::vector<std::pair<float, u32>> HNSW<128, hnsw_distance::SIMDAcceleratedL2>::searchLayer<true>(const float* query, u32 entry_point_id, u32 level, size_t ef, std::optional<std::pair<float, u32>> initial_entry_dist_pair);
-template std::vector<std::pair<float, u32>> HNSW<128, hnsw_distance::SIMDAcceleratedL2>::searchLayer<false>(const float* query, u32 entry_point_id, u32 level, size_t ef, std::optional<std::pair<float, u32>> initial_entry_dist_pair);
-template std::pair<float, u32> HNSW<128, hnsw_distance::SIMDAcceleratedL2>::findBestEntryPointForLevel<true>(const float* query, u32 entry_point_id, int level, float entry_point_dist);
-template std::pair<float, u32> HNSW<128, hnsw_distance::SIMDAcceleratedL2>::findBestEntryPointForLevel<false>(const float* query, u32 entry_point_id, int level, float entry_point_dist);
-template std::pair<float, u32> HNSW<128, hnsw_distance::SIMDAcceleratedL2>::searchBaseLayer<true>(const float* query, u32 entry_point_id, int start_level, int end_level);
-template std::pair<float, u32> HNSW<128, hnsw_distance::SIMDAcceleratedL2>::searchBaseLayer<false>(const float* query, u32 entry_point_id, int start_level, int end_level);
+template std::vector<std::pair<float, u32>> HNSW<hnsw_distance::SIMDAcceleratedL2>::searchLayer<true>(const float* query, u32 entry_point_id, u32 level, size_t ef, std::optional<std::pair<float, u32>> initial_entry_dist_pair);
+template std::vector<std::pair<float, u32>> HNSW<hnsw_distance::SIMDAcceleratedL2>::searchLayer<false>(const float* query, u32 entry_point_id, u32 level, size_t ef, std::optional<std::pair<float, u32>> initial_entry_dist_pair);
+template std::pair<float, u32> HNSW<hnsw_distance::SIMDAcceleratedL2>::findBestEntryPointForLevel<true>(const float* query, u32 entry_point_id, int level, float entry_point_dist);
+template std::pair<float, u32> HNSW<hnsw_distance::SIMDAcceleratedL2>::findBestEntryPointForLevel<false>(const float* query, u32 entry_point_id, int level, float entry_point_dist);
+template std::pair<float, u32> HNSW<hnsw_distance::SIMDAcceleratedL2>::searchBaseLayer<true>(const float* query, u32 entry_point_id, int start_level, int end_level);
+template std::pair<float, u32> HNSW<hnsw_distance::SIMDAcceleratedL2>::searchBaseLayer<false>(const float* query, u32 entry_point_id, int start_level, int end_level);

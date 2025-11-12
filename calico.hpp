@@ -17,10 +17,9 @@
 #include <functional>
 #include <limits>
 #include <memory>
-#include <span>
 #include <thread>
 #include <vector>
-
+#include <span>
 #include "hash_tables.hpp"
 
 // Extern declarations must come BEFORE headers that use them
@@ -39,7 +38,7 @@ typedef uint32_t u32;
 typedef uint64_t u64;
 typedef u64 PID;  // page id type
 
-static constexpr u64 pageSize = 4096;
+static constexpr u64 pageSize = 8192;
 
 __attribute__((target("sse4.2"))) uint64_t hash64(uint64_t key, uint32_t seed);
 
@@ -182,19 +181,23 @@ struct PageState {
 
     u64 getFrameValue() const {
         if (!packedMode) return 0;
-        return extractFrame(stateAndVersion.load(std::memory_order_acquire));
+        return extractFrame(stateAndVersion.load(std::memory_order_relaxed));
     }
 
     void setFrameValue(u64 frame) {
         if (!packedMode) return;
         frame &= frameMask;
         u64 expected = stateAndVersion.load(std::memory_order_relaxed);
-        while (true) {
-            u64 desired = (expected & ~frameMask) | frame;
-            if (stateAndVersion.compare_exchange_weak(expected, desired, std::memory_order_release,
-                                                      std::memory_order_relaxed))
-                return;
-        }
+        assert(getState(expected) == Locked);
+        u64 desired = (expected & ~frameMask) | frame;
+        stateAndVersion.store(desired, std::memory_order_release);
+        return;
+        // while (true) {
+        //     u64 desired = (expected & ~frameMask) | frame;
+        //     if (stateAndVersion.compare_exchange_weak(expected, desired, std::memory_order_release,
+        //                                               std::memory_order_relaxed))
+        //         return;
+        // }
     }
 
     void clearFrameValue() {
@@ -288,6 +291,7 @@ struct FreePartition {
     std::atomic_flag lock = ATOMIC_FLAG_INIT;
     std::vector<u32> frames;
     u32 top = 0;
+    char cachline_pad0[64 - sizeof(std::atomic_flag) - sizeof(std::vector<u32>) - sizeof(u32)];
 };
 
 // Two-level indirection for PageState array
@@ -345,7 +349,7 @@ struct BufferManager {
     enum class HashMode { Array1Access = 0, Unordered = 1, OpenAddress = 2, Array = 3, Lockfree = 4, Array2Level = 5, Array3Level = 6 };
 
     bool useTraditional;
-    bool useMmapOSPageacche;
+    bool useMmapOSPageacche = false;
     bool useExmap;
     HashMode hashMode;
     unsigned numThreads;
@@ -356,12 +360,17 @@ struct BufferManager {
     static constexpr PID invalidPID = std::numeric_limits<PID>::max();
     static constexpr u32 freePartitionCount = 1;
 
-    std::atomic<u64> physUsedCount;
+    char cachline_pad0[64];
     ResidentPageSet residentSet;
-    std::atomic<u64> allocCount;
 
+    std::atomic<u64> physUsedCount;
+    char cachline_pad1[64];
+    std::atomic<u64> allocCount;
+    char cachline_pad2[64];
     std::atomic<u64> readCount;
+    char cachline_pad3[64];
     std::atomic<u64> writeCount;
+    char cachline_pad4[64];
 
     Page* virtMem;
     Page* frameMem;
@@ -369,6 +378,8 @@ struct BufferManager {
     std::unique_ptr<TwoLevelPageStateArray> pageState2Level; // Two-level array (for Array2Level mode)
     std::unique_ptr<ThreeLevelPageStateArray> pageState3Level; // Three-level array (for Array3Level mode)
     std::unique_ptr<std::atomic<u64>[]> pidToFrameArray;
+    static constexpr u64 NUM_LOCK_SHARDS = 64;
+    std::unique_ptr<pthread_rwlock_t[]> pid_locks;
     std::unique_ptr<std::atomic<PID>[]> frameToPidArray;
     std::unique_ptr<PartitionedMap<PID, u64>> pidToFrameHash;
     std::unique_ptr<PartitionedMap<u64, PID>> frameToPidHash;
@@ -377,14 +388,19 @@ struct BufferManager {
     u64 batch;
 
     PageState& getPageState(PID pid) {
-        if (hashMode == HashMode::Array2Level) {
-            return pageState2Level->get(pid);
-        }
-        if (hashMode == HashMode::Array3Level) {
-            return pageState3Level->get(pid);
-        }
+        // if (hashMode == HashMode::Array2Level) {
+        //     return pageState2Level->get(pid);
+        // }
+        // if (hashMode == HashMode::Array3Level) {
+        //     return pageState3Level->get(pid);
+        // }
         return pageState[pid];
     }
+    u64 pid_lock_shard(PID pid) {
+        return pid % NUM_LOCK_SHARDS;
+    }
+
+    void flushAll();
 
     BufferManager(unsigned nthreads = 1);
     ~BufferManager();
@@ -403,6 +419,7 @@ struct BufferManager {
 
     void ensureFreePages();
     Page* allocPage();
+    void updateAllocCountSnapshot(u64 value);
     Page* handleFault(PID pid);
     void readPage(PID pid, Page* dest);
     void evict();
@@ -471,6 +488,7 @@ struct GuardO {
                     if (ps.tryLockX(v)) {
                         ptr = reinterpret_cast<T*>(bm.handleFault(pid));
                         bm.unfixX(pid);
+                        bm.ensureFreePages();
                     }
                     break;
                 default:
@@ -594,6 +612,7 @@ struct GuardORelaxed {
                     if (ps.tryLockX(v)) {
                         ptr = reinterpret_cast<T*>(bm.handleFault(pid));
                         bm.unfixX(pid);
+                        bm.ensureFreePages();
                     }
                     break;
                 case PageState::Marked:
@@ -696,6 +715,7 @@ struct GuardO_NoThrow {
                     if (ps.tryLockX(v)) {
                         ptr = reinterpret_cast<T*>(bm.handleFault(pid));
                         bm.unfixX(pid);
+                        bm.ensureFreePages();
                     }
                     break;
                 default:
@@ -1015,12 +1035,58 @@ static_assert(sizeof(BTreeNode) == pageSize, "btree node size problem");
 
 static const u64 metadataPageId = 0;
 
+struct HNSWMetaInfo {
+    static constexpr u64 magic = 0x484E53574D455441ULL;  // "HNSWMETA"
+    u64 magic_value = 0;
+    PID metadata_pid = BufferManager::invalidPID;
+    PID base_pid = BufferManager::invalidPID;
+    u64 max_elements = 0;
+    u64 dim = 0;
+    u64 M = 0;
+    u64 ef_construction = 0;
+    u64 max_level = 0;
+    u8 enable_prefetch = 0;
+    u8 valid = 0;
+    u8 reserved[6] = {0};
+
+    bool isValid() const {
+        return valid != 0 && magic_value == magic && metadata_pid != BufferManager::invalidPID &&
+               base_pid != BufferManager::invalidPID;
+    }
+
+    void clear() {
+        magic_value = 0;
+        metadata_pid = BufferManager::invalidPID;
+        base_pid = BufferManager::invalidPID;
+        max_elements = 0;
+        dim = 0;
+        M = 0;
+        ef_construction = 0;
+        max_level = 0;
+        enable_prefetch = 0;
+        valid = 0;
+        memset(reserved, 0, sizeof(reserved));
+    }
+};
+
 struct MetaDataPage {
     bool dirty;
-    PID roots[(pageSize - 8) / 8];
+    u8 padding[7] = {0};
+    HNSWMetaInfo hnsw_meta;
+    u64 alloc_count_snapshot = 0;
+    PID roots[(pageSize - sizeof(dirty) - sizeof(padding) - sizeof(HNSWMetaInfo) - sizeof(alloc_count_snapshot)) /
+              sizeof(PID)];
 
     PID getRoot(unsigned slot) { return roots[slot]; }
+
+    u64 getAllocCountSnapshot() const { return alloc_count_snapshot; }
+
+    void setAllocCountSnapshot(u64 value) { alloc_count_snapshot = value; }
 };
+
+void flush_system();
+
+static_assert(sizeof(MetaDataPage) <= pageSize, "MetaDataPage must fit within a single page");
 
 struct BTree {
    private:

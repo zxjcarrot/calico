@@ -7,6 +7,45 @@
 #include <atomic>
 #include <sys/mman.h>
 #include <mutex>
+#include "absl/container/flat_hash_map.h"
+
+// Custom allocator that applies MADV_HUGEPAGE to allocated memory
+template <typename T>
+class HugePageAllocator {
+public:
+   using value_type = T;
+   
+   HugePageAllocator() noexcept = default;
+   
+   template <typename U>
+   HugePageAllocator(const HugePageAllocator<U>&) noexcept {}
+   
+   T* allocate(size_t n) {
+      size_t bytes = n * sizeof(T);
+      T* ptr = static_cast<T*>(::operator new(bytes));
+      
+      // Apply huge page advice if allocation is large enough
+      if (bytes >= 2*1024*1024) {  // Only for allocations >= 4KB
+         madvise(ptr, bytes, MADV_HUGEPAGE);
+      }
+      
+      return ptr;
+   }
+   
+   void deallocate(T* ptr, size_t n) noexcept {
+      ::operator delete(ptr);
+   }
+   
+   template <typename U>
+   bool operator==(const HugePageAllocator<U>&) const noexcept {
+      return true;
+   }
+   
+   template <typename U>
+   bool operator!=(const HugePageAllocator<U>&) const noexcept {
+      return false;
+   }
+};
 
 // Forward declaration of Hasher template
 template<typename K>
@@ -27,7 +66,7 @@ class ShardedUnorderedMap : public PartitionedMap<K, V> {
    static_assert((ShardCount & (ShardCount - 1)) == 0, "ShardCount must be a power of two");
 
    struct Shard {
-      std::unordered_map<K, V, Hasher<K>> map;
+      std::unordered_map<K, V, Hasher<K>, std::equal_to<K>, HugePageAllocator<std::pair<const K, V>>> map;
       mutable std::shared_mutex mutex;
    };
 
@@ -115,152 +154,42 @@ struct OAEntry {
    State state = State::Empty;
 };
 
-template <typename K, typename V, size_t ShardCount = 64>
+template <typename K, typename V, size_t ShardCount = 64, typename HashFunc = Hasher<K>>
 class ShardedOpenAddressMap : public PartitionedMap<K, V> {
    static_assert((ShardCount & (ShardCount - 1)) == 0, "ShardCount must be a power of two");
 
    struct Shard {
       mutable std::shared_mutex mutex;
-      std::vector<OAEntry<K, V>> table;
-      size_t size = 0;
-      Hasher<K> hasher;
-
-      static size_t nextPow2(size_t v) {
-         if (v < 8)
-            return 8;
-         v--;
-         v |= v >> 1;
-         v |= v >> 2;
-         v |= v >> 4;
-         v |= v >> 8;
-         v |= v >> 16;
-#if SIZE_MAX > UINT32_MAX
-         v |= v >> 32;
-#endif
-         return v + 1;
-      }
-
-      void ensureCapacity() {
-         if (table.empty())
-            rehash(8);
-         else if ((size + 1) * 10 > table.size() * 7)
-            rehash(table.size() * 2);
-      }
-
-      void rehash(size_t newCap) {
-         newCap = nextPow2(newCap);
-         std::vector<OAEntry<K, V>> newTable(newCap);
-         size_t oldSize = size;
-         size = 0;
-         for (auto& entry : table) {
-            if (entry.state == OAEntry<K, V>::State::Occupied)
-               insertInto(newTable, entry.key, entry.value, hasher);
-         }
-         table.swap(newTable);
-         size = oldSize;
-         madvise(table.data(), table.size() * sizeof(OAEntry<K, V>), MADV_HUGEPAGE);
-      }
-
-      static void insertInto(std::vector<OAEntry<K, V>>& tbl, const K& key, const V& value, const Hasher<K>& hasher) {
-         size_t mask = tbl.size() - 1;
-         size_t idx = hasher(key) & mask;
-         size_t firstDeleted = tbl.size();
-         for (;;) {
-            auto& slot = tbl[idx];
-            if (slot.state == OAEntry<K, V>::State::Empty) {
-               size_t target = (firstDeleted != tbl.size()) ? firstDeleted : idx;
-               auto& dest = tbl[target];
-               dest.key = key;
-               dest.value = value;
-               dest.state = OAEntry<K, V>::State::Occupied;
-               return;
-            } else if (slot.state == OAEntry<K, V>::State::Deleted) {
-               if (firstDeleted == tbl.size())
-                  firstDeleted = idx;
-            } else if (slot.key == key) {
-               slot.value = value;
-               return;
-            }
-            idx = (idx + 1) & mask;
-         }
+      absl::flat_hash_map<K, V, HashFunc, std::equal_to<K>, HugePageAllocator<std::pair<const K, V>>> map;
+      
+      void reserve(size_t capacity) {
+         map.reserve(capacity);
       }
 
       void insertOrAssign(const K& key, const V& value) {
-         ensureCapacity();
-         size_t mask = table.size() - 1;
-         size_t idx = hasher(key) & mask;
-         size_t firstDeleted = table.size();
-         for (;;) {
-            auto& slot = table[idx];
-            if (slot.state == OAEntry<K, V>::State::Empty) {
-               size_t target = (firstDeleted != table.size()) ? firstDeleted : idx;
-               auto& dest = table[target];
-               dest.key = key;
-               dest.value = value;
-               if (dest.state != OAEntry<K, V>::State::Occupied) {
-                  dest.state = OAEntry<K, V>::State::Occupied;
-                  size++;
-               }
-               return;
-            } else if (slot.state == OAEntry<K, V>::State::Deleted) {
-               if (firstDeleted == table.size())
-                  firstDeleted = idx;
-            } else if (slot.key == key) {
-               slot.value = value;
-               return;
-            }
-            idx = (idx + 1) & mask;
-            if (idx == (hasher(key) & mask)) {
-               rehash(table.size() * 2);
-               insertOrAssign(key, value);
-               return;
-            }
-         }
-      }
-
-      bool tryGet(const K& key, V& value, size_t hash) const {
-         if (table.empty())
-            return false;
-         size_t mask = table.size() - 1;
-         size_t idx = hash & mask;
-         for (;;) {
-            const auto& slot = table[idx];
-            if (slot.state == OAEntry<K, V>::State::Empty)
-               return false;
-            if (slot.state == OAEntry<K, V>::State::Occupied && slot.key == key) {
-               value = slot.value;
-               return true;
-            }
-            idx = (idx + 1) & mask;
-         }
+         map.insert_or_assign(key, value);
       }
 
       bool tryGet(const K& key, V& value) const {
-         return tryGet(key, value, hasher(key));
+         auto it = map.find(key);
+         if (it == map.end())
+            return false;
+         value = it->second;
+         return true;
       }
 
       bool erase(const K& key, V& value) {
-         if (table.empty())
+         auto it = map.find(key);
+         if (it == map.end())
             return false;
-         size_t mask = table.size() - 1;
-         size_t idx = hasher(key) & mask;
-         for (;;) {
-            auto& slot = table[idx];
-            if (slot.state == OAEntry<K, V>::State::Empty)
-               return false;
-            if (slot.state == OAEntry<K, V>::State::Occupied && slot.key == key) {
-               value = slot.value;
-               slot.state = OAEntry<K, V>::State::Deleted;
-               size--;
-               return true;
-            }
-            idx = (idx + 1) & mask;
-         }
+         value = it->second;
+         map.erase(it);
+         return true;
       }
    };
 
    std::array<Shard, ShardCount> shards;
-   Hasher<K> hasher;
+   HashFunc hasher;
 
    static constexpr size_t shardMask = ShardCount - 1;
 
@@ -273,7 +202,7 @@ public:
       size_t perShard = (entries + ShardCount - 1) / ShardCount;
       for (auto& shard : shards) {
          std::unique_lock lock(shard.mutex);
-         shard.rehash(Shard::nextPow2(perShard * 2));
+         shard.reserve(perShard);
       }
    }
 
@@ -287,7 +216,7 @@ public:
       size_t hash = hasher(key);
       auto& shard = shards[hash & shardMask];
       std::shared_lock lock(shard.mutex);
-      return shard.tryGet(key, value, hash);
+      return shard.tryGet(key, value);
    }
 
    bool erase(const K& key, V& value) override {
@@ -298,144 +227,34 @@ public:
 };
 
 // Single-threaded specialization with no mutex overhead
-template <typename K, typename V>
-class ShardedOpenAddressMap<K, V, 1> : public PartitionedMap<K, V> {
-   std::vector<OAEntry<K, V>> table;
-   size_t size = 0;
-   Hasher<K> hasher;
-
-   static size_t nextPow2(size_t v) {
-      if (v < 8)
-         return 8;
-      v--;
-      v |= v >> 1;
-      v |= v >> 2;
-      v |= v >> 4;
-      v |= v >> 8;
-      v |= v >> 16;
-#if SIZE_MAX > UINT32_MAX
-      v |= v >> 32;
-#endif
-      return v + 1;
-   }
-
-   void ensureCapacity() {
-      if (table.empty())
-         rehash(8);
-      else if ((size + 1) * 10 > table.size() * 7)
-         rehash(table.size() * 2);
-   }
-
-   void rehash(size_t newCap) {
-      newCap = nextPow2(newCap);
-      std::vector<OAEntry<K, V>> newTable(newCap);
-      size_t oldSize = size;
-      size = 0;
-      for (auto& entry : table) {
-         if (entry.state == OAEntry<K, V>::State::Occupied)
-            insertInto(newTable, entry.key, entry.value);
-      }
-      table.swap(newTable);
-      size = oldSize;
-      madvise(table.data(), table.size() * sizeof(OAEntry<K, V>), MADV_HUGEPAGE);
-   }
-
-   void insertInto(std::vector<OAEntry<K, V>>& tbl, const K& key, const V& value) {
-      size_t mask = tbl.size() - 1;
-      size_t idx = hasher(key) & mask;
-      size_t firstDeleted = tbl.size();
-      for (;;) {
-         auto& slot = tbl[idx];
-         if (slot.state == OAEntry<K, V>::State::Empty) {
-            size_t target = (firstDeleted != tbl.size()) ? firstDeleted : idx;
-            auto& dest = tbl[target];
-            dest.key = key;
-            dest.value = value;
-            dest.state = OAEntry<K, V>::State::Occupied;
-            return;
-         } else if (slot.state == OAEntry<K, V>::State::Deleted) {
-            if (firstDeleted == tbl.size())
-               firstDeleted = idx;
-         } else if (slot.key == key) {
-            slot.value = value;
-            return;
-         }
-         idx = (idx + 1) & mask;
-      }
-   }
+template <typename K, typename V, typename HashFunc>
+class ShardedOpenAddressMap<K, V, 1, HashFunc> : public PartitionedMap<K, V> {
+   absl::flat_hash_map<K, V, HashFunc, std::equal_to<K>, HugePageAllocator<std::pair<const K, V>>> map;
 
 public:
    void reserve(size_t entries) override {
-      rehash(nextPow2(entries * 2));
+      map.reserve(entries);
    }
 
    void insertOrAssign(const K& key, const V& value) override {
-      ensureCapacity();
-      size_t mask = table.size() - 1;
-      size_t idx = hasher(key) & mask;
-      size_t firstDeleted = table.size();
-      for (;;) {
-         auto& slot = table[idx];
-         if (slot.state == OAEntry<K, V>::State::Empty) {
-            size_t target = (firstDeleted != table.size()) ? firstDeleted : idx;
-            auto& dest = table[target];
-            dest.key = key;
-            dest.value = value;
-            if (dest.state != OAEntry<K, V>::State::Occupied) {
-               dest.state = OAEntry<K, V>::State::Occupied;
-               size++;
-            }
-            return;
-         } else if (slot.state == OAEntry<K, V>::State::Deleted) {
-            if (firstDeleted == table.size())
-               firstDeleted = idx;
-         } else if (slot.key == key) {
-            slot.value = value;
-            return;
-         }
-         idx = (idx + 1) & mask;
-         if (idx == (hasher(key) & mask)) {
-            rehash(table.size() * 2);
-            insertOrAssign(key, value);
-            return;
-         }
-      }
+      map.insert_or_assign(key, value);
    }
 
    bool tryGet(const K& key, V& value) const override {
-      if (table.empty())
+      auto it = map.find(key);
+      if (it == map.end())
          return false;
-      size_t mask = table.size() - 1;
-      size_t idx = hasher(key) & mask;
-      for (;;) {
-         const auto& slot = table[idx];
-         if (slot.state == OAEntry<K, V>::State::Empty)
-            return false;
-         if (slot.state == OAEntry<K, V>::State::Occupied && slot.key == key) {
-            value = slot.value;
-            return true;
-         }
-         idx = (idx + 1) & mask;
-      }
+      value = it->second;
+      return true;
    }
 
    bool erase(const K& key, V& value) override {
-      if (table.empty())
+      auto it = map.find(key);
+      if (it == map.end())
          return false;
-      size_t mask = table.size() - 1;
-      size_t idx = hasher(key) & mask;
-      for (;;) {
-         auto& slot = table[idx];
-         if (slot.state == OAEntry<K, V>::State::Empty)
-            return false;
-         if (slot.state == OAEntry<K, V>::State::Occupied && slot.key == key) {
-            value = slot.value;
-            slot.state = OAEntry<K, V>::State::Deleted;
-            size--;
-            return true;
-         }
-         idx = (idx + 1) & mask;
-      }
+      value = it->second;
+      map.erase(it);
+      return true;
    }
 };
 
@@ -557,7 +376,7 @@ private:
 };
 
 // A lock-free hash map with automatic resizing and epoch-based memory reclamation
-template <typename K, typename V>
+template <typename K, typename V, typename HashFunc = Hasher<K>>
 class LockFreeHashMap : public PartitionedMap<K, V> {
 private:
     struct Slot {
@@ -601,7 +420,7 @@ private:
     std::atomic<bool> resizing_{false};  // Single writer migration lock
     
     EpochManager epoch_manager_;
-    Hasher<K> hasher_;
+    HashFunc hasher_;
     
     static constexpr double LOAD_FACTOR_THRESHOLD = 0.75;
     
@@ -715,7 +534,7 @@ public:
     // Pre-allocate capacity (single-writer resize)
     void reserve(size_t entries) override {
         Table* table = current_table_.load(std::memory_order_acquire);
-        size_t target_capacity = nextPow2(entries * 2);
+        size_t target_capacity = nextPow2(entries);
         
         while (table->capacity < target_capacity) {
             doResize(table, true);  // Force resize regardless of load factor
