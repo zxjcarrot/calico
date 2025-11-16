@@ -4,23 +4,20 @@
 
 #include <algorithm>
 #include <iostream>
-#include <map>  // For PID grouping
 #include <memory>
 #include <numeric>
 #include <queue>
 #include <random>
 #include <stdexcept>
-#include <unordered_set>
 #include <vector>
 
 #include "calico.hpp"
 
-static std::unique_ptr<Distance<float>> distance_metric =
-    std::unique_ptr<Distance<float>>(get_distance_function<float>(Metric::L2));
+static Distance distance_metric = Distance(Metric::L2);
 
-// =========================================================================
+// ========================================================================
 // Factory Function, Accessors, and ThreadPool
-// =========================================================================
+// ========================================================================
 std::unique_ptr<DiskANNBase> create_index(size_t dimensions, uint64_t max_elements, size_t R_max_degree,
                                           bool is_dynamic) {
     switch (dimensions) {
@@ -81,7 +78,7 @@ void DiskANN<T, TagT, Dim, MaxTagsPerNode>::MutableNodeAccessor::setTags(const s
     auto* count_ptr = reinterpret_cast<uint16_t*>(const_cast<uint8_t*>(this->_node_start) + VectorSize);
     auto* tags_start = reinterpret_cast<TagT*>(count_ptr + 1);
     size_t count_to_copy = std::min(tags.size(), MaxTagsPerNode);
-    *count_ptr = count_to_copy;
+    *count_ptr = static_cast<uint16_t>(count_to_copy);
     memcpy(tags_start, tags.data(), count_to_copy * sizeof(TagT));
     _page->dirty = true;
 }
@@ -91,7 +88,7 @@ void DiskANN<T, TagT, Dim, MaxTagsPerNode>::MutableNodeAccessor::setNeighbors(co
                                                   TagsHeaderSize + TagsDataSize);
     auto* neighbors_start = reinterpret_cast<uint32_t*>(count_ptr + 1);
     size_t count_to_copy = std::min(neighbors.size(), this->_index->_R_max_degree);
-    *count_ptr = count_to_copy;
+    *count_ptr = static_cast<uint16_t>(count_to_copy);
     memcpy(neighbors_start, neighbors.data(), count_to_copy * sizeof(uint32_t));
     _page->dirty = true;
 }
@@ -105,16 +102,16 @@ ThreadPool* DiskANN<T, TagT, Dim, MaxTagsPerNode>::getOrCreateThreadPool(size_t 
     return _thread_pool.get();
 }
 
-// =========================================================================
+// ========================================================================
 // Constructor & Destructor
-// =========================================================================
+// ========================================================================
 
 template <typename T, typename TagT, size_t Dim, size_t MaxTagsPerNode>
 DiskANN<T, TagT, Dim, MaxTagsPerNode>::DiskANN(uint64_t max_elements, size_t R_max_degree, bool is_dynamic)
     : _is_dynamic(is_dynamic), _max_elements(max_elements), _R_max_degree(R_max_degree), _is_layout_optimized(false) {
     _NeighborsDataSize = _R_max_degree * sizeof(uint32_t);
     size_t calculated_size = VectorSize + TagsHeaderSize + TagsDataSize + NeighborsHeaderSize + _NeighborsDataSize;
-    _FixedNodeSize = (calculated_size + 63) & ~63;
+    _FixedNodeSize = (calculated_size + 63) & ~63;  // 64B align
 
     _NodesPerPage = (pageSize - VamanaPage::HeaderSize) / _FixedNodeSize;
     if (_NodesPerPage == 0) throw std::runtime_error("Page size too small for node configuration.");
@@ -129,6 +126,8 @@ DiskANN<T, TagT, Dim, MaxTagsPerNode>::DiskANN(uint64_t max_elements, size_t R_m
     meta_guard->node_count = 0;
     meta_guard->base_pid = -1;
     meta_guard->is_layout_optimized = false;
+
+    // Pre-allocate data pages
     uint64_t num_pages = (_max_elements + _NodesPerPage - 1) / _NodesPerPage;
     if (num_pages > 0) {
         AllocGuard<VamanaPage> first_page_guard;
@@ -143,6 +142,7 @@ DiskANN<T, TagT, Dim, MaxTagsPerNode>::DiskANN(uint64_t max_elements, size_t R_m
         }
     }
     meta_guard->dirty = true;
+
     _visited_list_pool = std::make_unique<VisitedListPool>(1, _max_elements);
     if (_is_dynamic) _internal_to_external_map.reserve(_max_elements);
 }
@@ -150,41 +150,90 @@ DiskANN<T, TagT, Dim, MaxTagsPerNode>::DiskANN(uint64_t max_elements, size_t R_m
 template <typename T, typename TagT, size_t Dim, size_t MaxTagsPerNode>
 DiskANN<T, TagT, Dim, MaxTagsPerNode>::~DiskANN() {}
 
-// =========================================================================
+// ========================================================================
 // BATCH DATA ACCESS HELPERS (OPTIMIZED)
-// =========================================================================
+// ========================================================================
+
+// --- Helper methods to get or create thread pools ---
+template <typename T, typename TagT, size_t Dim, size_t MaxTagsPerNode>
+ThreadPool* DiskANN<T, TagT, Dim, MaxTagsPerNode>::getOrCreateSearchPool(size_t num_threads) const {
+    std::lock_guard<std::mutex> lock(search_pool_mutex_);
+    if (!search_thread_pool_ || search_pool_size_ != num_threads) {
+        search_thread_pool_.reset(new ThreadPool(num_threads));
+        search_pool_size_ = num_threads;
+    }
+    return search_thread_pool_.get();
+}
+
+template <typename T, typename TagT, size_t Dim, size_t MaxTagsPerNode>
+ThreadPool* DiskANN<T, TagT, Dim, MaxTagsPerNode>::getOrCreateAddPool(size_t num_threads) const {
+    std::lock_guard<std::mutex> lock(add_pool_mutex_);
+    if (!add_thread_pool_ || add_pool_size_ != num_threads) {
+        add_thread_pool_.reset(new ThreadPool(num_threads));
+        add_pool_size_ = num_threads;
+    }
+    return add_thread_pool_.get();
+}
+
+// Local helper for PID grouping without tree/map.
+namespace {
+struct IdWithIdx {
+    PID pid;
+    uint32_t id;
+    size_t out_idx;
+};
+inline uint32_t idxInPage(uint32_t id, uint32_t nodesPerPage) { return id % nodesPerPage; }
+}  // namespace
 
 template <typename T, typename TagT, size_t Dim, size_t MaxTagsPerNode>
 bool DiskANN<T, TagT, Dim, MaxTagsPerNode>::get_nodes_data_batch(const std::vector<uint32_t>& ids,
                                                                  NodeDataBatch& data_batch) const {
     if (ids.empty()) return true;
-    std::map<PID, std::vector<std::pair<uint32_t, size_t>>> page_to_nodes_map;
-    std::vector<PID> pids_to_prefetch;
-    pids_to_prefetch.reserve(ids.size());
 
+    // Build linear items and sort by PID to cluster page accesses.
+    thread_local std::vector<IdWithIdx> items;
+    items.clear();
+    items.reserve(ids.size());
     for (size_t i = 0; i < ids.size(); ++i) {
-        uint32_t id = ids[i];
-        PID pid = getNodePID(id);
-        if (page_to_nodes_map.find(pid) == page_to_nodes_map.end()) {
-            pids_to_prefetch.push_back(pid);
-        }
-        page_to_nodes_map[pid].emplace_back(id, i);
+        items.push_back({getNodePID(ids[i]), ids[i], i});
     }
-    if (!pids_to_prefetch.empty()) {
-        bm.prefetchPages(pids_to_prefetch.data(), pids_to_prefetch.size());
+    std::sort(items.begin(), items.end(), [](const IdWithIdx& a, const IdWithIdx& b) { return a.pid < b.pid; });
+
+    // Prefetch unique PIDs in order.
+    thread_local std::vector<PID> pids;
+    pids.clear();
+    pids.reserve(items.size());
+    for (size_t i = 0; i < items.size();) {
+        PID p = items[i].pid;
+        pids.push_back(p);
+        while (i < items.size() && items[i].pid == p) ++i;
     }
+    if (!pids.empty()) bm.prefetchPages(pids.data(), pids.size());
+
+    // Prepare output buffers.
     data_batch.clear();
     data_batch.vectors.resize(ids.size() * Dim);
     data_batch.tag_counts.resize(ids.size());
-    data_batch.tags.reserve(ids.size() * MaxTagsPerNode / 2);
+    data_batch.tags.clear();
+    data_batch.tags.reserve(ids.size());  // will grow as needed
+
     try {
-        for (const auto& [pid, node_infos] : page_to_nodes_map) {
-            GuardORelaxed<VamanaPage> page_guard(pid);
-            for (const auto& [node_id, original_index] : node_infos) {
-                NodeAccessor acc(page_guard.ptr, getNodeIndexInPage(node_id), this);
-                memcpy(data_batch.vectors.data() + original_index * Dim, acc.getVector(), VectorSize);
+        size_t i = 0;
+        while (i < items.size()) {
+            PID p = items[i].pid;
+            GuardORelaxed<VamanaPage> g(p);
+            // Consume this page's nodes
+            for (; i < items.size() && items[i].pid == p; ++i) {
+                const auto node_id = items[i].id;
+                const auto out_idx = items[i].out_idx;
+                NodeAccessor acc(g.ptr, idxInPage(node_id, _NodesPerPage), this);
+
+                // Copy vector
+                memcpy(data_batch.vectors.data() + out_idx * Dim, acc.getVector(), VectorSize);
+
+                // Copy tags (append into flat tags, record count per slot)
                 auto tags_span = acc.getTags();
-                data_batch.tag_counts[original_index] = tags_span.size();
+                data_batch.tag_counts[out_idx] = static_cast<uint16_t>(tags_span.size());
                 data_batch.tags.insert(data_batch.tags.end(), tags_span.begin(), tags_span.end());
             }
         }
@@ -195,28 +244,40 @@ bool DiskANN<T, TagT, Dim, MaxTagsPerNode>::get_nodes_data_batch(const std::vect
 }
 
 template <typename T, typename TagT, size_t Dim, size_t MaxTagsPerNode>
-bool DiskANN<T, TagT, Dim, MaxTagsPerNode>::get_vectors_batch(const std::vector<uint32_t>& ids, T* dest_buffer) const {
+bool DiskANN<T, TagT, Dim, MaxTagsPerNode>::get_vectors_batch(const std::vector<uint32_t>& ids,
+                                                              T* dest_buffer) const {
     if (ids.empty()) return true;
-    std::map<PID, std::vector<std::pair<uint32_t, size_t>>> page_to_nodes_map;
-    std::vector<PID> pids_to_prefetch;
-    pids_to_prefetch.reserve(ids.size());
+
+    // Build linear items and sort by PID to cluster page accesses.
+    thread_local std::vector<IdWithIdx> items;
+    items.clear();
+    items.reserve(ids.size());
     for (size_t i = 0; i < ids.size(); ++i) {
-        uint32_t id = ids[i];
-        PID pid = getNodePID(id);
-        if (page_to_nodes_map.find(pid) == page_to_nodes_map.end()) {
-            pids_to_prefetch.push_back(pid);
-        }
-        page_to_nodes_map[pid].emplace_back(id, i);
+        items.push_back({getNodePID(ids[i]), ids[i], i});
     }
-    if (!pids_to_prefetch.empty()) {
-        bm.prefetchPages(pids_to_prefetch.data(), pids_to_prefetch.size());
+    std::sort(items.begin(), items.end(), [](const IdWithIdx& a, const IdWithIdx& b) { return a.pid < b.pid; });
+
+    // Prefetch unique PIDs
+    thread_local std::vector<PID> pids;
+    pids.clear();
+    pids.reserve(items.size());
+    for (size_t i = 0; i < items.size();) {
+        PID p = items[i].pid;
+        pids.push_back(p);
+        while (i < items.size() && items[i].pid == p) ++i;
     }
+    if (!pids.empty()) bm.prefetchPages(pids.data(), pids.size());
+
     try {
-        for (const auto& [pid, node_infos] : page_to_nodes_map) {
-            GuardO<VamanaPage> page_guard(pid);
-            for (const auto& [node_id, original_index] : node_infos) {
-                NodeAccessor acc(page_guard.ptr, getNodeIndexInPage(node_id), this);
-                memcpy(dest_buffer + original_index * Dim, acc.getVector(), VectorSize);
+        size_t i = 0;
+        while (i < items.size()) {
+            PID p = items[i].pid;
+            GuardORelaxed<VamanaPage> g(p);
+            for (; i < items.size() && items[i].pid == p; ++i) {
+                const auto node_id = items[i].id;
+                const auto out_idx = items[i].out_idx;
+                NodeAccessor acc(g.ptr, idxInPage(node_id, _NodesPerPage), this);
+                memcpy(dest_buffer + out_idx * Dim, acc.getVector(), VectorSize);
             }
         }
         return true;
@@ -225,9 +286,9 @@ bool DiskANN<T, TagT, Dim, MaxTagsPerNode>::get_vectors_batch(const std::vector<
     }
 }
 
-// =========================================================================
+// ========================================================================
 // SEARCH ALGORITHMS (OPTIMIZED)
-// =========================================================================
+// ========================================================================
 template <typename T, typename TagT, size_t Dim, size_t MaxTagsPerNode>
 std::vector<std::pair<float, uint32_t>> DiskANN<T, TagT, Dim, MaxTagsPerNode>::greedy_search_final(
     uint32_t start_node_id, const T* start_node_vec, const T* query, size_t K, const SearchParams& params,
@@ -239,21 +300,19 @@ std::vector<std::pair<float, uint32_t>> DiskANN<T, TagT, Dim, MaxTagsPerNode>::g
     auto visited_guard = std::unique_ptr<VisitedList, std::function<void(VisitedList*)>>(
         visited_nodes, [&](VisitedList* p) { _visited_list_pool->releaseVisitedList(p); });
 
-    visited_nodes->reset();
-
     thread_local static NeighborPriorityQueue best_L_nodes;
     best_L_nodes.clear();
     best_L_nodes.reserve(params.L_search);
 
-    // MODIFIED: Use the pre-fetched vector if available to avoid initial lock contention
+    // Seed from provided vector (cache hit) or disk
     if (visited_nodes->try_visit(start_node_id)) {
-        if (start_node_vec) {  // Use the cached vector if available
-            float dist = distance_metric->compare(aligned_query, start_node_vec, Dim);
+        if (start_node_vec) {
+            float dist = distance_metric.compare(aligned_query, start_node_vec, Dim);
             best_L_nodes.insert(Neighbor(start_node_id, dist));
-        } else {  // Fallback to fetching from disk if cache missed
+        } else {
             alignas(32) T vec_from_disk[Dim];
             if (getNodeVector(start_node_id, vec_from_disk)) {
-                float dist = distance_metric->compare(aligned_query, vec_from_disk, Dim);
+                float dist = distance_metric.compare(aligned_query, vec_from_disk, Dim);
                 best_L_nodes.insert(Neighbor(start_node_id, dist));
             } else {
                 visited_nodes->unvisit(start_node_id);
@@ -261,7 +320,7 @@ std::vector<std::pair<float, uint32_t>> DiskANN<T, TagT, Dim, MaxTagsPerNode>::g
         }
     }
 
-    // HIGH-PERFORMANCE BEAM EXPANSION LOOP
+    // Beam expand
     std::vector<uint32_t> expansion_candidate_ids;
     std::vector<uint32_t> all_neighbors_from_beam;
     std::vector<uint32_t> unvisited_neighbors_ids;
@@ -297,7 +356,7 @@ std::vector<std::pair<float, uint32_t>> DiskANN<T, TagT, Dim, MaxTagsPerNode>::g
         unvisited_neighbors_ids.clear();
         unvisited_neighbors_ids.reserve(all_neighbors_from_beam.size());
         for (uint32_t neighbor_id : all_neighbors_from_beam) {
-            if (!_deleted_nodes.contains(neighbor_id) && visited_nodes->try_visit(neighbor_id)) {
+            if (visited_nodes->try_visit(neighbor_id)) {
                 unvisited_neighbors_ids.push_back(neighbor_id);
             }
         }
@@ -311,7 +370,6 @@ std::vector<std::pair<float, uint32_t>> DiskANN<T, TagT, Dim, MaxTagsPerNode>::g
             }
             size_t tags_offset = 0;
             for (size_t i = 0; i < unvisited_neighbors_ids.size(); ++i) {
-                uint32_t id = unvisited_neighbors_ids[i];
                 uint16_t tag_count = data_batch.tag_counts[i];
                 bool has_label = false;
                 std::span<const TagT> current_tags(data_batch.tags.data() + tags_offset, tag_count);
@@ -324,8 +382,8 @@ std::vector<std::pair<float, uint32_t>> DiskANN<T, TagT, Dim, MaxTagsPerNode>::g
                 tags_offset += tag_count;
                 if (has_label) {
                     const T* vector = data_batch.vectors.data() + i * Dim;
-                    float dist = distance_metric->compare(aligned_query, vector, Dim);
-                    best_L_nodes.insert(Neighbor(id, dist));
+                    float dist = distance_metric.compare(aligned_query, vector, Dim);
+                    best_L_nodes.insert(Neighbor(unvisited_neighbors_ids[i], dist));
                 }
             }
         } else {
@@ -336,10 +394,9 @@ std::vector<std::pair<float, uint32_t>> DiskANN<T, TagT, Dim, MaxTagsPerNode>::g
                 continue;
             }
             for (size_t i = 0; i < unvisited_neighbors_ids.size(); ++i) {
-                uint32_t id = unvisited_neighbors_ids[i];
                 const T* vector = neighbor_vectors.data() + i * Dim;
-                float dist = distance_metric->compare(aligned_query, vector, Dim);
-                best_L_nodes.insert(Neighbor(id, dist));
+                float dist = distance_metric.compare(aligned_query, vector, Dim);
+                best_L_nodes.insert(Neighbor(unvisited_neighbors_ids[i], dist));
             }
         }
     }
@@ -364,8 +421,6 @@ std::vector<std::pair<float, uint32_t>> DiskANN<T, TagT, Dim, MaxTagsPerNode>::g
     auto visited_guard = std::unique_ptr<VisitedList, std::function<void(VisitedList*)>>(
         visited_nodes, [&](VisitedList* p) { _visited_list_pool->releaseVisitedList(p); });
 
-    visited_nodes->reset();
-
     thread_local static NeighborPriorityQueue best_L_nodes;
     best_L_nodes.clear();
     best_L_nodes.reserve(params.L_search);
@@ -374,7 +429,7 @@ std::vector<std::pair<float, uint32_t>> DiskANN<T, TagT, Dim, MaxTagsPerNode>::g
         if (visited_nodes->try_visit(start_node)) {
             alignas(32) T start_node_vec[Dim];
             if (getNodeVector(start_node, start_node_vec)) {
-                float dist = distance_metric->compare(aligned_query, start_node_vec, Dim);
+                float dist = distance_metric.compare(aligned_query, start_node_vec, Dim);
                 best_L_nodes.insert(Neighbor(start_node, dist));
             } else {
                 visited_nodes->unvisit(start_node);
@@ -406,10 +461,9 @@ std::vector<std::pair<float, uint32_t>> DiskANN<T, TagT, Dim, MaxTagsPerNode>::g
         }
 
         for (size_t i = 0; i < unvisited_neighbors_ids.size(); ++i) {
-            uint32_t neighbor_id = unvisited_neighbors_ids[i];
             const T* vector = neighbor_vectors.data() + i * Dim;
-            float dist = distance_metric->compare(aligned_query, vector, Dim);
-            best_L_nodes.insert(Neighbor(neighbor_id, dist));
+            float dist = distance_metric.compare(aligned_query, vector, Dim);
+            best_L_nodes.insert(Neighbor(unvisited_neighbors_ids[i], dist));
         }
     }
 
@@ -422,15 +476,17 @@ std::vector<std::pair<float, uint32_t>> DiskANN<T, TagT, Dim, MaxTagsPerNode>::g
     return results;
 }
 
-// =========================================================================
+// ========================================================================
 // BUILD PROCESS & OTHER FUNCTIONS
-// =========================================================================
+// ========================================================================
 
 template <typename T, typename TagT, size_t Dim, size_t MaxTagsPerNode>
 void DiskANN<T, TagT, Dim, MaxTagsPerNode>::build_typed(const T* data, const std::vector<std::vector<TagT>>& tags,
                                                         uint64_t num_points, const BuildParams& params) {
     if (num_points > _max_elements) throw std::runtime_error("Number of points exceeds max_elements capacity.");
     std::cout << "Starting index build for " << num_points << " points with R=" << _R_max_degree << "..." << std::endl;
+
+    // Phase 1: write vectors & tags
     std::cout << "Phase 1/4: Writing vector and tag data..." << std::endl;
     if (!_is_dynamic) {
         std::unique_lock<std::shared_mutex> lock(_map_lock);
@@ -440,11 +496,11 @@ void DiskANN<T, TagT, Dim, MaxTagsPerNode>::build_typed(const T* data, const std
         for (uint32_t i = 0; i < num_points; ++i) _external_to_internal_map[i] = i;
     }
     for (uint64_t i = 0; i < num_points; ++i) {
-        PID pid = getNodePID(i);
+        PID pid = getNodePID(static_cast<uint32_t>(i));
         GuardX<VamanaPage> page_guard(pid);
         page_guard->node_count_in_page =
-            std::max(page_guard->node_count_in_page, static_cast<uint16_t>(getNodeIndexInPage(i) + 1));
-        MutableNodeAccessor acc(page_guard.ptr, getNodeIndexInPage(i), this);
+            std::max(page_guard->node_count_in_page, static_cast<uint16_t>(getNodeIndexInPage(static_cast<uint32_t>(i)) + 1));
+        MutableNodeAccessor acc(page_guard.ptr, getNodeIndexInPage(static_cast<uint32_t>(i)), this);
         acc.setVector(data + i * Dim);
         acc.setTags(tags[i]);
     }
@@ -454,154 +510,213 @@ void DiskANN<T, TagT, Dim, MaxTagsPerNode>::build_typed(const T* data, const std
         meta_guard->is_layout_optimized = false;
     }
     _is_layout_optimized = false;
+
+    // Phase 2: medoids
     std::cout << "Phase 2/4: Computing medoids..." << std::endl;
     compute_medoids(num_points);
+
+    // Phase 3: random graph init (no hash allocations)
     std::cout << "Phase 3/4: Initializing random graph..." << std::endl;
     std::mt19937 rng(1001);
     for (uint32_t i = 0; i < num_points; ++i) {
         std::vector<uint32_t> neighbors;
-        std::uniform_int_distribution<uint32_t> dist(0, num_points - 1);
-        std::unordered_set<uint32_t> chosen;
-        while (chosen.size() < _R_max_degree && chosen.size() < num_points - 1) {
-            uint32_t neighbor = dist(rng);
-            if (neighbor != i) chosen.insert(neighbor);
+        neighbors.reserve(_R_max_degree);
+        VisitedList* vis = _visited_list_pool->getFreeVisitedList();
+        vis->try_visit(i);  // avoid self
+        std::uniform_int_distribution<uint32_t> dist(0, static_cast<uint32_t>(num_points - 1));
+        while (neighbors.size() < _R_max_degree && neighbors.size() < num_points - 1) {
+            uint32_t cand = dist(rng);
+            if (vis->try_visit(cand)) {
+                if (cand != i) neighbors.push_back(cand);
+            }
         }
-        neighbors.assign(chosen.begin(), chosen.end());
+        _visited_list_pool->releaseVisitedList(vis);
+
         PID pid = getNodePID(i);
         GuardX<VamanaPage> page_guard(pid);
         MutableNodeAccessor acc(page_guard.ptr, getNodeIndexInPage(i), this);
         acc.setNeighbors(neighbors);
     }
+
+    // Phase 4: Vamana refinement
     std::cout << "Phase 4/4: Running Vamana refinement passes..." << std::endl;
     std::vector<uint32_t> permutation(num_points);
     std::iota(permutation.begin(), permutation.end(), 0);
+
     auto run_pass = [&](float alpha, bool filter_aware, int pass_num) {
         std::cout << "  - Pass " << pass_num << " with alpha=" << alpha << "..." << std::endl;
         std::shuffle(permutation.begin(), permutation.end(), rng);
-        std::atomic<size_t> processed_count = 0;
+
+        std::atomic<size_t> processed_count{0};
         size_t num_threads = (params.num_threads == 0) ? omp_get_max_threads() : params.num_threads;
-        omp_set_num_threads(num_threads);
-#pragma omp parallel for schedule(dynamic, 64)
-        for (uint64_t i = 0; i < num_points; ++i) {
-            uint32_t node_id = permutation[i];
+        omp_set_num_threads(static_cast<int>(num_threads));
+
+#pragma omp parallel for schedule(static)  // static keeps better locality and avoids scheduler contention
+        for (size_t i = 0; i < num_points; ++i) {
+            const uint32_t node_id = permutation[i];
+
+            // Per-thread reusable buffers
+            alignas(32) T query_vec[Dim];
+            std::vector<TagT> node_tags;
+            std::vector<uint32_t> start_nodes;
+
             for (;;) {
                 try {
-                    alignas(32) T query_vec[Dim];
-                    std::vector<TagT> node_tags;
                     if (!getNodeVector(node_id, query_vec)) throw OLCRestartException();
-                    if (filter_aware && !getNodeTags(node_id, node_tags)) throw OLCRestartException();
-                    std::vector<uint32_t> start_nodes;
                     if (filter_aware) {
-                        for (const TagT& tag : node_tags)
-                            if (_medoids.count(tag)) start_nodes.push_back(_medoids.at(tag));
+                        node_tags.clear();
+                        if (!getNodeTags(node_id, node_tags)) throw OLCRestartException();
+                        start_nodes.clear();
+                        for (const TagT& tag : node_tags) {
+                            auto it = _medoids.find(tag);
+                            if (it != _medoids.end()) start_nodes.push_back(it->second);
+                        }
+                    } else {
+                        start_nodes.clear();
                     }
+
                     if (start_nodes.empty() && !_medoids.empty()) start_nodes.push_back(_medoids.begin()->second);
                     if (start_nodes.empty()) start_nodes.push_back(0);
+
                     SearchParams search_params{params.L_build, 4};
                     auto candidates_with_dist =
                         greedy_search_original(start_nodes, query_vec, params.L_build, search_params, nullptr);
+
                     robust_prune_batched(node_id, candidates_with_dist, alpha, filter_aware);
+
                     std::vector<uint32_t> final_neighbors;
+                    final_neighbors.reserve(candidates_with_dist.size());
                     for (const auto& p : candidates_with_dist) final_neighbors.push_back(p.second);
+
                     connect_neighbors_batched(node_id, final_neighbors, params, filter_aware);
                     break;
                 } catch (const OLCRestartException&) {
                     continue;
                 }
             }
-            size_t count = processed_count.fetch_add(1);
-            if ((count + 1) % (num_points / 100 + 1) == 0)
-                std::cout << "\r    Processed " << count + 1 << "/" << num_points << " nodes." << std::flush;
+
+            size_t count = processed_count.fetch_add(1) + 1;
+            if ((count % (num_points / 100 + 1)) == 0) {
+                std::cout << "\r    Processed " << count << "/" << num_points << " nodes." << std::flush;
+            }
         }
         std::cout << std::endl;
     };
+
     run_pass(1.0f, true, 1);
     run_pass(params.alpha, true, 2);
+
     std::cout << "Build complete." << std::endl;
+
     optimize_layout();
     std::cout << "Layout optimization finished. Index is ready for search." << std::endl;
 }
 
 template <typename T, typename TagT, size_t Dim, size_t MaxTagsPerNode>
-void DiskANN<T, TagT, Dim, MaxTagsPerNode>::robust_prune_batched(uint32_t p_id,
+void DiskANN<T, TagT, Dim, MaxTagsPerNode>::robust_prune_batched(uint32_t /*p_id*/,
                                                                  std::vector<std::pair<float, uint32_t>>& candidates,
-                                                                 float alpha, bool filter_aware) {
+                                                                 float alpha, bool /*filter_aware*/) {
     if (candidates.empty()) return;
-    std::sort(candidates.begin(), candidates.end());
 
-    std::vector<uint32_t> candidate_ids;
-    candidate_ids.reserve(candidates.size());
-    for (const auto& pair : candidates) candidate_ids.push_back(pair.second);
+    // Keep only top alpha*R by distance (partial-select), then do linear pruning with early stop.
+    const size_t R = _R_max_degree;
+    const size_t alphaR = std::min(candidates.size(), (size_t)std::ceil(alpha * R));
+    std::nth_element(candidates.begin(), candidates.begin() + alphaR, candidates.end(),
+                     [](const auto& a, const auto& b) { return a.first < b.first; });
+    candidates.resize(alphaR);
+    std::sort(candidates.begin(), candidates.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
 
-    std::vector<T, AlignedAllocator<T, 32>> candidate_vectors(candidate_ids.size() * Dim);
-    if (!get_vectors_batch(candidate_ids, candidate_vectors.data())) {
-        if (candidates.size() > _R_max_degree) candidates.resize(_R_max_degree);
+    // Batch fetch vectors of the reduced candidate set.
+    thread_local static std::vector<uint32_t> ids;
+    ids.clear();
+    ids.reserve(candidates.size());
+    for (auto& p : candidates) ids.push_back(p.second);
+
+    thread_local static std::vector<T, AlignedAllocator<T, 32>> cand_vecs;
+    cand_vecs.resize(ids.size() * Dim);
+    if (!get_vectors_batch(ids, cand_vecs.data())) {
+        if (candidates.size() > R) candidates.resize(R);
         return;
     }
 
-    std::vector<std::pair<float, uint32_t>> new_neighbors;
-    new_neighbors.reserve(_R_max_degree);
-    std::vector<bool> pruned(candidates.size(), false);
+    std::vector<std::pair<float, uint32_t>> out;
+    out.reserve(R);
+    std::vector<uint8_t> pruned(candidates.size(), 0);
 
-    for (size_t i = 0; i < candidates.size(); ++i) {
-        if (new_neighbors.size() >= _R_max_degree) break;
+    for (size_t i = 0; i < candidates.size() && out.size() < R; ++i) {
         if (pruned[i]) continue;
-        new_neighbors.push_back(candidates[i]);
-        const T* p_star_vec = candidate_vectors.data() + i * Dim;
+        out.push_back(candidates[i]);
+        const T* vi = cand_vecs.data() + i * Dim;
 
+        // Local triangle pruning within the reduced window; early exit if R reached.
         for (size_t j = i + 1; j < candidates.size(); ++j) {
             if (pruned[j]) continue;
-            const T* p_prime_vec = candidate_vectors.data() + j * Dim;
-            float dist_p_star_p_prime = distance_metric->compare(p_star_vec, p_prime_vec, Dim);
-            if (alpha * dist_p_star_p_prime < candidates[j].first) pruned[j] = true;
+            const T* vj = cand_vecs.data() + j * Dim;
+            float dij = distance_metric.compare(vi, vj, Dim);
+            if (alpha * dij < candidates[j].first) pruned[j] = 1;
         }
     }
-    candidates = new_neighbors;
+
+    candidates.swap(out);
 }
 
 template <typename T, typename TagT, size_t Dim, size_t MaxTagsPerNode>
 void DiskANN<T, TagT, Dim, MaxTagsPerNode>::connect_neighbors_batched(uint32_t node_id,
                                                                       const std::vector<uint32_t>& neighbors,
                                                                       const BuildParams& params, bool filter_aware) {
+    // Write N(node_id) once.
     {
         GuardX<VamanaPage> page_guard(getNodePID(node_id));
         MutableNodeAccessor acc(page_guard.ptr, getNodeIndexInPage(node_id), this);
         acc.setNeighbors(neighbors);
     }
-    for (uint32_t neighbor_id : neighbors) {
+
+    // For each v in N(node_id), ensure symmetry v <- node_id with bounded pruning if needed.
+    // We keep locking narrow and only recompute when degree overflow occurs.
+    for (uint32_t v : neighbors) {
         for (;;) {
             try {
-                std::vector<uint32_t> neighbor_current_neighbors;
-                if (!getNodeNeighbors(neighbor_id, neighbor_current_neighbors)) throw OLCRestartException();
-                bool already_connected = false;
-                for (uint32_t n : neighbor_current_neighbors)
-                    if (n == node_id) {
-                        already_connected = true;
+                std::vector<uint32_t> nbors_v;
+                if (!getNodeNeighbors(v, nbors_v)) throw OLCRestartException();
+
+                // Quick check: already connected?
+                bool connected = false;
+                for (uint32_t u : nbors_v) {
+                    if (u == node_id) {
+                        connected = true;
                         break;
                     }
-                if (already_connected) break;
-                neighbor_current_neighbors.push_back(node_id);
-                if (neighbor_current_neighbors.size() > _R_max_degree) {
-                    std::vector<T, AlignedAllocator<T, 32>> local_vectors(neighbor_current_neighbors.size() * Dim);
-                    if (!get_vectors_batch(neighbor_current_neighbors, local_vectors.data()))
-                        throw OLCRestartException();
-                    alignas(32) T neighbor_vec_query[Dim];
-                    if (!getNodeVector(neighbor_id, neighbor_vec_query)) throw OLCRestartException();
-                    std::vector<std::pair<float, uint32_t>> candidates_to_prune;
-                    candidates_to_prune.reserve(neighbor_current_neighbors.size());
-                    for (size_t i = 0; i < neighbor_current_neighbors.size(); ++i) {
-                        candidates_to_prune.push_back(
-                            {distance_metric->compare(neighbor_vec_query, local_vectors.data() + i * Dim, Dim),
-                             neighbor_current_neighbors[i]});
-                    }
-                    robust_prune_batched(neighbor_id, candidates_to_prune, params.alpha, filter_aware);
-                    neighbor_current_neighbors.clear();
-                    for (const auto& p : candidates_to_prune) neighbor_current_neighbors.push_back(p.second);
                 }
-                {
-                    GuardX<VamanaPage> x_guard(getNodePID(neighbor_id));
-                    MutableNodeAccessor x_acc(x_guard.ptr, getNodeIndexInPage(neighbor_id), this);
-                    x_acc.setNeighbors(neighbor_current_neighbors);
+                if (!connected) {
+                    nbors_v.push_back(node_id);
+                    if (nbors_v.size() > _R_max_degree) {
+                        // Bounded prune on v
+                        thread_local static std::vector<T, AlignedAllocator<T, 32>> vecs;
+                        vecs.resize(nbors_v.size() * Dim);
+                        if (!get_vectors_batch(nbors_v, vecs.data())) throw OLCRestartException();
+
+                        alignas(32) T v_query[Dim];
+                        if (!getNodeVector(v, v_query)) throw OLCRestartException();
+
+                        std::vector<std::pair<float, uint32_t>> cand;
+                        cand.reserve(nbors_v.size());
+                        for (size_t i = 0; i < nbors_v.size(); ++i) {
+                            float d = distance_metric.compare(v_query, vecs.data() + i * Dim, Dim);
+                            cand.emplace_back(d, nbors_v[i]);
+                        }
+                        robust_prune_batched(v, cand, params.alpha, filter_aware);
+                        nbors_v.clear();
+                        nbors_v.reserve(cand.size());
+                        for (auto& p : cand) nbors_v.push_back(p.second);
+                    }
+
+                    // Commit N(v)
+                    {
+                        GuardX<VamanaPage> xg(getNodePID(v));
+                        MutableNodeAccessor xacc(xg.ptr, getNodeIndexInPage(v), this);
+                        xacc.setNeighbors(nbors_v);
+                    }
                 }
                 break;
             } catch (const OLCRestartException&) {
@@ -610,12 +725,14 @@ void DiskANN<T, TagT, Dim, MaxTagsPerNode>::connect_neighbors_batched(uint32_t n
         }
     }
 }
+
 template <typename T, typename TagT, size_t Dim, size_t MaxTagsPerNode>
 void DiskANN<T, TagT, Dim, MaxTagsPerNode>::optimize_layout() {
     if (_is_dynamic) {
         std::cerr << "Warning: Layout optimization is intended for static indices..." << std::endl;
     }
-    uint64_t num_points;
+
+    uint64_t num_points = 0;
     for (;;) {
         try {
             GuardO<DiskANNMetadataPage> meta_guard(_metadata_pid);
@@ -631,7 +748,10 @@ void DiskANN<T, TagT, Dim, MaxTagsPerNode>::optimize_layout() {
         }
     }
     if (num_points == 0) return;
+
     std::cout << "Starting graph layout optimization for " << num_points << " points..." << std::endl;
+
+    // Phase 1: BFS ordering
     std::cout << "Phase 1/4: Calculating BFS ordering..." << std::endl;
     std::vector<uint32_t> new_id_to_old_id(num_points);
     std::vector<int32_t> old_id_to_new_id(num_points, -1);
@@ -641,6 +761,7 @@ void DiskANN<T, TagT, Dim, MaxTagsPerNode>::optimize_layout() {
     q.push(start_node);
     visited[start_node] = true;
     uint32_t current_new_id = 0;
+
     while (current_new_id < num_points) {
         if (q.empty()) {
             bool found_unvisited = false;
@@ -659,6 +780,7 @@ void DiskANN<T, TagT, Dim, MaxTagsPerNode>::optimize_layout() {
         new_id_to_old_id[current_new_id] = current_old_id;
         old_id_to_new_id[current_old_id] = current_new_id;
         current_new_id++;
+
         std::vector<uint32_t> neighbors;
         for (;;) {
             try {
@@ -675,6 +797,8 @@ void DiskANN<T, TagT, Dim, MaxTagsPerNode>::optimize_layout() {
             }
         }
     }
+
+    // Phase 2: read original node blobs
     std::cout << "Phase 2/4: Reading original index data into memory snapshot..." << std::endl;
     std::vector<uint8_t> original_data_buffer(num_points * _FixedNodeSize);
     for (uint32_t old_id = 0; old_id < num_points; ++old_id) {
@@ -689,29 +813,38 @@ void DiskANN<T, TagT, Dim, MaxTagsPerNode>::optimize_layout() {
             }
         }
     }
+
+    // Phase 3: remap and write back
     std::cout << "Phase 3/4: Constructing and writing final index..." << std::endl;
     std::vector<uint8_t> temp_node_buffer(_FixedNodeSize);
     for (uint32_t new_id = 0; new_id < num_points; ++new_id) {
         uint32_t old_id_source = new_id_to_old_id[new_id];
         const uint8_t* src_node_ptr = original_data_buffer.data() + old_id_source * _FixedNodeSize;
+
         memcpy(temp_node_buffer.data(), src_node_ptr, VectorSize + TagsHeaderSize + TagsDataSize);
+
         const uint16_t* old_count_ptr =
             reinterpret_cast<const uint16_t*>(src_node_ptr + VectorSize + TagsHeaderSize + TagsDataSize);
         const uint32_t* old_neighbors_data_ptr = reinterpret_cast<const uint32_t*>(old_count_ptr + 1);
         const uint16_t neighbor_count = *old_count_ptr;
+
         uint16_t* new_count_ptr =
             reinterpret_cast<uint16_t*>(temp_node_buffer.data() + VectorSize + TagsHeaderSize + TagsDataSize);
         uint32_t* new_neighbors_data_ptr = reinterpret_cast<uint32_t*>(new_count_ptr + 1);
         *new_count_ptr = neighbor_count;
+
         for (uint16_t i = 0; i < neighbor_count; ++i) {
             uint32_t old_neighbor_id = old_neighbors_data_ptr[i];
             new_neighbors_data_ptr[i] =
-                (old_neighbor_id < num_points) ? old_id_to_new_id[old_neighbor_id] : old_neighbor_id;
+                (old_neighbor_id < num_points) ? static_cast<uint32_t>(old_id_to_new_id[old_neighbor_id]) : old_neighbor_id;
         }
+
         GuardX<VamanaPage> page_guard(getNodePID(new_id));
         uint8_t* dest_on_disk_ptr = page_guard->getNodeData() + getNodeIndexInPage(new_id) * _FixedNodeSize;
         memcpy(dest_on_disk_ptr, temp_node_buffer.data(), _FixedNodeSize);
     }
+
+    // Phase 4: update maps
     std::cout << "Phase 4/4: Updating internal ID maps..." << std::endl;
     {
         std::unique_lock<std::shared_mutex> lock(_map_lock);
@@ -721,6 +854,7 @@ void DiskANN<T, TagT, Dim, MaxTagsPerNode>::optimize_layout() {
             new_internal_to_external_map[new_id] = _internal_to_external_map[old_id];
         }
         _internal_to_external_map = std::move(new_internal_to_external_map);
+
         _external_to_internal_map.clear();
         _external_to_internal_map.reserve(num_points);
         for (uint32_t new_id = 0; new_id < num_points; ++new_id) {
@@ -728,10 +862,12 @@ void DiskANN<T, TagT, Dim, MaxTagsPerNode>::optimize_layout() {
         }
     }
     for (auto& pair : _medoids) {
-        if (pair.second < num_points) pair.second = old_id_to_new_id[pair.second];
+        if (pair.second < num_points) pair.second = static_cast<uint32_t>(old_id_to_new_id[pair.second]);
     }
-    // After remapping IDs, the vector cache is invalid and must be repopulated.
+
+    // Refresh medoid caches after remap
     compute_medoids(num_points);
+
     {
         GuardX<DiskANNMetadataPage> meta_guard(_metadata_pid);
         meta_guard->is_layout_optimized = true;
@@ -777,7 +913,6 @@ std::vector<std::pair<float, uint32_t>> DiskANN<T, TagT, Dim, MaxTagsPerNode>::s
         }
     }
     auto internal_results = greedy_search_final(start_node_id, start_node_vec, query, K, params, nullptr);
-    std::shared_lock<std::shared_mutex> lock(_map_lock);
     for (auto& pair : internal_results) {
         if (pair.second < _internal_to_external_map.size()) {
             pair.second = _internal_to_external_map[pair.second];
@@ -810,7 +945,6 @@ std::vector<std::pair<float, uint32_t>> DiskANN<T, TagT, Dim, MaxTagsPerNode>::s
         start_node_vec = cache_it->second.data();
     }
     auto internal_results = greedy_search_final(start_node_id, start_node_vec, query, K, params, &filter_label);
-    std::shared_lock<std::shared_mutex> lock(_map_lock);
     for (auto& pair : internal_results) {
         if (pair.second < _internal_to_external_map.size()) {
             pair.second = _internal_to_external_map[pair.second];
@@ -822,7 +956,7 @@ std::vector<std::pair<float, uint32_t>> DiskANN<T, TagT, Dim, MaxTagsPerNode>::s
 template <typename T, typename TagT, size_t Dim, size_t MaxTagsPerNode>
 bool DiskANN<T, TagT, Dim, MaxTagsPerNode>::getNodeVector(uint32_t node_id, T* dest_vector) const {
     try {
-        GuardO<VamanaPage> page_guard(getNodePID(node_id));
+        GuardORelaxed<VamanaPage> page_guard(getNodePID(node_id));
         NodeAccessor acc(page_guard.ptr, getNodeIndexInPage(node_id), this);
         memcpy(dest_vector, acc.getVector(), VectorSize);
         return true;
@@ -833,7 +967,7 @@ bool DiskANN<T, TagT, Dim, MaxTagsPerNode>::getNodeVector(uint32_t node_id, T* d
 template <typename T, typename TagT, size_t Dim, size_t MaxTagsPerNode>
 bool DiskANN<T, TagT, Dim, MaxTagsPerNode>::getNodeTags(uint32_t node_id, std::vector<TagT>& dest_tags) const {
     try {
-        GuardO<VamanaPage> page_guard(getNodePID(node_id));
+        GuardORelaxed<VamanaPage> page_guard(getNodePID(node_id));
         NodeAccessor acc(page_guard.ptr, getNodeIndexInPage(node_id), this);
         auto tags_span = acc.getTags();
         dest_tags.assign(tags_span.begin(), tags_span.end());
@@ -868,89 +1002,98 @@ template <typename T, typename TagT, size_t Dim, size_t MaxTagsPerNode>
 void DiskANN<T, TagT, Dim, MaxTagsPerNode>::compute_medoids(uint64_t num_points) {
     if (num_points == 0) return;
     std::cout << "Computing medoids using centroid method..." << std::endl;
+
     _medoids.clear();
-    _medoid_vectors_cache.clear();  // Clear the cache before re-computing
+    _medoid_vectors_cache.clear();
+
     std::unordered_map<TagT, std::vector<uint32_t>> points_by_tag;
     for (uint32_t i = 0; i < num_points; ++i) {
         std::vector<TagT> tags;
-        if (getNodeTags(i, tags))
+        if (getNodeTags(i, tags)) {
             for (const auto& tag : tags) points_by_tag[tag].push_back(i);
+        }
     }
+
+    // Universal tag
     TagT universal_tag_key = std::numeric_limits<TagT>::max();
     points_by_tag[universal_tag_key].reserve(num_points);
     for (uint32_t i = 0; i < num_points; ++i) points_by_tag[universal_tag_key].push_back(i);
 
-    for (auto const& [tag, points] : points_by_tag) {
+    // Compute centroid & select closest point per tag
+    for (const auto& kv : points_by_tag) {
+        const TagT tag = kv.first;
+        const auto& points = kv.second;
         if (points.empty()) continue;
+
         std::vector<double> centroid(Dim, 0.0);
-        size_t points_in_centroid = 0;
-        const size_t BATCH_SIZE = 1024;
-        std::vector<T, AlignedAllocator<T, 32>> vector_batch(BATCH_SIZE * Dim);
-        std::vector<uint32_t> id_batch;
-        id_batch.reserve(BATCH_SIZE);
-        for (uint32_t point_id : points) {
-            id_batch.push_back(point_id);
-            if (id_batch.size() == BATCH_SIZE) {
-                if (get_vectors_batch(id_batch, vector_batch.data())) {
-                    for (size_t i = 0; i < id_batch.size(); ++i)
-                        for (size_t d = 0; d < Dim; ++d) centroid[d] += vector_batch[i * Dim + d];
-                    points_in_centroid += id_batch.size();
+        size_t count = 0;
+
+        const size_t BATCH = 1024;
+        thread_local static std::vector<T, AlignedAllocator<T, 32>> vec_batch;
+        thread_local static std::vector<uint32_t> id_batch;
+        vec_batch.resize(BATCH * Dim);
+        id_batch.clear();
+        id_batch.reserve(BATCH);
+
+        auto flush_acc = [&]() {
+            if (id_batch.empty()) return;
+            if (get_vectors_batch(id_batch, vec_batch.data())) {
+                for (size_t i = 0; i < id_batch.size(); ++i) {
+                    const T* v = vec_batch.data() + i * Dim;
+                    for (size_t d = 0; d < Dim; ++d) centroid[d] += v[d];
                 }
-                id_batch.clear();
+                count += id_batch.size();
             }
+            id_batch.clear();
+        };
+
+        for (uint32_t pid : points) {
+            id_batch.push_back(pid);
+            if (id_batch.size() == BATCH) flush_acc();
         }
-        if (!id_batch.empty()) {
-            std::vector<T, AlignedAllocator<T, 32>> leftover_vector_batch(id_batch.size() * Dim);
-            if (get_vectors_batch(id_batch, leftover_vector_batch.data())) {
-                for (size_t i = 0; i < id_batch.size(); ++i)
-                    for (size_t d = 0; d < Dim; ++d) centroid[d] += leftover_vector_batch[i * Dim + d];
-                points_in_centroid += id_batch.size();
-            }
-        }
-        if (points_in_centroid == 0) continue;
-        for (size_t d = 0; d < Dim; ++d) centroid[d] /= points_in_centroid;
+        flush_acc();
+
+        if (count == 0) continue;
+        for (size_t d = 0; d < Dim; ++d) centroid[d] /= static_cast<double>(count);
+
         std::vector<T, AlignedAllocator<T, 32>> centroid_T(Dim);
         for (size_t d = 0; d < Dim; ++d) centroid_T[d] = static_cast<T>(centroid[d]);
 
-        float min_dist_sq = std::numeric_limits<float>::max();
-        uint32_t medoid_id = points[0];
+        // Select nearest to centroid
+        float best = std::numeric_limits<float>::max();
+        uint32_t medoid = points[0];
+
         id_batch.clear();
-        for (uint32_t point_id : points) {
-            id_batch.push_back(point_id);
-            if (id_batch.size() == BATCH_SIZE) {
-                if (get_vectors_batch(id_batch, vector_batch.data())) {
-                    for (size_t i = 0; i < id_batch.size(); ++i) {
-                        float dist_sq = distance_metric->compare(centroid_T.data(), vector_batch.data() + i * Dim, Dim);
-                        if (dist_sq < min_dist_sq) {
-                            min_dist_sq = dist_sq;
-                            medoid_id = id_batch[i];
-                        }
-                    }
-                }
-                id_batch.clear();
-            }
-        }
-        if (!id_batch.empty()) {
-            std::vector<T, AlignedAllocator<T, 32>> leftover_vector_batch(id_batch.size() * Dim);
-            if (get_vectors_batch(id_batch, leftover_vector_batch.data())) {
+        auto flush_sel = [&]() {
+            if (id_batch.empty()) return;
+            if (get_vectors_batch(id_batch, vec_batch.data())) {
                 for (size_t i = 0; i < id_batch.size(); ++i) {
-                    float dist_sq =
-                        distance_metric->compare(centroid_T.data(), leftover_vector_batch.data() + i * Dim, Dim);
-                    if (dist_sq < min_dist_sq) {
-                        min_dist_sq = dist_sq;
-                        medoid_id = id_batch[i];
+                    float dist = distance_metric.compare(centroid_T.data(), vec_batch.data() + i * Dim, Dim);
+                    if (dist < best) {
+                        best = dist;
+                        medoid = id_batch[i];
                     }
                 }
             }
+            id_batch.clear();
+        };
+
+        for (uint32_t pid : points) {
+            id_batch.push_back(pid);
+            if (id_batch.size() == BATCH) flush_sel();
         }
+        flush_sel();
+
         TagT cache_key;
         if (tag == universal_tag_key) {
             if (_medoids.find(0) == _medoids.end()) {
-                _medoids[0] = medoid_id;
+                _medoids[0] = medoid;
                 cache_key = 0;
+            } else {
+                cache_key = 0;  // keep for cache fill below if missing
             }
         } else {
-            _medoids[tag] = medoid_id;
+            _medoids[tag] = medoid;
             cache_key = tag;
         }
 
@@ -958,18 +1101,19 @@ void DiskANN<T, TagT, Dim, MaxTagsPerNode>::compute_medoids(uint64_t num_points)
             _medoid_vectors_cache[cache_key].resize(Dim);
             if (!getNodeVector(_medoids[cache_key], _medoid_vectors_cache[cache_key].data())) {
                 _medoid_vectors_cache.erase(cache_key);
-                std::cerr << "Warning: Failed to fetch and cache vector for medoid with tag " << cache_key << std::endl;
+                std::cerr << "Warning: Failed to cache vector for medoid tag " << cache_key << std::endl;
             }
         }
     }
+
     if (_medoids.empty() && num_points > 0) {
-        _medoids[0] = num_points / 2;
-        // Also cache this fallback medoid
+        _medoids[0] = static_cast<uint32_t>(num_points / 2);
         _medoid_vectors_cache[0].resize(Dim);
         if (!getNodeVector(_medoids[0], _medoid_vectors_cache[0].data())) {
             _medoid_vectors_cache.erase(0);
         }
     }
+
     std::cout << "Computed " << _medoids.size() << " medoids using centroid method." << std::endl;
 }
 
@@ -996,6 +1140,7 @@ void DiskANN<T, TagT, Dim, MaxTagsPerNode>::insert_point_typed(const T* point, c
     if (_is_layout_optimized)
         std::cerr << "Warning: Inserting into an optimized-layout index will degrade performance over time."
                   << std::endl;
+
     uint32_t internal_id;
     {
         std::unique_lock<std::shared_mutex> lock(_map_lock);
@@ -1007,6 +1152,7 @@ void DiskANN<T, TagT, Dim, MaxTagsPerNode>::insert_point_typed(const T* point, c
         }
         _external_to_internal_map[external_id] = internal_id;
         _internal_to_external_map.push_back(external_id);
+
         PID pid = getNodePID(internal_id);
         GuardX<VamanaPage> page_guard(pid);
         page_guard->node_count_in_page =
@@ -1016,23 +1162,28 @@ void DiskANN<T, TagT, Dim, MaxTagsPerNode>::insert_point_typed(const T* point, c
         acc.setTags(tags);
         acc.setNeighbors({});
     }
+
     std::vector<uint32_t> start_nodes;
     for (const TagT& tag : tags)
         if (_medoids.count(tag)) start_nodes.push_back(_medoids.at(tag));
     if (start_nodes.empty() && !_medoids.empty()) start_nodes.push_back(_medoids.begin()->second);
     if (start_nodes.empty() && internal_id > 0) start_nodes.push_back(0);
     if (start_nodes.empty()) return;
+
     BuildParams insert_build_params;
     SearchParams insert_search_params{insert_build_params.L_build, 4};
     auto candidates_with_dist =
         greedy_search_original(start_nodes, point, insert_build_params.L_build, insert_search_params, nullptr);
     robust_prune_batched(internal_id, candidates_with_dist, insert_build_params.alpha, true);
+
     std::vector<uint32_t> final_neighbors;
+    final_neighbors.reserve(candidates_with_dist.size());
     for (const auto& p : candidates_with_dist) final_neighbors.push_back(p.second);
+
     connect_neighbors_batched(internal_id, final_neighbors, insert_build_params, true);
 }
 template <typename T, typename TagT, size_t Dim, size_t MaxTagsPerNode>
-void DiskANN<T, TagT, Dim, MaxTagsPerNode>::consolidate_deletes(const BuildParams& params) {
+void DiskANN<T, TagT, Dim, MaxTagsPerNode>::consolidate_deletes(const BuildParams& /*params*/) {
     throw std::runtime_error("consolidate_deletes not fully implemented in this optimized version yet.");
 }
 template <typename T, typename TagT, size_t Dim, size_t MaxTagsPerNode>
@@ -1040,16 +1191,79 @@ std::vector<std::vector<std::pair<float, uint32_t>>> DiskANN<T, TagT, Dim, MaxTa
     const void* queries, size_t num_queries, size_t K, const SearchParams& params, size_t num_threads) {
     return search_parallel_typed(static_cast<const T*>(queries), num_queries, K, params, num_threads);
 }
+
 template <typename T, typename TagT, size_t Dim, size_t MaxTagsPerNode>
 std::vector<std::vector<std::pair<float, uint32_t>>> DiskANN<T, TagT, Dim, MaxTagsPerNode>::search_parallel_typed(
     const T* queries_typed, size_t num_queries, size_t K, const SearchParams& params, size_t num_threads) {
     std::vector<std::vector<std::pair<float, uint32_t>>> all_results(num_queries);
     if (num_queries == 0) return all_results;
-    size_t threads_to_use = (num_threads == 0) ? omp_get_max_threads() : num_threads;
-#pragma omp parallel for num_threads(threads_to_use)
-    for (size_t i = 0; i < num_queries; ++i) all_results[i] = search_typed(queries_typed + i * Dim, K, params);
+
+    uint32_t num_points = 0;
+    for (;;) {
+        try {
+            GuardO<DiskANNMetadataPage> meta_guard(_metadata_pid);
+            if (meta_guard->node_count == 0) return all_results;
+            num_points = static_cast<uint32_t>(meta_guard->node_count);
+            if (_medoids.empty()) {
+                compute_medoids(meta_guard->node_count);
+            }
+            break;
+        } catch (const OLCRestartException&) {
+            continue;
+        }
+    }
+
+    const size_t threads_to_use = (num_threads == 0) ? omp_get_max_threads() : num_threads;
+
+    std::vector<uint32_t> entry_points;
+    entry_points.reserve(threads_to_use);
+    if (!_medoids.empty()) {
+        for (const auto& kv : _medoids) {
+            if (entry_points.size() == threads_to_use) break;
+            entry_points.push_back(kv.second);
+        }
+    }
+    if (entry_points.size() < threads_to_use) {
+        std::mt19937 rng(1001);
+        std::uniform_int_distribution<uint32_t> dist(0, num_points - 1);
+        while (entry_points.size() < threads_to_use) entry_points.push_back(dist(rng));
+    }
+
+    std::vector<std::vector<T, AlignedAllocator<T, 32>>> entry_point_vectors(entry_points.size());
+    for (size_t i = 0; i < entry_points.size(); ++i) {
+        entry_point_vectors[i].resize(Dim);
+        getNodeVector(entry_points[i], entry_point_vectors[i].data());
+    }
+
+#pragma omp parallel num_threads(threads_to_use)
+    {
+        const size_t tid = static_cast<size_t>(omp_get_thread_num());
+        const size_t nT = static_cast<size_t>(omp_get_num_threads());
+
+        const size_t chunk = (num_queries + nT - 1) / nT;
+        const size_t beg = tid * chunk;
+        const size_t end = std::min(num_queries, beg + chunk);
+
+        const uint32_t start_node_id = entry_points[tid % entry_points.size()];
+        const T* start_node_vec = entry_point_vectors[tid % entry_point_vectors.size()].data();
+
+        for (size_t i = beg; i < end; ++i) {
+            auto res = greedy_search_final(start_node_id, start_node_vec, queries_typed + i * Dim, K, params,
+                                           /*filter_label=*/nullptr);
+            if (!_internal_to_external_map.empty()) {
+                for (auto& p : res) {
+                    if (p.second < _internal_to_external_map.size()) {
+                        p.second = _internal_to_external_map[p.second];
+                    }
+                }
+            }
+            all_results[i] = std::move(res);
+        }
+    }
+
     return all_results;
 }
+
 template <typename T, typename TagT, size_t Dim, size_t MaxTagsPerNode>
 std::vector<std::vector<std::pair<float, uint32_t>>> DiskANN<T, TagT, Dim, MaxTagsPerNode>::search_with_filter_parallel(
     const void* queries, size_t num_queries, uint32_t filter_label, size_t K, const SearchParams& params,
@@ -1065,10 +1279,42 @@ DiskANN<T, TagT, Dim, MaxTagsPerNode>::search_with_filter_parallel_typed(const T
                                                                          size_t num_threads) {
     std::vector<std::vector<std::pair<float, uint32_t>>> all_results(num_queries);
     if (num_queries == 0) return all_results;
+
+    uint32_t start_node_id;
+    const T* start_node_vec = nullptr;
+
+    auto it = _medoids.find(filter_label);
+    if (it == _medoids.end()) {
+        it = _medoids.find(0);
+        if (it == _medoids.end() && !_medoids.empty()) it = _medoids.begin();
+        if (it == _medoids.end()) return {};
+    }
+    start_node_id = it->second;
+    auto cache_it = _medoid_vectors_cache.find(it->first);
+    if (cache_it != _medoid_vectors_cache.end()) {
+        start_node_vec = cache_it->second.data();
+    }
+
     size_t threads_to_use = (num_threads == 0) ? omp_get_max_threads() : num_threads;
-#pragma omp parallel for num_threads(threads_to_use)
-    for (size_t i = 0; i < num_queries; ++i)
-        all_results[i] = search_with_filter_typed(queries_typed + i * Dim, filter_label, K, params);
+#pragma omp parallel for num_threads(threads_to_use) schedule(static)
+    for (int64_t i = 0; i < static_cast<int64_t>(num_queries); ++i) {
+        all_results[static_cast<size_t>(i)] =
+            greedy_search_final(start_node_id, start_node_vec, queries_typed + static_cast<size_t>(i) * Dim, K, params,
+                                &filter_label);
+    }
+
+    if (!_internal_to_external_map.empty()) {
+#pragma omp parallel for num_threads(threads_to_use) schedule(static)
+        for (int64_t i = 0; i < static_cast<int64_t>(num_queries); ++i) {
+            auto& v = all_results[static_cast<size_t>(i)];
+            for (auto& p : v) {
+                if (p.second < _internal_to_external_map.size()) {
+                    p.second = _internal_to_external_map[p.second];
+                }
+            }
+        }
+    }
+
     return all_results;
 }
 

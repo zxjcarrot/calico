@@ -20,45 +20,39 @@
 //
 // Base Class Implementatons
 //
-template <typename T>
-float Distance<T>::compare(const T *a, const T *b, const float normA, const float normB, uint32_t length) const {
+float Distance::compare(const float *a, const float *b, const float normA, const float normB, uint32_t length) const {
     throw std::logic_error("This function is not implemented.");
 }
 
-template <typename T>
-uint32_t Distance<T>::post_normalization_dimension(uint32_t orig_dimension) const {
+
+uint32_t Distance::post_normalization_dimension(uint32_t orig_dimension) const {
     return orig_dimension;
 }
 
-template <typename T>
-Metric Distance<T>::get_metric() const {
+Metric Distance::get_metric() const {
     return _distance_metric;
 }
 
-template <typename T>
-bool Distance<T>::preprocessing_required() const {
+bool Distance::preprocessing_required() const {
     return false;
 }
 
-template <typename T>
-void Distance<T>::preprocess_base_points(T *original_data, const size_t orig_dim, const size_t num_points) {}
+void Distance::preprocess_base_points(float *original_data, const size_t orig_dim, const size_t num_points) {}
 
-template <typename T>
-void Distance<T>::preprocess_query(const T *query_vec, const size_t query_dim, T *scratch_query) {
-    std::memcpy(scratch_query, query_vec, query_dim * sizeof(T));
+void Distance::preprocess_query(const float *query_vec, const size_t query_dim, float *scratch_query) {
+    std::memcpy(scratch_query, query_vec, query_dim * sizeof(float));
 }
 
-template <typename T>
-size_t Distance<T>::get_required_alignment() const {
+size_t Distance::get_required_alignment() const {
     return _alignment_factor;
 }
 
 #ifndef _WINDOWS
-float DistanceL2Float::compare(const float *a, const float *b, uint32_t size) const {
+float Distance::compare(const float *a, const float *b, uint32_t size) const {
     a = (const float *)__builtin_assume_aligned(a, 32);
     b = (const float *)__builtin_assume_aligned(b, 32);
 #else
-float DistanceL2Float::compare(const float *a, const float *b, uint32_t size) const {
+float Distance::compare(const float *a, const float *b, uint32_t size) const {
 #endif
 
     float result = 0;
@@ -94,11 +88,3 @@ float DistanceL2Float::compare(const float *a, const float *b, uint32_t size) co
 #endif
     return result;
 }
-
-// Get the right distance function for the given metric.
-template <>
-Distance<float> *get_distance_function(Metric m) {
-    return new DistanceL2Float();
-}
-
-template Distance<float> *get_distance_function(Metric m);

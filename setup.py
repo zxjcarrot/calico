@@ -24,6 +24,7 @@ openmp_link_args = []
 if sys.platform != "win32":
     openmp_compile_args.append('-fopenmp')
     openmp_link_args.append('-fopenmp')
+    openmp_link_args.append('-lomp')
 # For MSVC on Windows
 else:
     openmp_compile_args.append('/openmp')
