@@ -1045,7 +1045,6 @@ struct HNSWMetaInfo {
     u64 M = 0;
     u64 ef_construction = 0;
     u64 max_level = 0;
-    u8 enable_prefetch = 0;
     u8 valid = 0;
     u8 reserved[6] = {0};
 
@@ -1063,7 +1062,6 @@ struct HNSWMetaInfo {
         M = 0;
         ef_construction = 0;
         max_level = 0;
-        enable_prefetch = 0;
         valid = 0;
         memset(reserved, 0, sizeof(reserved));
     }

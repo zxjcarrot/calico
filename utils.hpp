@@ -48,7 +48,7 @@ public:
 };
 
 // --- VisitedList for preventing cycles during graph traversal ---
-using vl_type = unsigned short;
+using vl_type = unsigned char;
 
 class VisitedList {
 public:

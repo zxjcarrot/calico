@@ -7,10 +7,10 @@ set -e
 
 # Base directory for experiments
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-EXP_BASE_DIR="${SCRIPT_DIR}/exps/in-memory/btree_ycsbc"
+EXP_BASE_DIR="${SCRIPT_DIR}/Calico-VLDB26/data/exps/in-memory/btree_ycsbc"
 
 # Thread counts to process
-THREAD_COUNTS=(1 4 8 16 32)
+THREAD_COUNTS=(1 4 8 16 32 64 128)
 
 # Check if experiment directory exists
 if [ ! -d "${EXP_BASE_DIR}" ]; then
@@ -177,17 +177,40 @@ extract_leanstore_metrics() {
     esac
 }
 
+# Function to extract wiredtiger metrics from tx CSV
+extract_wiredtiger_metrics() {
+    local tx_file="$1"
+    local metric="$2"
+
+    if [ ! -f "$tx_file" ]; then
+        echo "n/a"
+        return
+    fi
+
+    case "$metric" in
+        "throughput")
+            # Sum of oltp_committed / number of seconds (skipping header and t=0)
+            awk -F',' 'NR > 1 && $5 > 0 { sum += $5; count++ } END { if (count > 0) print sum/count; else print "n/a" }' "$tx_file"
+            ;;
+        *)
+            echo "n/a"
+            ;;
+    esac
+}
+
 # Create summary CSV header
 echo "thread_count,config_name,avg_throughput,llc_miss_per_op,dtlb_miss_per_op,cycles_per_op,insts_per_op,ipc" > "${EXP_BASE_DIR}/results_summary_all.csv"
 
 # List of configurations to process (huge page variations)
 configs=(
     "calico_array_nohuge" "calico_array_huge"
+    "calico_array_2level_nohuge" "calico_array_2level_huge"
+    "calico_array_3level_nohuge" "calico_array_3level_huge"
     "calico_mmap_nohuge" "calico_mmap_huge"
     "calico_chained_hash_nohuge" "calico_chained_hash_huge"
     "calico_openaddr_hash_nohuge" "calico_openaddr_hash_huge"
     "calico_lockfree_hash_nohuge" "calico_lockfree_hash_huge"
-    "leanstore"
+    "leanstore" "wiredtiger"
 )
 
 echo "Extracting results from experiment files for all thread counts..."
@@ -214,7 +237,7 @@ for threads in "${THREAD_COUNTS[@]}"; do
         
         tx_file="${thread_dir}/${config}_tx.csv"
         perf_file="${thread_dir}/${config}_perf.csv"
-        
+        echo "$tx_file"
         # Extract values based on configuration type
         if [ "$config" == "leanstore" ]; then
             # Leanstore uses custom parser for console table output
@@ -224,6 +247,15 @@ for threads in "${THREAD_COUNTS[@]}"; do
             cycles_per_op=$(extract_leanstore_metrics "$tx_file" "cycles_per_tx")
             insts_per_op=$(extract_leanstore_metrics "$tx_file" "insts_per_tx")
             ipc=$(extract_leanstore_metrics "$tx_file" "ipc")
+        elif [ "$config" == "wiredtiger" ]; then
+            # WiredTiger uses a simple CSV output
+            avg_throughput=$(extract_wiredtiger_metrics "$tx_file" "throughput")
+            # For perf metrics, assume it uses the same format as Calico
+            llc_miss_per_op=$(extract_perf_value "$perf_file" "llc_misses")
+            dtlb_miss_per_op=$(extract_perf_value "$perf_file" "dtlb_misses")
+            cycles_per_op=$(extract_perf_value "$perf_file" "cycles")
+            insts_per_op=$(extract_perf_value "$perf_file" "instructions")
+            ipc=$(extract_ipc_value "$perf_file")
         else
             # Calico configurations use standard CSV parsers
             avg_throughput=$(extract_avg_throughput "$tx_file")
@@ -270,7 +302,8 @@ echo "  - calico_chained_hash: 2 combinations (nohuge, huge)"
 echo "  - calico_openaddr_hash: 2 combinations (nohuge, huge)"
 echo "  - calico_lockfree_hash: 2 combinations (nohuge, huge)"
 echo "  - leanstore: 1 configuration"
-echo "  Total per thread count: 10 configurations"
+echo "  - wiredtiger: 1 configuration"
+echo "  Total per thread count: 12 configurations"
 echo
 
 echo "Global Results Summary (all thread counts):"

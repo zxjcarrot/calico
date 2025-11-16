@@ -23,9 +23,6 @@ class ThreadPool;
 
 #include "utils.hpp"
 
-// Definition of the thread_local cache (inline to avoid multiple definitions across TUs)
-inline thread_local VisitedListPool::TLSCache VisitedListPool::tls_cache{};
-
 // --- HNSW Stats ---
 struct HNSWStats {
     // Live counters (updated during operations)

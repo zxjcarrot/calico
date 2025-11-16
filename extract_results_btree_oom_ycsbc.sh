@@ -10,7 +10,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 EXP_BASE_DIR="${SCRIPT_DIR}/exps/larger-than-memory/btree_ycsbc"
 
 # Data sizes to process
-DATA_SIZES=(50000000 100000000 200000000 400000000)
+DATA_SIZES=(25000000 50000000 100000000 200000000 400000000)
+
+# Get total number of cores from lscpu
+TOTAL_CORES=$(lscpu -p | grep -v '^#' | wc -l)
+if [ -z "$TOTAL_CORES" ] || [ "$TOTAL_CORES" -eq 0 ]; then
+    echo "Warning: Could not determine total number of cores. Throughput-per-core will be n/a."
+    TOTAL_CORES=0
+fi
+echo "Detected ${TOTAL_CORES} total cores on the system."
+echo
 
 # Check if experiment directory exists
 if [ ! -d "${EXP_BASE_DIR}" ]; then
@@ -57,6 +66,77 @@ extract_avg_throughput() {
     # Extract the throughput value from the avg_throughput row
     awk -F',' '$1 == "avg_throughput" { print $2 }' "$tx_file"
 }
+
+# Function to extract average CPU utilization from iostat log
+extract_avg_cpu_util() {
+    local iostat_file="$1"
+    
+    if [ ! -f "$iostat_file" ]; then
+        echo "n/a"
+        return
+    fi
+    
+    # Extract the %user and %system columns (avg-cpu block), average (user+system)
+    # Skip lines until we see "avg-cpu" header, then read the numeric line(s) that follow
+    awk '
+        BEGIN { in_cpu_section = 0; count = 0; total_util = 0; }
+        /avg-cpu/ { in_cpu_section = 1; next; }
+        /Device/ { in_cpu_section = 0; }
+        in_cpu_section && NF >= 3 {
+            # Expect the numeric line(s) after the avg-cpu header. Typical columns:
+            # %user %nice %system %iowait %steal %idle
+            # We take $1 (%user) + $3 (%system) as active CPU utilization.
+            if ($1 ~ /^[0-9.]+$/ && $3 ~ /^[0-9.]+$/) {
+                util = ($1 + $3);
+                total_util += util;
+                count++;
+            }
+        }
+        END {
+            if (count > 0) {
+                avg_util = total_util / count;
+                print avg_util;
+            } else {
+                print "n/a";
+            }
+        }
+    ' "$iostat_file"
+}
+
+# Function to extract average SSD bandwidth from iostat log
+extract_avg_ssd_bandwidth() {
+    local iostat_file="$1"
+    
+    if [ ! -f "$iostat_file" ]; then
+        echo "n/a"
+        return
+    fi
+    
+    # Extract the MB/s read and write columns for the device, average them
+    # Skip header lines, then average the r/s and w/s columns
+    awk '
+        BEGIN { count = 0; total_bw = 0; }
+        # Match lines with numeric data for the nvme device
+        /nvme1n1/ && $2 ~ /^[0-9]/ {
+            # iostat -x output has rMB/s and wMB/s as columns 6 and 7
+            read_bw = $6
+            write_bw = $7
+            if (read_bw ~ /^[0-9.]+$/ && write_bw ~ /^[0-9.]+$/) {
+                total_bw += read_bw + write_bw;
+                count++;
+            }
+        }
+        END {
+            if (count > 0) {
+                avg_bw = total_bw / count;
+                print avg_bw;
+            } else {
+                print "n/a";
+            }
+        }
+    ' "$iostat_file"
+}
+
 
 # Function to extract leanstore/wiredtiger metrics from tx CSV (which contains console output)
 extract_leanstore_metrics() {
@@ -224,7 +304,7 @@ extract_leanstore_metrics() {
             # IPC = instructions / cycles
             local insts=$(extract_leanstore_metrics "$tx_file" "insts_per_tx")
             local cycles=$(extract_leanstore_metrics "$tx_file" "cycles_per_tx")
-            if [ "$insts" != "n/a" ] && [ "$cycles" != "n/a" ] && [ "$cycles" != "0" ]; then
+            if [ "$insts" != "n/a" ] && [ "$cycles" != "n/a" ] && [ "$cycles" != "0" ] && [ $(echo "$cycles > 0" | bc -l) -eq 1 ]; then
                 echo "scale=6; $insts / $cycles" | bc
             else
                 echo "n/a"
@@ -233,14 +313,49 @@ extract_leanstore_metrics() {
     esac
 }
 
+extract_wiredtiger_metrics() {
+    local tx_file="$1"
+    local metric="$2"
+
+    if [ ! -f "$tx_file" ]; then
+        echo "n/a"
+        return
+    fi
+
+    case "$metric" in
+        "throughput")
+            # For wiredtiger, the format is a simple CSV: t,tag,oltp_committed,oltp_aborted
+            # We average the oltp_committed column, skipping the header and the first data point (t=0)
+            awk -F',' '
+                NR > 2 { # Skip header and t=0
+                    sum += $3;
+                    count++;
+                }
+                END {
+                    if (count > 0) {
+                        print sum/count;
+                    } else {
+                        print "n/a";
+                    }
+                }
+            ' "$tx_file"
+            ;;
+        *)
+            # Other metrics are not available for wiredtiger in this experiment setup
+            echo "n/a"
+            ;;
+    esac
+}
+
 # Create summary CSV header
-echo "datasize,config_name,avg_throughput,llc_miss_per_op,dtlb_miss_per_op,cycles_per_op,insts_per_op,ipc" > "${EXP_BASE_DIR}/results_summary_all.csv"
+echo "datasize,config_name,avg_throughput,avg_throughput_per_core,llc_miss_per_op,dtlb_miss_per_op,cycles_per_op,insts_per_op,ipc,avg_ssd_bandwidth_mb_s" > "${EXP_BASE_DIR}/results_summary_all.csv"
 
 # List of configurations to process
 configs=(
     "calico_mmap_nohuge"
     "calico_array_huge"
     "calico_lockfree_hash_huge"
+    "calico_openaddr_hash_huge"
     "leanstore"
     "wiredtiger"
 )
@@ -261,7 +376,7 @@ for datasize in "${DATA_SIZES[@]}"; do
     
     # Create datasize-specific summary
     datasize_summary_csv="${datasize_dir}/results_summary.csv"
-    echo "config_name,avg_throughput,llc_miss_per_op,dtlb_miss_per_op,cycles_per_op,insts_per_op,ipc" > "$datasize_summary_csv"
+    echo "config_name,avg_throughput,avg_throughput_per_core,llc_miss_per_op,dtlb_miss_per_op,cycles_per_op,insts_per_op,ipc,avg_ssd_bandwidth_mb_s" > "$datasize_summary_csv"
     
     # Process each configuration for this data size
     for config in "${configs[@]}"; do
@@ -269,9 +384,38 @@ for datasize in "${DATA_SIZES[@]}"; do
         
         tx_file="${datasize_dir}/${config}_tx.csv"
         perf_file="${datasize_dir}/${config}_perf.csv"
+        iostat_file="${datasize_dir}/${config}_iostat.log"
+        
+        # Determine active cores. Prefer explicit thread count from config.json when available.
+        active_cores="n/a"
+        config_json="${datasize_dir}/config.json"
+
+        
+        # If we don't have threads from config.json, fall back to iostat-based estimate
+        if [ "$active_cores" = "n/a" ]; then
+            avg_cpu_util=$(extract_avg_cpu_util "$iostat_file")
+            if [ "$avg_cpu_util" != "n/a" ] && [ "$TOTAL_CORES" -gt 0 ]; then
+                # Calculate active cores based on utilization percentage and cap to TOTAL_CORES
+                est_active=$(echo "scale=4; ($avg_cpu_util / 100) * $TOTAL_CORES" | bc)
+                # Round up to nearest integer, but not more than TOTAL_CORES
+                est_active_ceil=$(printf "%0.f" "$(echo "($est_active+0.5)/1" | bc -l)")
+                if [ -z "$est_active_ceil" ] || [ "$est_active_ceil" -le 0 ]; then
+                    active_cores="n/a"
+                else
+                    if [ "$est_active_ceil" -gt "$TOTAL_CORES" ]; then
+                        active_cores="$TOTAL_CORES"
+                    else
+                        active_cores="$est_active_ceil"
+                    fi
+                fi
+            fi
+        fi
+
+        echo "$active_cores for $config"
+
         
         # Extract values based on configuration type
-        if [ "$config" == "leanstore" ] || [ "$config" == "wiredtiger" ]; then
+        if [ "$config" == "leanstore" ]; then
             # Leanstore and WiredTiger use custom parser for console table output
             avg_throughput=$(extract_leanstore_metrics "$tx_file" "throughput")
             llc_miss_per_op=$(extract_leanstore_metrics "$tx_file" "llc_per_tx")
@@ -279,6 +423,13 @@ for datasize in "${DATA_SIZES[@]}"; do
             cycles_per_op=$(extract_leanstore_metrics "$tx_file" "cycles_per_tx")
             insts_per_op=$(extract_leanstore_metrics "$tx_file" "insts_per_tx")
             ipc=$(extract_leanstore_metrics "$tx_file" "ipc")
+        elif [ "$config" == "wiredtiger" ]; then
+            avg_throughput=$(extract_wiredtiger_metrics "$tx_file" "throughput")
+            llc_miss_per_op=$(extract_wiredtiger_metrics "$tx_file" "llc_per_tx")
+            dtlb_miss_per_op=$(extract_wiredtiger_metrics "$tx_file" "dtlb_per_tx")
+            cycles_per_op=$(extract_wiredtiger_metrics "$tx_file" "cycles_per_tx")
+            insts_per_op=$(extract_wiredtiger_metrics "$tx_file" "insts_per_tx")
+            ipc=$(extract_wiredtiger_metrics "$tx_file" "ipc")
         else
             # Calico configurations use standard CSV parsers
             avg_throughput=$(extract_avg_throughput "$tx_file")
@@ -289,19 +440,36 @@ for datasize in "${DATA_SIZES[@]}"; do
             ipc=$(extract_ipc_value "$perf_file")
         fi
         
+        # Extract SSD bandwidth
+        avg_ssd_bandwidth=$(extract_avg_ssd_bandwidth "$iostat_file")
+
+        # Calculate throughput per core using integer active_cores when available
+        avg_throughput_per_core="n/a"
+        if [ "$avg_throughput" != "n/a" ]; then
+            if [ "$active_cores" != "n/a" ] && [[ "$active_cores" =~ ^[0-9]+$ ]] && [ "$active_cores" -gt 0 ]; then
+                # Use awk for division because it supports scientific notation (e.g., 1.51835e+06)
+                avg_throughput_per_core=$(awk -v a="$avg_throughput" -v b="$active_cores" 'BEGIN { if (a=="" || a=="n/a" || b==0) { print "n/a"; } else { printf "%.2f", (a / b) } }')
+            else
+                # No valid active core count; leave as n/a
+                avg_throughput_per_core="n/a"
+            fi
+        fi
+        
         # Handle empty values
         avg_throughput=${avg_throughput:-"n/a"}
+        avg_throughput_per_core=${avg_throughput_per_core:-"n/a"}
         llc_miss_per_op=${llc_miss_per_op:-"n/a"}
         dtlb_miss_per_op=${dtlb_miss_per_op:-"n/a"}
         cycles_per_op=${cycles_per_op:-"n/a"}
         insts_per_op=${insts_per_op:-"n/a"}
         ipc=${ipc:-"n/a"}
+        avg_ssd_bandwidth=${avg_ssd_bandwidth:-"n/a"}
         
         # Write to datasize-specific summary CSV
-        echo "$config,$avg_throughput,$llc_miss_per_op,$dtlb_miss_per_op,$cycles_per_op,$insts_per_op,$ipc" >> "$datasize_summary_csv"
+        echo "$config,$avg_throughput,$avg_throughput_per_core,$llc_miss_per_op,$dtlb_miss_per_op,$cycles_per_op,$insts_per_op,$ipc,$avg_ssd_bandwidth" >> "$datasize_summary_csv"
         
         # Write to global summary CSV with data size
-        echo "$datasize,$config,$avg_throughput,$llc_miss_per_op,$dtlb_miss_per_op,$cycles_per_op,$insts_per_op,$ipc" >> "${EXP_BASE_DIR}/results_summary_all.csv"
+        echo "$datasize,$config,$avg_throughput,$avg_throughput_per_core,$llc_miss_per_op,$dtlb_miss_per_op,$cycles_per_op,$insts_per_op,$ipc,$avg_ssd_bandwidth" >> "${EXP_BASE_DIR}/results_summary_all.csv"
     done
     
     echo "  Data size-specific summary: $datasize_summary_csv"

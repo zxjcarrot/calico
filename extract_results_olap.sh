@@ -1,16 +1,19 @@
 #!/bin/bash
 
 # extract_results_olap.sh - Extract and summarize OLAP experiment results
-# This script processes the OLAP CSV files to create a summary table for varying page sizes
+# This script processes the OLAP CSV files to create a summary table for varying row sizes
 
 set -e
 
 # Base directory for experiments
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-EXP_BASE_DIR="${SCRIPT_DIR}/exps/in-memory/olap"
+EXP_BASE_DIR="${SCRIPT_DIR}/exps/in-memory/olap_row"
 
-# Page sizes to process (in KB)
-PAGE_SIZES=(4 8 16 32 64 128 256 512)
+# Fixed page size (KB)
+FIXED_PAGE_SIZE_KB=8
+
+# Row sizes to process (in bytes)
+ROW_SIZES=(128 256 512 1024 2048 4096)
 
 # Operation types to process
 OP_TYPES=("nonfiltered_count" "sum")
@@ -85,7 +88,6 @@ extract_avg_write_mb() {
 calculate_throughput_gbps() {
     local queries_per_sec="$1"
     local pages_per_query="$2"
-    local page_size_kb="$3"
     
     if [ "$queries_per_sec" == "n/a" ] || [ -z "$queries_per_sec" ]; then
         echo "n/a"
@@ -93,12 +95,13 @@ calculate_throughput_gbps() {
     fi
     
     # Throughput (GB/s) = queries/sec × pages/query × page_size_KB / (1024 * 1024)
+    # Using fixed 8KB page size
     # Using bc for floating point calculation
-    echo "scale=4; $queries_per_sec * $pages_per_query * $page_size_kb / (1024 * 1024)" | bc
+    echo "scale=4; $queries_per_sec * $pages_per_query * ${FIXED_PAGE_SIZE_KB} / (1024 * 1024)" | bc
 }
 
 # Create summary CSV header
-echo "page_size_kb,config_name,op_type,layout,avg_queries_per_sec,throughput_gbps,avg_read_mb,avg_write_mb" > "${EXP_BASE_DIR}/results_summary_all.csv"
+echo "row_size_bytes,config_name,op_type,layout,avg_queries_per_sec,throughput_gbps,avg_read_mb,avg_write_mb" > "${EXP_BASE_DIR}/results_summary_all.csv"
 
 # List of configurations to process
 configs=(
@@ -106,45 +109,48 @@ configs=(
     "mmap_huge"
     "calico"
     "chained_hash"
+    "openaddr_hash"
     "lockfree_hash"
 )
 
-echo "Extracting OLAP results from experiment files for all page sizes..."
+echo "Extracting OLAP results from experiment files for all row sizes..."
 echo "=================================================================="
 
-# Process each page size
-for page_size_kb in "${PAGE_SIZES[@]}"; do
-    page_dir="${EXP_BASE_DIR}/${page_size_kb}kb"
+# Process each row size
+for row_size in "${ROW_SIZES[@]}"; do
+    row_dir="${EXP_BASE_DIR}/${row_size}bytes"
     
-    if [ ! -d "$page_dir" ]; then
-        echo "Warning: Page directory $page_dir does not exist, skipping..."
+    if [ ! -d "$row_dir" ]; then
+        echo "Warning: Row directory $row_dir does not exist, skipping..."
         continue
     fi
     
-    echo "Processing results for ${page_size_kb}KB pages..."
+    echo "Processing results for ${row_size}B rows (${FIXED_PAGE_SIZE_KB}KB pages)..."
     
     # Read num_pages from config.json if available
-    config_file="${page_dir}/config.json"
+    config_file="${row_dir}/config.json"
     if [ -f "$config_file" ]; then
         num_pages=$(grep -oP '"num_pages":\s*\K[0-9]+' "$config_file" || echo "0")
         scan_pages=$(grep -oP '"SCANPAGES":\s*\K[0-9]+' "$config_file" || echo "0")
     else
         # Fallback calculation if config.json doesn't exist
-        data_size_kb=$((30 * 1024 * 1024))  # 30GB in KB
-        num_pages=$((data_size_kb / page_size_kb))
-        scan_pages=$((num_pages / 4))
+        data_size_kb=$((50 * 1024 * 1024))  # 50GB in KB
+        num_pages=$((data_size_kb / FIXED_PAGE_SIZE_KB))
+        scan_pages=$((num_pages / 10))
     fi
     
+    echo "  Row size: ${row_size}B"
+    echo "  Page size: ${FIXED_PAGE_SIZE_KB}KB (fixed)"
     echo "  Number of pages: ${num_pages}"
     echo "  Pages per query: ${scan_pages}"
     
-    # Create page-size-specific summary
-    page_summary_csv="${page_dir}/results_summary.csv"
-    echo "config_name,op_type,layout,avg_queries_per_sec,throughput_gbps,avg_read_mb,avg_write_mb" > "$page_summary_csv"
+    # Create row-size-specific summary
+    row_summary_csv="${row_dir}/results_summary.csv"
+    echo "config_name,op_type,layout,avg_queries_per_sec,throughput_gbps,avg_read_mb,avg_write_mb" > "$row_summary_csv"
     
     # Process each layout type
     for layout_type in "${LAYOUT_TYPES[@]}"; do
-        layout_dir="${page_dir}/${layout_type}"
+        layout_dir="${row_dir}/${layout_type}"
         
         if [ ! -d "$layout_dir" ]; then
             echo "  Warning: Layout directory $layout_dir does not exist, skipping..."
@@ -157,7 +163,7 @@ for page_size_kb in "${PAGE_SIZES[@]}"; do
         for op_type in "${OP_TYPES[@]}"; do
             echo "    Processing operation type: ${op_type}..."
             
-            # Process each configuration for this page size, layout, and operation type
+            # Process each configuration for this row size, layout, and operation type
             for config in "${configs[@]}"; do
                 echo "      Processing ${config} with ${op_type} and ${layout_type}..."
                 
@@ -169,7 +175,7 @@ for page_size_kb in "${PAGE_SIZES[@]}"; do
                 avg_write_mb=$(extract_avg_write_mb "$olap_file")
                 
                 # Calculate throughput in GB/s
-                throughput_gbps=$(calculate_throughput_gbps "$avg_queries_per_sec" "$scan_pages" "$page_size_kb")
+                throughput_gbps=$(calculate_throughput_gbps "$avg_queries_per_sec" "$scan_pages")
                 
                 # Handle empty values
                 avg_queries_per_sec=${avg_queries_per_sec:-"n/a"}
@@ -177,52 +183,55 @@ for page_size_kb in "${PAGE_SIZES[@]}"; do
                 avg_read_mb=${avg_read_mb:-"n/a"}
                 avg_write_mb=${avg_write_mb:-"n/a"}
                 
-                # Write to page-size-specific summary CSV
-                echo "$config,$op_type,$layout_type,$avg_queries_per_sec,$throughput_gbps,$avg_read_mb,$avg_write_mb" >> "$page_summary_csv"
+                # Write to row-size-specific summary CSV
+                echo "$config,$op_type,$layout_type,$avg_queries_per_sec,$throughput_gbps,$avg_read_mb,$avg_write_mb" >> "$row_summary_csv"
                 
-                # Write to global summary CSV with page size, op_type, and layout
-                echo "$page_size_kb,$config,$op_type,$layout_type,$avg_queries_per_sec,$throughput_gbps,$avg_read_mb,$avg_write_mb" >> "${EXP_BASE_DIR}/results_summary_all.csv"
+                # Write to global summary CSV with row size, op_type, and layout
+                echo "$row_size,$config,$op_type,$layout_type,$avg_queries_per_sec,$throughput_gbps,$avg_read_mb,$avg_write_mb" >> "${EXP_BASE_DIR}/results_summary_all.csv"
             done
         done
     done
     
-    echo "  Page-size-specific summary: $page_summary_csv"
+    echo "  Row-size-specific summary: $row_summary_csv"
     echo
 done
 
 echo "=================================================================="
 echo "Summary tables created:"
 echo "  Global summary: ${EXP_BASE_DIR}/results_summary_all.csv"
-for page_size_kb in "${PAGE_SIZES[@]}"; do
-    page_summary="${EXP_BASE_DIR}/${page_size_kb}kb/results_summary.csv"
-    if [ -f "$page_summary" ]; then
-        echo "  ${page_size_kb}KB pages: $page_summary"
+for row_size in "${ROW_SIZES[@]}"; do
+    row_summary="${EXP_BASE_DIR}/${row_size}bytes/results_summary.csv"
+    if [ -f "$row_summary" ]; then
+        echo "  ${row_size}B rows: $row_summary"
     fi
 done
 echo
-echo "Configurations processed per page size:"
+echo "Fixed page size: ${FIXED_PAGE_SIZE_KB}KB"
+echo "Row sizes processed: ${ROW_SIZES[*]} bytes"
+echo
+echo "Configurations processed per row size:"
 echo "  - mmap: VMCache without huge pages"
 echo "  - mmap_huge: VMCache with huge pages"
 echo "  - calico: Traditional buffer pool with array translator (huge pages)"
 echo "  - chained_hash: Traditional buffer pool with chained hash (huge pages)"
 echo "  - lockfree_hash: Traditional buffer pool with lockfree hash (huge pages)"
-echo "  Total per page size: 5 configurations × 2 operation types × 2 layout types = 20 experiments"
+echo "  Total per row size: 5 configurations × 2 operation types × 2 layout types = 20 experiments"
 echo
 
-echo "Global Results Summary (all page sizes):"
+echo "Global Results Summary (all row sizes):"
 echo "--------------------------------------------"
 if [ -f "${EXP_BASE_DIR}/results_summary_all.csv" ]; then
     column -t -s',' "${EXP_BASE_DIR}/results_summary_all.csv"
 fi
 echo
 
-# Display individual page size summaries
-for page_size_kb in "${PAGE_SIZES[@]}"; do
-    page_summary="${EXP_BASE_DIR}/${page_size_kb}kb/results_summary.csv"
-    if [ -f "$page_summary" ]; then
-        echo "Results for ${page_size_kb}KB pages:"
+# Display individual row size summaries
+for row_size in "${ROW_SIZES[@]}"; do
+    row_summary="${EXP_BASE_DIR}/${row_size}bytes/results_summary.csv"
+    if [ -f "$row_summary" ]; then
+        echo "Results for ${row_size}B rows (${FIXED_PAGE_SIZE_KB}KB pages):"
         echo "-----------------------------------"
-        column -t -s',' "$page_summary"
+        column -t -s',' "$row_summary"
         echo
     fi
 done

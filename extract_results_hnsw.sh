@@ -1,16 +1,17 @@
 #!/bin/bash
 
 # Extract and summarize HNSW benchmark results
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-RESULTS_BASE_DIR="./exps/in-memory/hnsw"
+RESULTS_BASE_DIR="${SCRIPT_DIR}/Calico-VLDB26/data/exps/in-memory/hnsw/sift10M"
 OUTPUT_CSV="${RESULTS_BASE_DIR}/hnsw_results_summary.csv"
 
 # Thread counts
-THREAD_COUNTS=(1 4 8 16 32)
+THREAD_COUNTS=(1 4 8 16 32 64 128)
 
 # Configuration names
-CONFIGS=("chained_hash" "openaddr_hash" "lockfree_hash" "vmcache" "calico" "mmap_oscache")
-
+#CONFIGS=("chained_hash" "openaddr_hash" "lockfree_hash" "vmcache" "calico" "calico-2level" "calico-3level" "mmap_oscache")
+CONFIGS=("chained_hash" "openaddr_hash" "lockfree_hash" "vmcache" "calico" "usearch")
 # Function to extract a metric from log file
 extract_metric() {
     local log_file=$1

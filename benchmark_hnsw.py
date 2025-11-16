@@ -225,7 +225,7 @@ def benchmark_calico(X_base, X_query, ground_truth, params, num_threads):
     
     index_calico = calico_py.HnswIndex(max_elements=num_elements, enable_prefetch=True)
     print("Start building graph")
-    index_calico.add_items(X_base_float32, 0)
+    index_calico.add_items(X_base_float32)
     
     build_time = time.time() - start_time
     results['build_time'] = build_time
@@ -253,7 +253,7 @@ def benchmark_calico(X_base, X_query, ground_truth, params, num_threads):
         profiler = CacheProfiler(events=CACHE_EVENTS)
         with profiler:
             start_time = time.time()
-            labels, distances = index_calico.search_knn_parallel(X_query_float32, k, 46, num_threads, stats=True)
+            labels, distances = index_calico.search_knn_parallel(X_query_float32, k, 50, num_threads, stats=True)
             search_time = time.time() - start_time
         
         cache_stats = profiler.get_results()

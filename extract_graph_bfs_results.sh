@@ -108,27 +108,24 @@ for config in "${CONFIGS[@]}"; do
     
     # Extract graph BFS metrics from TX_CSV
     if [ -s "${tx_csv}" ]; then
-        # Look for line containing "bfs nodes=" (configuration line)
-        config_line=$(grep "^bfs nodes=" "${tx_csv}" 2>/dev/null || echo "")
-        # Look for line containing "BFS completed:" (results line)
-        results_line=$(grep "BFS completed:" "${tx_csv}" 2>/dev/null || echo "")
+        # Look for line containing "graph_bfs" - format: graph_bfs nodes=5000000 neighbors_per_node=44 visited=5000000 value_sum=110125024213 time_ms=11361
+        bfs_line=$(grep "^graph_bfs" "${tx_csv}" 2>/dev/null || echo "")
         
-        if [ -n "${config_line}" ]; then
-            # Extract nodes from config line: bfs nodes=5000000 neighbors_per_node=22 nthreads=1 start_indices=[0]
-            nodes=$(echo "${config_line}" | sed -n 's/.*nodes=\([0-9]*\).*/\1/p')
-        else
-            nodes="N/A"
-        fi
-        
-        if [ -n "${results_line}" ]; then
-            # Extract metrics from results line: BFS completed: nthreads=1 avg_traversal_time=12172ms overall_time=12175ms total_visited=5000000
-            avg_time_ms=$(echo "${results_line}" | sed -n 's/.*avg_traversal_time=\([0-9.]*\)ms.*/\1/p')
-            overall_time_ms=$(echo "${results_line}" | sed -n 's/.*overall_time=\([0-9.]*\)ms.*/\1/p')
+        if [ -n "${bfs_line}" ]; then
+            # Extract nodes: nodes=5000000
+            nodes=$(echo "${bfs_line}" | sed -n 's/.*nodes=\([0-9]*\).*/\1/p')
+            # Extract time_ms: time_ms=11361
+            time_ms=$(echo "${bfs_line}" | sed -n 's/.*time_ms=\([0-9.]*\).*/\1/p')
             
             # Handle empty values
-            [ -z "$avg_time_ms" ] && avg_time_ms="N/A"
-            [ -z "$overall_time_ms" ] && overall_time_ms="N/A"
+            [ -z "$nodes" ] && nodes="N/A"
+            [ -z "$time_ms" ] && time_ms="N/A"
+            
+            # For this format, avg_traversal_time and overall_time are the same
+            avg_time_ms="$time_ms"
+            overall_time_ms="$time_ms"
         else
+            nodes="N/A"
             avg_time_ms="N/A"
             overall_time_ms="N/A"
         fi

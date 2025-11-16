@@ -71,6 +71,7 @@ namespace py = pybind11;
 // --- Forward declare init/shutdown functions from calico.cpp ---
 void initialize_system();
 void shutdown_system();
+void flush_system();
 
 // --- Automatic Initializer ---
 struct SystemInitializer {
@@ -90,7 +91,7 @@ static SystemInitializer initializer;
 // For this binding, we will use a fixed dimension of 128 to match the explicit
 // template instantiation in hnsw.cpp. This is a common approach for high-performance bindings.
 constexpr size_t HNSW_DIM = 128;
-using HnswIndexType = HNSW<HNSW_DIM, hnsw_distance::SIMDAcceleratedL2>;
+using HnswIndexType = HNSW<hnsw_distance::SIMDAcceleratedL2>;
 
 // --- Python Module Definition ---
 PYBIND11_MODULE(calico_py, m) {
@@ -110,10 +111,28 @@ PYBIND11_MODULE(calico_py, m) {
         }
     });
 
-    py::class_<HnswIndexType>(m, "HnswIndex")
-        .def(py::init<u64, size_t, size_t, bool>(), py::arg("max_elements"), py::arg("M") = 16,
-             py::arg("ef_construction") = 200, py::arg("enable_prefetch") = true,
-             "Initializes a new, empty HNSW index with runtime parameters.")
+    // py::class_<HnswIndexType>(m, "HnswIndex")
+    //     .def(py::init<u64, size_t, size_t, bool>(), py::arg("max_elements"), py::arg("M") = 16,
+    //          py::arg("ef_construction") = 200, py::arg("enable_prefetch") = true,
+    //          "Initializes a new, empty HNSW index with runtime parameters.")
+    m.def("flush_storage", []() { flush_system(); },
+          "Flushes all dirty pages managed by the Calico buffer pool to persistent storage.");
+
+        py::class_<HnswIndexType>(m, "HnswIndex")
+                .def(py::init<u64, size_t, size_t, size_t, bool, bool>(),
+                         py::arg("max_elements"),
+                         py::arg("dim") = HNSW_DIM,
+                         py::arg("M") = 16,
+                         py::arg("ef_construction") = 200,
+                         py::arg("enable_prefetch") = true,
+                         py::arg("skip_recovery") = false,
+                         "Initializes a new, empty HNSW index with runtime parameters. Set skip_recovery to True to rebuild the index from scratch.")
+        .def(
+            "flush",
+            [](HnswIndexType&) { flush_system(); },
+            "Flushes all dirty pages managed by Calico to persistent storage.")
+        .def("was_recovered", &HnswIndexType::wasRecovered,
+             "Returns True if the underlying index state was recovered from existing storage.")
 
         .def(
             "add_points",
@@ -122,9 +141,10 @@ PYBIND11_MODULE(calico_py, m) {
                 if (items.ndim() != 2) {
                     throw std::runtime_error("Input array must be 2-dimensional (n_samples, n_features)");
                 }
-                if (items.shape(1) != HNSW_DIM) {
+                const size_t dim = self.getDim();
+                if (items.shape(1) != static_cast<py::ssize_t>(dim)) {
                     throw std::runtime_error("Input array has incorrect dimension. Expected " +
-                                             std::to_string(HNSW_DIM) + ", but got " + std::to_string(items.shape(1)));
+                                             std::to_string(dim) + ", but got " + std::to_string(items.shape(1)));
                 }
 
                 size_t num_points = items.shape(0);
@@ -135,7 +155,7 @@ PYBIND11_MODULE(calico_py, m) {
                 for (size_t i = 0; i < num_points; ++i) {
                     u32 node_id_out;
                     // Get a pointer to the start of the i-th vector
-                    const float* point = data_ptr + i * HNSW_DIM;
+                    const float* point = data_ptr + i * dim;
                     self.addPoint(point, node_id_out);
                     // For simplicity, we assume the returned node_id matches the item index i.
                     // A more complex implementation could store a mapping if needed.
@@ -151,9 +171,10 @@ PYBIND11_MODULE(calico_py, m) {
                 if (query.ndim() != 1) {
                     throw std::runtime_error("Query must be a 1-dimensional NumPy array");
                 }
-                if (query.shape(0) != HNSW_DIM) {
+                const size_t dim = self.getDim();
+                if (query.shape(0) != static_cast<py::ssize_t>(dim)) {
                     throw std::runtime_error("Query vector has incorrect dimension. Expected " +
-                                             std::to_string(HNSW_DIM) + ", but got " + std::to_string(query.shape(0)));
+                                             std::to_string(dim) + ", but got " + std::to_string(query.shape(0)));
                 }
 
                 const float* query_ptr = query.data();
@@ -187,9 +208,10 @@ PYBIND11_MODULE(calico_py, m) {
                 if (queries.ndim() != 2) {
                     throw std::runtime_error("Queries must be a 2-dimensional NumPy array of shape (num_queries, dim)");
                 }
-                if (queries.shape(1) != HNSW_DIM) {
+                const size_t dim = self.getDim();
+                if (queries.shape(1) != static_cast<py::ssize_t>(dim)) {
                     throw std::runtime_error("Query vectors have incorrect dimension. Expected " +
-                                             std::to_string(HNSW_DIM) + ", but got " +
+                                             std::to_string(dim) + ", but got " +
                                              std::to_string(queries.shape(1)));
                 }
                 if (k == 0) {
@@ -281,9 +303,10 @@ PYBIND11_MODULE(calico_py, m) {
                 if (data.ndim() != 2) {
                     throw std::runtime_error("Data must be a 2-dimensional NumPy array of shape (num_items, dim)");
                 }
-                if (data.shape(1) != HNSW_DIM) {
+                const size_t dim = self.getDim();
+                if (data.shape(1) != static_cast<py::ssize_t>(dim)) {
                     throw std::runtime_error("Data vectors have incorrect dimension. Expected " +
-                                             std::to_string(HNSW_DIM) + ", but got " + std::to_string(data.shape(1)));
+                                             std::to_string(dim) + ", but got " + std::to_string(data.shape(1)));
                 }
 
                 if (data.shape(0) == 0) {
@@ -313,6 +336,8 @@ PYBIND11_MODULE(calico_py, m) {
         .def(
             "get_index_info", &HnswIndexType::getIndexInfo,
             "Returns comprehensive information about the HNSW index including configuration, metadata, and statistics.")
+
+        .def("get_dim", &HnswIndexType::getDim, "Returns the dimensionality of vectors managed by the index.")
 
         .def("reset_stats", &HnswIndexType::resetStats,
              "Resets live statistics counters like distance computations and search hops.")

@@ -2,13 +2,19 @@
 
 # Extract and summarize HNSW OOM benchmark results
 # Parses log files and generates CSV summary
-
-
 # Base directory containing results
-RESULTS_BASE_DIR="./exps/larger-than-memory/hnsw"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RESULTS_BASE_DIR="${SCRIPT_DIR}/Calico-VLDB26/data/exps/larger-than-memory/hnsw-deep10M"
+#RESULTS_BASE_DIR="${SCRIPT_DIR}/Calico-VLDB26/data/exps/larger-than-memory/hnsw-sift10M"
 
 # Output CSV file
 OUTPUT_CSV="${RESULTS_BASE_DIR}/hnsw_oom_results_summary.csv"
+
+# Helper: check if a value is a positive number (int or float)
+is_number() {
+    echo "$1" | grep -E '^[0-9]+(\.[0-9]+)?$' >/dev/null 2>&1
+}
 
 # Function to extract a metric from log file
 extract_metric() {
@@ -138,14 +144,36 @@ parse_log_file() {
     
     local search_time=$(extract_summary_metric "$log_file" "Search Time" "N/A")
     search_time=$(echo "$search_time" | sed 's/s$//')
+    # Fallback: parse from inline "Search time (N queries): X seconds (...)"
+    if [ -z "$search_time" ] || [ "$search_time" = "N/A" ]; then
+        local st_inline=$(grep -E "^Search time \([0-9,]+ queries\): [0-9.]+ seconds" "$log_file" | head -1 | awk -F":" '{print $2}' | awk '{print $1}')
+        if [ -n "$st_inline" ]; then
+            search_time="$st_inline"
+        fi
+    fi
     
     local qps=$(extract_summary_metric "$log_file" "QPS")
+    # Fallback: parse QPS from inline line
+    if [ -z "$qps" ] || [ "$qps" = "N/A" ]; then
+        qps=$(grep -E "^Search time \([0-9,]+ queries\): [0-9.]+ seconds \([0-9.]+ QPS\)" "$log_file" | head -1 | grep -oE "\([0-9.]+ QPS\)" | tr -d '()' | awk '{print $1}')
+        [ -z "$qps" ] && qps="N/A"
+    fi
     
     local recall=$(extract_summary_metric "$log_file" "Recall@10")
+    # Fallback: early line "Recall@10: X" if summary missing
+    if [ -z "$recall" ] || [ "$recall" = "N/A" ]; then
+        recall=$(grep -E "^Recall@10:" "$log_file" | head -1 | awk -F":" '{print $2}' | sed 's/^ *//')
+        [ -z "$recall" ] && recall="N/A"
+    fi
     
     local avg_dist_comps=$(extract_summary_metric "$log_file" "Avg Dist Comps/Query")
     
     local index_size=$(extract_summary_metric "$log_file" "Index Size")
+    # Fallback: for usearch logs which print "Index file size: X"
+    if [ -z "$index_size" ] || [ "$index_size" = "N/A" ]; then
+        index_size=$(grep -E "^Index file size:" "$log_file" | head -1 | cut -d':' -f2- | sed 's/^ *//')
+        [ -z "$index_size" ] && index_size="N/A"
+    fi
     
     # Extract cache metrics using simpler patterns
     local cache_misses=$(grep "cache-misses" "$log_file" | grep -oE "[0-9,]+" | head -1 | tr -d ',')
@@ -187,41 +215,44 @@ parse_log_file() {
     local build_duration="N/A"
     local search_duration="N/A"
     
-    if [ "$build_time" != "N/A" ] && [ -n "$build_time" ]; then
-        build_duration=$(echo "$build_time" | awk '{if ($1 > 0) print int($1 + 0.5); else print "N/A"}')
+    if is_number "$build_time"; then
+        build_duration=$(awk -v t="$build_time" 'BEGIN {if (t > 0) printf "%d", int(t + 0.5); else print "N/A"}')
     fi
     
-    if [ "$search_time" != "N/A" ] && [ -n "$search_time" ]; then
-        search_duration=$(echo "$search_time" | awk '{if ($1 > 0) print int($1 + 0.5); else print "N/A"}')
+    if is_number "$search_time"; then
+        search_duration=$(awk -v t="$search_time" 'BEGIN {if (t > 0) printf "%d", int(t + 0.5); else print "N/A"}')
     fi
     
     # Parse iostat for build phase (starts at sample 3)
     local build_iostat="N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A"
-    if [ "$build_duration" != "N/A" ] && [ -f "$iostat_file" ]; then
+    if [ -n "$build_duration" ] && [ "$build_duration" != "N/A" ] && [ -f "$iostat_file" ]; then
         build_iostat=$(parse_iostat_range "$iostat_file" "$start_sample" "$build_duration")
     fi
     
     # Parse iostat for search phase (starts after build phase + 2 sample buffer)
-    local search_start=$((start_sample + build_duration + 2))
+    local search_start=""
+    if [ -n "$build_duration" ] && [ "$build_duration" != "N/A" ]; then
+        search_start=$((start_sample + build_duration + 2))
+    fi
     local search_iostat="N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A"
-    if [ "$search_duration" != "N/A" ] && [ "$build_duration" != "N/A" ] && [ -f "$iostat_file" ]; then
+    if [ -n "$search_start" ] && [ -n "$search_duration" ] && [ "$search_duration" != "N/A" ] && [ -f "$iostat_file" ]; then
         search_iostat=$(parse_iostat_range "$iostat_file" "$search_start" "$search_duration")
     fi
     
     # Compute IO per query and KB per query for search phase
     local io_per_query="N/A"
     local kb_per_query="N/A"
-    if [ "$qps" != "N/A" ] && [ "$qps" != "" ]; then
+    if is_number "$qps" && awk -v q="$qps" 'BEGIN{exit !(q>0)}'; then
         local search_read_iops=$(echo "$search_iostat" | cut -d',' -f5)
         local search_write_iops=$(echo "$search_iostat" | cut -d',' -f7)
         local search_read_kbps=$(echo "$search_iostat" | cut -d',' -f6)
         local search_write_kbps=$(echo "$search_iostat" | cut -d',' -f8)
         
-        if [ "$search_read_iops" != "N/A" ] && [ "$search_write_iops" != "N/A" ] && [ "$search_read_iops" != "" ] && [ "$search_write_iops" != "" ]; then
+        if is_number "$search_read_iops" && is_number "$search_write_iops"; then
             io_per_query=$(awk -v r="$search_read_iops" -v w="$search_write_iops" -v qps="$qps" 'BEGIN {printf "%.4f", (r+w)/qps}')
         fi
         
-        if [ "$search_read_kbps" != "N/A" ] && [ "$search_write_kbps" != "N/A" ] && [ "$search_read_kbps" != "" ] && [ "$search_write_kbps" != "" ]; then
+        if is_number "$search_read_kbps" && is_number "$search_write_kbps"; then
             kb_per_query=$(awk -v kr="$search_read_kbps" -v kw="$search_write_kbps" -v qps="$qps" 'BEGIN {printf "%.2f", (kr+kw)/qps}')
         fi
     fi

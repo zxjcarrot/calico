@@ -366,6 +366,7 @@ BufferManager::BufferManager(unsigned nthreads)
     virtMem = nullptr;
     frameMem = nullptr;
     bool disableHugePageForFrameMem = envOr("NOHUGEPAGE_FRAME_MEM", 0);
+    bool disableHugePageForTranslationArray = envOr("NOHUGEPAGE_TRANSLATION_ARRAY", 0);
 
     u64 virtAllocSize = virtSize + (1 << 16);  // guard space for optimistic reads
 
@@ -480,6 +481,11 @@ BufferManager::BufferManager(unsigned nthreads)
         for (u64 i = 0; i < virtCount; i++) pageState[i].init();
         pageState2Level.reset();
         pageState3Level.reset();
+    }
+    if (disableHugePageForTranslationArray && useTraditional) {
+        if (hashMode == HashMode::Array1Access) {
+            madvise(pageState, virtCount * sizeof(PageState), MADV_NOHUGEPAGE);
+        }
     }
 
     physUsedCount = 0;
@@ -1045,9 +1051,9 @@ void BufferManager::prefetchPages(const PID* pages, int n_pages, const u32* offs
         if (state != PageState::Evicted) {
             if (offsets_within_pages != nullptr) {
                   // Touch the page to bring it into cache
-                  char *tmp = (((char*)residentPtr(pid, stateAndVersion)) + offsets_within_pages[i]);
-                  _mm_prefetch(reinterpret_cast<const char*>(tmp), _MM_HINT_T2);
-                  _mm_prefetch(reinterpret_cast<const char*>(tmp) + 64, _MM_HINT_T2);
+                //   char *tmp = (((char*)residentPtr(pid, stateAndVersion)) + offsets_within_pages[i]);
+                //   _mm_prefetch(reinterpret_cast<const char*>(tmp), _MM_HINT_T2);
+                //   _mm_prefetch(reinterpret_cast<const char*>(tmp) + 64, _MM_HINT_T2);
             }
             continue;
         }

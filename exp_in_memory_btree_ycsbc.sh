@@ -7,17 +7,18 @@ set -e
 
 # Base directory for experiments
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-EXP_BASE_DIR="${SCRIPT_DIR}/exps/in-memory/btree_ycsbc"
+EXP_BASE_DIR="${SCRIPT_DIR}/Calico-VLDB26/data/exps/in-memory/btree_ycsbc"
 
 # Thread counts to test
+#THREAD_COUNTS=(64 128)
 THREAD_COUNTS=(1 4 8 16 32)
-
-PHYSMEM=24
+#THREAD_COUNTS=(1 4 8)
+PHYSMEM=32
 RUN_DURATION=60
 
 # Common settings for all experiments (except THREADS which varies)
 export RNDREAD=1
-export BLOCK=/home/zxjcarrot/Workspace/calico/heapfile
+export BLOCK=/ssd/ssd0/xj/calico/heapfile
 export VIRTGB=32G
 export PHYSGB=${PHYSMEM}G
 export DATASIZE=1e8
@@ -26,7 +27,8 @@ export PERF=1
 
 # Build the project first
 echo "Building calico..."
-make clean && make -j$(nproc)
+make clean
+make -j$(nproc)
 
 # Function to run leanstore experiment
 run_leanstore_experiment() {
@@ -55,7 +57,7 @@ run_leanstore_experiment() {
     echo "  TX CSV: ${tx_file}"
     echo "  PERF CSV: ${perf_file}"
     
-    # Run leanstore and capture output
+    # Run leanstore and capture output, rerun if failed
     until build/frontend/ycsb \
         --ycsb_read_ratio=100 \
         --ycsb_tuple_count=100000000 \
@@ -74,12 +76,64 @@ run_leanstore_experiment() {
         echo "leanstore_ycsb failed, retrying in 5 seconds..."
         sleep 5
     done
-    # Parse output to extract perf-like metrics
-    # This will be done in extract script
+    
+    # Create empty perf file placeholder
     touch "${perf_file}"
     
     cd "${SCRIPT_DIR}"
     echo "Leanstore experiment with ${thread_count} threads completed."
+    echo
+}
+
+# Function to run WiredTiger experiment
+run_wiredtiger_experiment() {
+    local thread_count="$1"
+    local thread_dir="${EXP_BASE_DIR}/${thread_count}"
+    mkdir -p "${thread_dir}"
+    
+    local config_name="wiredtiger"
+    local tx_file="${thread_dir}/${config_name}_tx.csv"
+    local perf_file="${thread_dir}/${config_name}_perf.csv"
+
+    echo "=================================================================="
+    echo "Running WiredTiger experiment with ${thread_count} threads"
+    echo "=================================================================="
+    
+    cd "${SCRIPT_DIR}/leanstore"
+
+    # Remove old WiredTiger database directory
+    rm -rf build/wt_db
+    mkdir build/wt_db
+    echo "Running WiredTiger ycsb..."
+    echo "Output files:"
+    echo "  TX CSV: ${tx_file}"
+    echo "  PERF CSV: ${perf_file}"
+
+    # Run WiredTiger and capture output, rerun if failed
+    until build/frontend/wiredtiger_ycsb \
+        --ycsb_read_ratio=100 \
+        --ycsb_tuple_count=100000000 \
+        --ssd_path=build/wt_db \
+        --worker_threads=${thread_count} \
+        --pp_threads=1 \
+        --dram_gib=${PHYSMEM} \
+        --csv_path=./log \
+        --free_pct=1 \
+        --contention_split \
+        --xmerge \
+        --print_tx_console \
+        --run_for_seconds=${RUN_DURATION} \
+        --isolation_level=si > "${tx_file}" 2>&1 # must run in si mode
+    do
+        echo "wiredtiger_ycsb failed, retrying in 5 seconds..."
+        sleep 5
+    done
+    
+    # Create empty perf file placeholder
+    touch "${perf_file}"
+    
+    cd "${SCRIPT_DIR}"
+    echo "WiredTiger experiment with ${thread_count} threads completed."
     echo
 }
 
@@ -194,10 +248,25 @@ for threads in "${THREAD_COUNTS[@]}"; do
 EOF
     
     echo "Running experiments with ${threads} threads..." >> "${GLOBAL_SUMMARY_FILE}"
-    
-    # Configuration 1: Calico array (traditional buffer pool with array translator)
+
+    # # Configuration 6: Leanstore
+    # run_leanstore_experiment ${threads}
+
+    # # Configuration 7: Wiredtiger
+    # run_wiredtiger_experiment ${threads}
+
+    # # Configuration 1: Calico array (traditional buffer pool with array translator)
     run_config_combinations ${threads} "calico_array" "Calico with traditional buffer pool using array translator" \
         "TRADITIONAL=1" "TRADHASH=0"
+
+    # # Configuration 1: Calico array (traditional buffer pool with 2-level array translator)
+    # run_config_combinations ${threads} "calico_array_2level" "Calico with traditional buffer pool using array translator" \
+    #     "TRADITIONAL=1" "TRADHASH=5"
+
+    # # Configuration 1: Calico array (traditional buffer pool with 3-level array translator)
+    # run_config_combinations ${threads} "calico_array_3level" "Calico with traditional buffer pool using array translator" \
+    #     "TRADITIONAL=1" "TRADHASH=6"
+
 
     # Configuration 2: Calico mmap (virtual memory cache)
     run_config_combinations ${threads} "calico_mmap" "Calico with mmap (virtual memory cache)" \
@@ -215,8 +284,6 @@ EOF
     run_config_combinations ${threads} "calico_lockfree_hash" "Calico with traditional buffer pool using lock free open addressing hash translator" \
         "TRADITIONAL=1" "TRADHASH=4"
 
-    # Configuration 6: Leanstore
-    run_leanstore_experiment ${threads}
 
     echo "Completed experiments with ${threads} threads" >> "${GLOBAL_SUMMARY_FILE}"
     echo "" >> "${GLOBAL_SUMMARY_FILE}"
