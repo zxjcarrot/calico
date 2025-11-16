@@ -46,6 +46,10 @@ cpp_args = [
     '-fno-omit-frame-pointer'
 ] + openmp_compile_args # Add the OpenMP compile args
 
+# Optional: control HNSW_DISABLE_OPTIMISTIC_READ via env for ablation builds
+if os.getenv("CALICO_HNSW_DISABLE_OPTIMISTIC_READ", "0") == "1":
+    cpp_args.append("-DHNSW_DISABLE_OPTIMISTIC_READ")
+
 # Linker arguments, if any are needed
 linker_args = [] + openmp_link_args # Add the OpenMP link args
 
