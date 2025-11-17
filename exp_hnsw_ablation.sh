@@ -23,22 +23,23 @@ SEARCH_THREADS=1
 # 6: + group prefetching
 
 AB_STAGES=(
-  "1_hash_only:1:2:0:1:1:0"   # name:TRADITIONAL:TRADHASH:NOHUGEPAGE_FRAME_MEM:NOHUGEPAGE_TRANSLATION_ARRAY:OPT_READ_DISABLED:PREFETCH
-  "2_array_index:1:0:0:1:1:0"
-  "3_array_huge_frames_trans:1:0:0:0:1:0"
-  "4_array_huge_frames_trans_optread:1:0:0:0:0:0"
-  "5_array_huge_frames_trans_optread_prefetch:1:0:0:0:0:1"
+  "1_hash_only:1:2:0:1:1:0:hash"   # name:TRADITIONAL:TRADHASH:NOHUGEPAGE_FRAME_MEM:NOHUGEPAGE_TRANSLATION_ARRAY:OPT_READ_DISABLED:PREFETCH:SPECIALIZATION
+  "2_array_index:1:0:0:1:1:0:calico"
+  "3_array_huge_frames_trans:1:0:0:0:1:0:calico"
+  "4_array_huge_frames_trans_optread:1:0:0:0:0:0:calico"
+  "5_array_huge_frames_trans_optread_prefetch:1:0:0:0:0:1:calico"
 )
 
 run_stage() {
   local spec="$1"
-  IFS=':' read -r name traditional tradhash nohuge_frame nohuge_trans optread_disabled prefetch <<< "$spec"
+  IFS=':' read -r name traditional tradhash nohuge_frame nohuge_trans optread_disabled prefetch specialization <<< "$spec"
 
   echo "==============================="
   echo "Stage: $name"
   echo "TRADITIONAL=$traditional TRADHASH=$tradhash"
   echo "NOHUGEPAGE_FRAME_MEM=$nohuge_frame NOHUGEPAGE_TRANSLATION_ARRAY=$nohuge_trans"
   echo "OPTREAD_DISABLED=$optread_disabled PREFETCH=$prefetch"
+  echo "SPECIALIZATION=$specialization"
   echo "==============================="
 
   export TRADITIONAL="$traditional"
@@ -48,6 +49,8 @@ run_stage() {
   export PREFETCH="$prefetch"
   export PHYSGB="$PHYSMEM"
   export VIRTGB="$VIRTMEM"
+  export CALICO_RUN_LABEL="$name"
+  export CALICO_SPECIALIZATION="$specialization"
   # Control compile-time macro via env used by setup.py
   if [ "$optread_disabled" = "1" ]; then
     export CALICO_HNSW_DISABLE_OPTIMISTIC_READ=1

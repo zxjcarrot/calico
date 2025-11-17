@@ -38,7 +38,7 @@ typedef uint32_t u32;
 typedef uint64_t u64;
 typedef u64 PID;  // page id type
 
-static constexpr u64 pageSize = 8192;
+static constexpr u64 pageSize = 4096;
 
 __attribute__((target("sse4.2"))) uint64_t hash64(uint64_t key, uint32_t seed);
 
@@ -415,6 +415,8 @@ struct BufferManager {
     Page* toPtr(PID pid);
     Page* residentPtr(PID pid);
     Page* residentPtr(PID pid, u64 stateAndVersion);
+    Page* residentPtrCalico(PID pid, u64 stateAndVersion);
+    Page* residentPtrHash(PID pid, u64 stateAndVersion);
     Page* preparePageForWrite(PID pid);
 
     void ensureFreePages();
@@ -492,7 +494,13 @@ struct GuardO {
                     }
                     break;
                 default:
+#if defined(CALICO_SPECIALIZATION_CALICO)
+                    ptr = reinterpret_cast<T*>(bm.residentPtrCalico(pid, v));
+#elif defined(CALICO_SPECIALIZATION_HASH)
+                    ptr = reinterpret_cast<T*>(bm.residentPtrHash(pid, v));
+#else
                     ptr = reinterpret_cast<T*>(bm.residentPtr(pid, v));
+#endif
                     version = v;
                     return;
             }
@@ -618,7 +626,13 @@ struct GuardORelaxed {
                 case PageState::Marked:
                 case PageState::Locked:// we can live with stale data here, fallthrough
                 default:
+#if defined(CALICO_SPECIALIZATION_CALICO)
+                    ptr = reinterpret_cast<T*>(bm.residentPtrCalico(pid, v));
+#elif defined(CALICO_SPECIALIZATION_HASH)
+                    ptr = reinterpret_cast<T*>(bm.residentPtrHash(pid, v));
+#else
                     ptr = reinterpret_cast<T*>(bm.residentPtr(pid, v));
+#endif
                     version = v;
                     return;
             }
@@ -719,7 +733,13 @@ struct GuardO_NoThrow {
                     }
                     break;
                 default:
+#if defined(CALICO_SPECIALIZATION_CALICO)
+                    ptr = reinterpret_cast<T*>(bm.residentPtrCalico(pid, v));
+#elif defined(CALICO_SPECIALIZATION_HASH)
+                    ptr = reinterpret_cast<T*>(bm.residentPtrHash(pid, v));
+#else
                     ptr = reinterpret_cast<T*>(bm.residentPtr(pid, v));
+#endif
                     version = v;
                     return;
             }

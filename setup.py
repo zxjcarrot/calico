@@ -13,7 +13,7 @@ tpcc_sources = glob.glob('tpcc/*.cpp') # Fixed the extension from .pp to .cpp, a
 # Combine all C++ source files needed for the module.
 # You need bindings.cpp (for Python interface) and all your original source files.
 all_sources = ['bindings.cpp', 'calico.cpp', 'hnsw.cpp', 'diskann.cpp', 'distance_diskann.cpp'] + tpcc_sources
-
+#all_sources = ['bindings.cpp', 'calico.cpp', 'hnsw.cpp'] + tpcc_sources
 # --- MODIFICATION START: Added OpenMP flags ---
 
 # We'll handle different compilers/platforms for better compatibility
@@ -24,7 +24,7 @@ openmp_link_args = []
 if sys.platform != "win32":
     openmp_compile_args.append('-fopenmp')
     openmp_link_args.append('-fopenmp')
-    openmp_link_args.append('-lomp')
+    #openmp_link_args.append('-lomp')
 # For MSVC on Windows
 else:
     openmp_compile_args.append('/openmp')
@@ -36,7 +36,7 @@ else:
 # Compiler arguments translated from your Makefile
 cpp_args = [
     '-std=c++20',
-    '-O3',
+    '-O2',
     '-DNDEBUG',
     '-g3', # Generates debug info
     '-fnon-call-exceptions',
@@ -50,6 +50,14 @@ cpp_args = [
 # Optional: control HNSW_DISABLE_OPTIMISTIC_READ via env for ablation builds
 if os.getenv("CALICO_HNSW_DISABLE_OPTIMISTIC_READ", "0") == "1":
     cpp_args.append("-DHNSW_DISABLE_OPTIMISTIC_READ")
+
+# Optional: control specialization via env for ablation builds
+specialization = os.getenv("CALICO_SPECIALIZATION", "")
+if specialization == "calico":
+    cpp_args.append("-DCALICO_SPECIALIZATION_CALICO")
+elif specialization == "hash":
+    cpp_args.append("-DCALICO_SPECIALIZATION_HASH")
+# If not set or other value, no specialization macro is defined (uses residentPtr for generality)
 
 # Linker arguments, if any are needed
 linker_args = [] + openmp_link_args # Add the OpenMP link args
@@ -68,8 +76,8 @@ calico_module = Extension(
         'tpcc'    # Directory for tpcc headers
     ],
     
-    # Libraries to link against, translated from -laio, -luring and -lpthread
-    libraries=['aio', 'uring', 'pthread'], 
+    # Libraries to link against, translated from -laio, -luring, -lpthread and abseil
+    libraries=['aio', 'uring', 'pthread', 'absl_hash', 'absl_raw_hash_set', 'absl_raw_logging_internal'], 
     
     language='c++',
     

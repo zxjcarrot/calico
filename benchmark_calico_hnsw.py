@@ -60,7 +60,7 @@ class CacheProfiler:
         if not shutil.which("perf"):
             raise RuntimeError("The 'perf' command-line tool is not installed or not in PATH.")
         
-        self.events = events or ['cache-misses', 'cache-references', 'L1-dcache-load-misses', 'LLC-load-misses']
+        self.events = events or ['cache-misses', 'cache-references', 'L1-dcache-load-misses', 'LLC-load-misses', 'dTLB-load-misses', 'dTLB-loads', 'instructions', 'cycles']
         self.enabled = len(self.events) > 0
         
         if self.enabled:
@@ -238,7 +238,7 @@ def start_perf_profiling(
     data_quoted = shlex.quote(str(data_path))
     cmd_str = (
         f"sleep {int(delay)}; "
-        f"exec perf record -F 999 -g -p {int(target_pid)} -o {data_quoted} -- sleep {float(duration)}"
+        f"exec perf record -g -p {int(target_pid)} -o {data_quoted} -- sleep {float(duration)}"
     )
 
     try:
@@ -768,7 +768,7 @@ def benchmark_calico_config(X_base, X_query, ground_truth, params, num_threads, 
     # use 100% of the query to warmup the cache
     warmup_count = max(1, len(X_query_repeated))
     print(f"Warming up cache with {warmup_count} queries...")
-    _ = index_calico.search_knn_parallel(X_query_repeated[:warmup_count], k, ef_search=100, num_threads=64, stats=False)
+    _ = index_calico.search_knn_parallel(X_query_repeated[:warmup_count], k, ef_search=100, num_threads=16, stats=False)
 
     ef_search = params.get("ef_search", 50) + 8
     print(f"\nQuerying for k={k} nearest neighbors with ef_search={ef_search}, threads={num_threads}...")

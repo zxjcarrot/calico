@@ -494,17 +494,25 @@ BufferManager::BufferManager(unsigned nthreads)
     writeCount = 0;
     batch = envOr("BATCH", 64);
 
+    std::string translation_specialization = "general";
+    #ifdef CALICO_SPECIALIZATION_CALICO
+    translation_specialization = "calico";
+    #elif defined(CALICO_SPECIALIZATION_HASH)
+    translation_specialization = "hash";
+    #else
+    #endif
     cerr << "calico BufferManager initialized: "
          << "blk:" << path << " virtgb:" << virtSize / gb << " physgb:" << (float)physSize / gb
          << " traditional:" << useTraditional << " mmap_os_pagecache:" << useMmapOSPageacche
          << " trad_hash:" << static_cast<int>(hashMode) << " exmap:" << useExmap << " hugepage: " << (disableHugePageForFrameMem == 0)
-         << " num_threads:" << numThreads
+         << " num_threads:" << numThreads 
+         << " translation_specialization:" << translation_specialization
          << endl;
 }
 
 BufferManager::~BufferManager() {
     try {
-        flushAll();
+        //flushAll();
     } catch (const std::exception& ex) {
         std::cerr << "BufferManager::~BufferManager flush error: " << ex.what() << std::endl;
     } catch (...) {
@@ -555,7 +563,30 @@ inline Page* BufferManager::residentPtr(PID pid) {
     if (!useTraditional) return virtMem + pid;
     PageState& ps = getPageState(pid);
     u64 stateAndVersion = ps.stateAndVersion.load(std::memory_order_acquire);
+#if defined(CALICO_SPECIALIZATION_CALICO)
+    return residentPtrCalico(pid, stateAndVersion);
+#elif defined(CALICO_SPECIALIZATION_HASH)
+    return residentPtrHash(pid, stateAndVersion);
+#else
     return residentPtr(pid, stateAndVersion);
+#endif
+}
+
+Page* BufferManager::residentPtrCalico(PID pid, u64 stateAndVersion) {
+    // Specialized for Calico array indexing - extracts frame from stateAndVersion
+    u64 frame = PageState::extractFrame(stateAndVersion);
+    assert(frame != PageState::packedInvalidFrame);
+    assert(frame < physCount);
+    return frameMem + static_cast<size_t>(frame);
+}
+
+Page* BufferManager::residentPtrHash(PID pid, u64 stateAndVersion) {
+    // Specialized for hash table lookup - ignores stateAndVersion
+    u64 frame;
+    bool ok = pidToFrameHash->tryGet(pid, frame);
+    assert(ok);
+    assert(frame < physCount);
+    return frameMem + static_cast<size_t>(frame);
 }
 
 Page* BufferManager::residentPtr(PID pid, u64 stateAndVersion) {
@@ -716,7 +747,7 @@ Page* BufferManager::allocPage() {
     residentSet.insert(pid);
     page->dirty = true;
 
-    updateAllocCountSnapshot(pid + 1);
+    //updateAllocCountSnapshot(pid + 1);
 
     return page;
 }
@@ -756,12 +787,18 @@ Page* BufferManager::fixX(PID pid) {
         u64 stateAndVersion = ps.stateAndVersion.load();
         u64 state = PageState::getState(stateAndVersion);
         
-        if (useMmapOSPageacche) {
+    if (useMmapOSPageacche) {
             // In mmap+OS page cache mode, pages are never evicted by DB
             // Only need to handle: Locked, Marked, Unlocked states
             if (state == PageState::Marked || state == PageState::Unlocked) {
                 if (ps.tryLockX(stateAndVersion)) {
+#if defined(CALICO_SPECIALIZATION_CALICO)
+                    return residentPtrCalico(pid, stateAndVersion);
+#elif defined(CALICO_SPECIALIZATION_HASH)
+                    return residentPtrHash(pid, stateAndVersion);
+#else
                     return residentPtr(pid, stateAndVersion);
+#endif
                 }
             }
             // For Locked state, just retry
@@ -780,7 +817,13 @@ Page* BufferManager::fixX(PID pid) {
                 case PageState::Unlocked: {
                     if (ps.tryLockX(stateAndVersion)) {
                         // u64 lockedState = PageState::sameVersion(stateAndVersion, PageState::Locked);
+#if defined(CALICO_SPECIALIZATION_CALICO)
+                        return residentPtrCalico(pid, stateAndVersion);
+#elif defined(CALICO_SPECIALIZATION_HASH)
+                        return residentPtrHash(pid, stateAndVersion);
+#else
                         return residentPtr(pid, stateAndVersion);
+#endif
                     }
                     break;
                 }
@@ -807,7 +850,13 @@ Page* BufferManager::fixS(PID pid) {
                     u64 s = PageState::getState(stateAndVersion);
                     u64 nextState = (s < PageState::MaxShared) ? (s + 1) : 1;
                     u64 newState = PageState::sameVersion(stateAndVersion, nextState);
+#if defined(CALICO_SPECIALIZATION_CALICO)
+                    return residentPtrCalico(pid, newState);
+#elif defined(CALICO_SPECIALIZATION_HASH)
+                    return residentPtrHash(pid, newState);
+#else
                     return residentPtr(pid, newState);
+#endif
                 }
             }
         } else {
@@ -829,7 +878,13 @@ Page* BufferManager::fixS(PID pid) {
                         u64 s = PageState::getState(stateAndVersion);
                         u64 nextState = (s < PageState::MaxShared) ? (s + 1) : 1;
                         u64 newState = PageState::sameVersion(stateAndVersion, nextState);
+#if defined(CALICO_SPECIALIZATION_CALICO)
+                        return residentPtrCalico(pid, newState);
+#elif defined(CALICO_SPECIALIZATION_HASH)
+                        return residentPtrHash(pid, newState);
+#else
                         return residentPtr(pid, newState);
+#endif
                     }
                 }
             }
@@ -908,7 +963,13 @@ void BufferManager::flushAll() {
             }
 
             if (ps.tryLockS(state_and_version)) {
+#if defined(CALICO_SPECIALIZATION_CALICO)
+                Page* page_ptr = residentPtrCalico(pid, state_and_version);
+#elif defined(CALICO_SPECIALIZATION_HASH)
+                Page* page_ptr = residentPtrHash(pid, state_and_version);
+#else
                 Page* page_ptr = residentPtr(pid, state_and_version);
+#endif
                 if (page_ptr->dirty) {
                     batch.push_back(pid);
                     locked_states.push_back(&ps);
@@ -1007,13 +1068,13 @@ void BufferManager::evict() {
 
 void BufferManager::prefetchPages(const PID* pages, int n_pages, const u32* offsets_within_pages) {
     //if (!useTraditional || hashMode == HashMode::Array1Access || hashMode == HashMode::Array || hashMode == HashMode::Array2Level) {
-    // if (!useTraditional || hashMode == HashMode::Array1Access) {
-    //     for (int i = 0; i < n_pages; i++) {
-    //         PageState& ps = getPageState(pages[i]);
-    //         char * tmp = (char*)&ps;
-    //         _mm_prefetch(reinterpret_cast<const char*>(tmp), _MM_HINT_T0);
-    //     }
-    // }
+    if (!useTraditional || hashMode == HashMode::Array1Access) {
+        for (int i = 0; i < n_pages; i++) {
+            PageState& ps = pageState[pages[i]];
+            char * tmp = (char*)&ps;
+            _mm_prefetch(reinterpret_cast<const char*>(tmp), _MM_HINT_T0);
+        }
+    }
     
     // if (!useTraditional) {
     //    // For mmap mode, all pages are always "resident"
@@ -1027,14 +1088,15 @@ void BufferManager::prefetchPages(const PID* pages, int n_pages, const u32* offs
     for (int i = 0; i < n_pages; i++) {
         PID pid = pages[i];
         assert(pid < virtCount);
-        if (i + 1 < n_pages) {
-            // Prefetch next PageState
-            PageState& next_ps = getPageState(pages[i + 1]);
-            char* tmp = (char*)&next_ps;
-            _mm_prefetch(reinterpret_cast<const char*>(tmp), _MM_HINT_T0);
-        }
+        // if (i + 1 < n_pages) {
+        //     // Prefetch next PageState
+        //     PageState& next_ps = getPageState(pages[i + 1]);
+        //     char* tmp = (char*)&next_ps;
+        //     _mm_prefetch(reinterpret_cast<const char*>(tmp), _MM_HINT_T0);
+        // }
 
-        PageState& ps = getPageState(pid);
+        //PageState& ps = getPageState(pid);
+        PageState& ps = pageState[pages[i]];
         u64 stateAndVersion = ps.stateAndVersion.load(std::memory_order_acquire);
         u64 state = PageState::getState(stateAndVersion);
 
@@ -1049,6 +1111,14 @@ void BufferManager::prefetchPages(const PID* pages, int n_pages, const u32* offs
 
         // Skip pages that are already in memory (not evicted)
         if (state != PageState::Evicted) {
+            u64 frame = PageState::extractFrame(stateAndVersion);
+            // u64 v = ps.getFrameValue();
+            // u64 frame = PageState::extractFrame(v);
+            //pthread_rwlock_unlock(&pid_locks[pid_lock_shard(pid)]);
+            // assert(frame != PageState::packedInvalidFrame);
+            // assert(frame < physCount);
+            char *tmp = (char*)(frameMem + static_cast<size_t>(frame)) + (offsets_within_pages == nullptr ? 0 : offsets_within_pages[i]);
+            _mm_prefetch(reinterpret_cast<const char*>(tmp), _MM_HINT_T0);
             if (offsets_within_pages != nullptr) {
                   // Touch the page to bring it into cache
                 //   char *tmp = (((char*)residentPtr(pid, stateAndVersion)) + offsets_within_pages[i]);
@@ -1455,11 +1525,16 @@ PID BTreeNode::lookupInner(span<u8> key) {
 static unsigned btreeslotcounter = 0;
 
 BTree::BTree() : splitOrdered(false) {
-    GuardX<MetaDataPage> page(metadataPageId);
-    AllocGuard<BTreeNode> rootNode(true);
+    PID rootNodePid;
     {
+        AllocGuard<BTreeNode> rootNode(true);
+        rootNodePid = rootNode.pid;
+    }
+    
+    {
+        GuardX<MetaDataPage> page(metadataPageId);
         slotId = btreeslotcounter++;
-        page->roots[slotId] = rootNode.pid;
+        page->roots[slotId] = rootNodePid;
         page->dirty = true;
     }
 }
@@ -1494,13 +1569,14 @@ GuardS<BTreeNode> BTree::findLeafS(span<u8> key) {
 void BTree::trySplit(GuardX<BTreeNode>&& node, GuardX<BTreeNode>&& parent, span<u8> key, unsigned payloadLen) {
     // create new root if necessary
     if (parent.pid == metadataPageId) {
-        GuardX<MetaDataPage> meta_guard(metadataPageId);
+        // parent already holds the lock on metadataPageId, so reuse it
+        MetaDataPage* meta_page = reinterpret_cast<MetaDataPage*>(parent.ptr);
 
         AllocGuard<BTreeNode> newRoot(false);
         newRoot->upperInnerNode = node.pid;
         {
-            meta_guard->roots[slotId] = newRoot.pid;
-            meta_guard->dirty = true;
+            meta_page->roots[slotId] = newRoot.pid;
+            meta_page->dirty = true;
         }
         parent = std::move(newRoot);
     }
