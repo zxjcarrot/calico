@@ -386,7 +386,9 @@ BufferManager::BufferManager(unsigned nthreads)
             if (start >= physCount) continue;
             u32 end = std::min<u32>(start + partitionFrameSpan, physCount);
             partition.frames.reserve(end - start);
-            for (u32 frame = start; frame < end; frame++) partition.frames.push_back(frame);
+            // Reserve frame 0 as invalid marker - start from frame 1
+            u32 frameStart = (start == 0) ? 1 : start;
+            for (u32 frame = frameStart; frame < end; frame++) partition.frames.push_back(frame);
             //if (!partition.frames.empty()) std::random_shuffle(partition.frames.begin(), partition.frames.end());
             std::reverse(partition.frames.begin(), partition.frames.end());
             partition.top = partition.frames.size();
@@ -477,15 +479,42 @@ BufferManager::BufferManager(unsigned nthreads)
         pageState2Level.reset();
         pageState3Level = std::make_unique<ThreeLevelPageStateArray>(virtCount);
     } else {
-        pageState = (PageState*)allocHuge(virtCount * sizeof(PageState));
-        for (u64 i = 0; i < virtCount; i++) pageState[i].init();
+        if (disableHugePageForTranslationArray) {
+            pageState = (PageState*)mmap(NULL, virtCount * sizeof(PageState), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (pageState == MAP_FAILED) die("mmap pageState");
+        } else {
+            pageState = (PageState*)allocHuge(virtCount * sizeof(PageState));
+        }
+        //for (u64 i = 0; i < virtCount; i++) pageState[i].init();
         pageState2Level.reset();
         pageState3Level.reset();
     }
-    if (disableHugePageForTranslationArray && useTraditional) {
-        if (hashMode == HashMode::Array1Access) {
-            madvise(pageState, virtCount * sizeof(PageState), MADV_NOHUGEPAGE);
+    // if (disableHugePageForTranslationArray && useTraditional) {
+    //     if (hashMode == HashMode::Array1Access) {
+    //         madvise(pageState, virtCount * sizeof(PageState), MADV_NOHUGEPAGE);
+    //     }
+    // }
+    
+    // Determine OS page size for translation array based on huge page usage
+    // If huge pages are disabled for translation array, use 4KB pages, otherwise 2MB
+    translationOSPageSize = (disableHugePageForTranslationArray && useTraditional) ? 4096 : (2 * 1024 * 1024);
+    
+    // Initialize reference counting for hole-punching (Array1Access mode only)
+    translationRefCounts = nullptr;
+    if (hashMode == HashMode::Array1Access && useTraditional) {
+        // Each OS page holds translationOSPageSize/sizeof(PageState) translation entries
+        u64 entriesPerOSPage = translationOSPageSize / sizeof(PageState);
+        numRefCountGroups = (virtCount + entriesPerOSPage - 1) / entriesPerOSPage;
+        
+        // Lazily allocate reference counts using mmap with MAP_PRIVATE | MAP_ANONYMOUS
+        // This ensures physical memory is only allocated on first write (zero-page COW)
+        size_t refCountSize = numRefCountGroups * sizeof(std::atomic<u32>);
+        translationRefCounts = (std::atomic<u32>*)mmap(NULL, refCountSize, PROT_READ | PROT_WRITE,
+                                                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (translationRefCounts == MAP_FAILED) {
+            die("mmap translationRefCounts failed");
         }
+        // No need to initialize - mmap with MAP_ANONYMOUS gives zero-filled pages
     }
 
     physUsedCount = 0;
@@ -517,6 +546,13 @@ BufferManager::~BufferManager() {
         std::cerr << "BufferManager::~BufferManager flush error: " << ex.what() << std::endl;
     } catch (...) {
         std::cerr << "BufferManager::~BufferManager encountered an unknown error during flush." << std::endl;
+    }
+    
+    // Cleanup lazily allocated reference counts
+    if (translationRefCounts != nullptr) {
+        size_t refCountSize = numRefCountGroups * sizeof(std::atomic<u32>);
+        munmap(translationRefCounts, refCountSize);
+        translationRefCounts = nullptr;
     }
 }
 
@@ -660,10 +696,38 @@ Page* BufferManager::acquireFrameForPid(PID pid) {
         pidToFrameArray[pid].store(static_cast<u64>(frame), std::memory_order_release);
         frameToPidArray[frame].store(pid, std::memory_order_release);
     } else if (hashMode == HashMode::Array1Access || hashMode == HashMode::Array2Level || hashMode == HashMode::Array3Level) {
+        
+        // Increment reference counter for this OS page group (Array1Access only)
+        if (hashMode == HashMode::Array1Access && translationRefCounts) {
+            u64 entriesPerOSPage = translationOSPageSize / sizeof(PageState);
+            u64 refCountIdx = pid / entriesPerOSPage;
+            
+            // Atomically increment reference count with lock bit handling
+            while (true) {
+                u32 oldVal = translationRefCounts[refCountIdx].load(std::memory_order_acquire);
+                
+                // Check if locked (highest bit set)
+                if (oldVal & REF_COUNT_LOCK_BIT) {
+                    _mm_pause();  // Spin-wait during hole-punching
+                    continue;
+                }
+                
+                // Try to increment count (lower 31 bits)
+                u32 count = oldVal & REF_COUNT_MASK;
+                u32 newVal = (count + 1) & REF_COUNT_MASK;
+                
+                if (translationRefCounts[refCountIdx].compare_exchange_weak(oldVal, newVal, 
+                                                                            std::memory_order_release,
+                                                                            std::memory_order_acquire)) {
+                    break;  // Successfully incremented
+                }
+            }
+        }
         //pthread_rwlock_wrlock(&pid_locks[pid_lock_shard(pid)]);
         getPageState(pid).setFrameValue(frame);
         frameToPidArray[frame].store(pid, std::memory_order_release);
         //pthread_rwlock_unlock(&pid_locks[pid_lock_shard(pid)]);
+        
     } else {
         u64 frameId = static_cast<u64>(frame);
         pidToFrameHash->insertOrAssign(pid, frameId);
@@ -687,6 +751,57 @@ void BufferManager::releaseFrame(PID pid) {
         getPageState(pid).clearFrameValue();
         frameToPidArray[static_cast<size_t>(frameId)].store(invalidPID, std::memory_order_release);
         //pthread_rwlock_unlock(&pid_locks[pid_lock_shard(pid)]);
+        
+        // Reference counting and hole-punching for Array1Access only
+        if (hashMode == HashMode::Array1Access && translationRefCounts) {
+            u64 entriesPerOSPage = translationOSPageSize / sizeof(PageState);
+            u64 refCountIdx = pid / entriesPerOSPage;
+            
+            // Atomically decrement reference count with lock bit handling
+            while (true) {
+                u32 oldVal = translationRefCounts[refCountIdx].load(std::memory_order_acquire);
+                
+                // Check if locked (highest bit set) - should not happen during normal decrement
+                if (oldVal & REF_COUNT_LOCK_BIT) {
+                    _mm_pause();
+                    continue;
+                }
+                
+                // Get current count (lower 31 bits)
+                u32 count = oldVal & REF_COUNT_MASK;
+                assert(count > 0);  // Should never decrement from 0
+                
+                u32 newCount = count - 1;
+                
+                // If count will become zero, try to set lock bit for hole-punching
+                if (newCount == 0) {
+                    u32 lockedVal = REF_COUNT_LOCK_BIT;  // Set lock bit, count = 0
+                    if (translationRefCounts[refCountIdx].compare_exchange_weak(oldVal, lockedVal,
+                                                                                std::memory_order_acquire,
+                                                                                std::memory_order_acquire)) {
+                        // Successfully locked with count=0, perform hole-punching
+                        void* osPageStart = reinterpret_cast<void*>(
+                            reinterpret_cast<uintptr_t>(pageState) + 
+                            (refCountIdx * entriesPerOSPage * sizeof(PageState))
+                        );
+                        madvise(osPageStart, translationOSPageSize, MADV_DONTNEED);
+                        
+                        // Reset to 0 (unlock, count remains 0)
+                        translationRefCounts[refCountIdx].store(0, std::memory_order_release);
+                        break;
+                    }
+                    // CAS failed, retry
+                } else {
+                    // Normal decrement without locking
+                    if (translationRefCounts[refCountIdx].compare_exchange_weak(oldVal, newCount,
+                                                                                std::memory_order_release,
+                                                                                std::memory_order_acquire)) {
+                        break;  // Successfully decremented
+                    }
+                    // CAS failed, retry
+                }
+            }
+        }
     } else {
         bool ok = pidToFrameHash->erase(pid, frameId);
         assert(ok);
@@ -807,9 +922,15 @@ Page* BufferManager::fixX(PID pid) {
             switch (state) {
                 case PageState::Evicted: {
                     if (ps.tryLockX(stateAndVersion)) {
-                        Page* page = handleFault(pid);
-                        ensureFreePages();
-                        return page;
+                        try {
+                            Page* page = handleFault(pid);
+                            ensureFreePages();
+                            return page;
+                        } catch (...) {
+                            // Unlock page on failure to prevent livelock
+                            ps.unlockXEvicted();
+                            throw;
+                        }
                     }
                     break;
                 }
@@ -867,9 +988,15 @@ Page* BufferManager::fixS(PID pid) {
                 }
                 case PageState::Evicted: {
                     if (ps.tryLockX(stateAndVersion)) {
-                        handleFault(pid);
-                        ps.unlockX();
-                        ensureFreePages();
+                        try {
+                            handleFault(pid);
+                            ps.unlockX();
+                            ensureFreePages();
+                        } catch (...) {
+                            // Unlock page on failure to prevent livelock
+                            ps.unlockXEvicted();
+                            throw;
+                        }
                     }
                     break;
                 }
@@ -1088,12 +1215,12 @@ void BufferManager::prefetchPages(const PID* pages, int n_pages, const u32* offs
     for (int i = 0; i < n_pages; i++) {
         PID pid = pages[i];
         assert(pid < virtCount);
-        // if (i + 1 < n_pages) {
-        //     // Prefetch next PageState
-        //     PageState& next_ps = getPageState(pages[i + 1]);
-        //     char* tmp = (char*)&next_ps;
-        //     _mm_prefetch(reinterpret_cast<const char*>(tmp), _MM_HINT_T0);
-        // }
+        if (i + 1 < n_pages) {
+            // Prefetch next PageState
+            PageState& next_ps = getPageState(pages[i + 1]);
+            char* tmp = (char*)&next_ps;
+            _mm_prefetch(reinterpret_cast<const char*>(tmp), _MM_HINT_T0);
+        }
 
         //PageState& ps = getPageState(pid);
         PageState& ps = pageState[pages[i]];
@@ -1119,12 +1246,12 @@ void BufferManager::prefetchPages(const PID* pages, int n_pages, const u32* offs
             // assert(frame < physCount);
             char *tmp = (char*)(frameMem + static_cast<size_t>(frame)) + (offsets_within_pages == nullptr ? 0 : offsets_within_pages[i]);
             _mm_prefetch(reinterpret_cast<const char*>(tmp), _MM_HINT_T0);
-            if (offsets_within_pages != nullptr) {
-                  // Touch the page to bring it into cache
-                //   char *tmp = (((char*)residentPtr(pid, stateAndVersion)) + offsets_within_pages[i]);
-                //   _mm_prefetch(reinterpret_cast<const char*>(tmp), _MM_HINT_T2);
-                //   _mm_prefetch(reinterpret_cast<const char*>(tmp) + 64, _MM_HINT_T2);
-            }
+            // if (offsets_within_pages != nullptr) {
+            //       // Touch the page to bring it into cache
+            //     //   char *tmp = (((char*)residentPtr(pid, stateAndVersion)) + offsets_within_pages[i]);
+            //     //   _mm_prefetch(reinterpret_cast<const char*>(tmp), _MM_HINT_T2);
+            //     //   _mm_prefetch(reinterpret_cast<const char*>(tmp) + 64, _MM_HINT_T2);
+            // }
             continue;
         }
 
@@ -1146,8 +1273,8 @@ void BufferManager::prefetchPages(const PID* pages, int n_pages, const u32* offs
                 destinations->push_back(frame);
                 physUsedCount++;
             } else {
-                // Failed to acquire frame, unlock the page
-                ps.unlockX();
+                // Failed to acquire frame, return to evicted state
+                ps.unlockXEvicted();
             }
         }
     }

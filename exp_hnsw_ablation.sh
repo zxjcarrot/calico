@@ -4,8 +4,8 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}" )" && pwd)"
 RESULTS_BASE_DIR="${SCRIPT_DIR}/Calico-VLDB26/data/exps/in-memory/ablation"
 
-#DATASET="deep10M"
-DATASET="sift1m"
+DATASET="deep10M"
+#DATASET="sift1m"
 M=16
 EF_CONSTRUCTION=100
 K=10

@@ -33,7 +33,6 @@ import hnswlib
 
 # Global cache events to profile
 CACHE_EVENTS = ['dTLB-load-misses', 'dTLB-loads', 'instructions', 'cycles', 'cache-misses', 'cache-references', 'L1-dcache-load-misses', 'LLC-load-misses']
-CACHE_EVENTS = []
 def get_rss_from_proc():
     """Read RSS (Resident Set Size) from /proc/self/status in bytes."""
     try:
@@ -704,7 +703,7 @@ def benchmark_calico_config(X_base, X_query, ground_truth, params, num_threads, 
                     processed += (end_idx - i)
                     elapsed_total = time.time() - batch_time_total_start
                     vps = processed / elapsed_total if elapsed_total > 0 else float('inf')
-                    mbps = (processed * dim * 4) / elapsed_total / (1024**2) if elapsed_total > 0 else 0.0
+                    mbps = (float(processed) * dim * 4) / elapsed_total / (1024**2) if elapsed_total > 0 else 0.0
                     remaining = max(0, num_elements - end_idx)
                     eta_seconds = remaining / vps if vps > 0 and vps != float('inf') else 0
                     eta_str = time.strftime("%H:%M:%S", time.gmtime(eta_seconds))
@@ -723,7 +722,7 @@ def benchmark_calico_config(X_base, X_query, ground_truth, params, num_threads, 
                 processed += (end_idx - i)
                 elapsed_total = time.time() - batch_time_total_start
                 vps = processed / elapsed_total if elapsed_total > 0 else float('inf')
-                mbps = (processed * dim * 4) / elapsed_total / (1024**2) if elapsed_total > 0 else 0.0
+                mbps = (float(processed) * dim * 4) / elapsed_total / (1024**2) if elapsed_total > 0 else 0.0
                 remaining = max(0, num_elements - end_idx)
                 eta_seconds = remaining / vps if vps > 0 and vps != float('inf') else 0
                 eta_str = time.strftime("%H:%M:%S", time.gmtime(eta_seconds))
@@ -1057,7 +1056,7 @@ def benchmark_usearch_config(X_base, X_query, ground_truth, params, num_threads,
                     processed += (end_idx - i)
                     elapsed_total = time.time() - batch_time_total_start
                     vps = processed / elapsed_total if elapsed_total > 0 else float('inf')
-                    mbps = (processed * dim * 4) / elapsed_total / (1024**2) if elapsed_total > 0 else 0.0
+                    mbps = (float(processed) * dim * 4) / elapsed_total / (1024**2) if elapsed_total > 0 else 0.0
                     remaining = max(0, num_elements - end_idx)
                     eta_seconds = remaining / vps if vps > 0 and vps != float('inf') else 0
                     eta_str = time.strftime("%H:%M:%S", time.gmtime(eta_seconds))
@@ -1077,7 +1076,7 @@ def benchmark_usearch_config(X_base, X_query, ground_truth, params, num_threads,
                 processed += (end_idx - i)
                 elapsed_total = time.time() - batch_time_total_start
                 vps = processed / elapsed_total if elapsed_total > 0 else float('inf')
-                mbps = (processed * dim * 4) / elapsed_total / (1024**2) if elapsed_total > 0 else 0.0
+                mbps = (float(processed) * dim * 4) / elapsed_total / (1024**2) if elapsed_total > 0 else 0.0
                 remaining = max(0, num_elements - end_idx)
                 eta_seconds = remaining / vps if vps > 0 and vps != float('inf') else 0
                 eta_str = time.strftime("%H:%M:%S", time.gmtime(eta_seconds))

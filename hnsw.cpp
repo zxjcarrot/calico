@@ -464,39 +464,43 @@ std::vector<std::pair<float, u32>> HNSW<DistanceMetric>::searchLayer(
             unvisited_neighbors.clear();
 
             if (level <= 2 && !neighbors.empty() && enable_prefetch_) {
-                // for (const u32& neighbor_id : neighbors) { 
-                //     _mm_prefetch(reinterpret_cast<const char*>(&visited_array[neighbor_id]), _MM_HINT_T0);
-                // }
+                for (const u32& neighbor_id : neighbors) { 
+                    _mm_prefetch(reinterpret_cast<const char*>(&visited_array[neighbor_id]), _MM_HINT_T0);
+                }
                 pages_to_prefetch.clear();
                 offsets_within_pages.clear();
                 // unroll the following loop for better performance
                 size_t i = 0;
-                // for (i = 0; i < neighbors.size();) {
-                //     const u32& neighbor_id1 = neighbors[i];
-                //     if (!(visited_array[neighbor_id1] == visited_array_tag)) {
-                //         pages_to_prefetch.push_back(getNodePID(neighbor_id1));
-                //         offsets_within_pages.push_back(NodeAccessor::getVectorOffset(this, neighbor_id1));
-                //     }
-                //     const u32& neighbor_id2 = neighbors[i + 1];
-                //     if (!(visited_array[neighbor_id2] == visited_array_tag)) {
-                //         pages_to_prefetch.push_back(getNodePID(neighbor_id2));
-                //         offsets_within_pages.push_back(NodeAccessor::getVectorOffset(this, neighbor_id2));
-                //     }
-                //     const u32& neighbor_id3 = neighbors[i + 2];
-                //     if (!(visited_array[neighbor_id3] == visited_array_tag)) {
-                //         pages_to_prefetch.push_back(getNodePID(neighbor_id3));
-                //         offsets_within_pages.push_back(NodeAccessor::getVectorOffset(this, neighbor_id3));
-                //     }
-                //     const u32& neighbor_id4 = neighbors[i + 3];
-                //     if (!(visited_array[neighbor_id4] == visited_array_tag)) {
-                //         pages_to_prefetch.push_back(getNodePID(neighbor_id4));
-                //         offsets_within_pages.push_back(NodeAccessor::getVectorOffset(this, neighbor_id4));
-                //     }
-                //     if (i + 4 >= neighbors.size()) {
-                //         break;
-                //     }
-                //     i += 4;
-                // }
+                for (i = 0; i + 4 < neighbors.size();) {
+                    const u32& neighbor_id1 = neighbors[i];
+                    if (!(visited_array[neighbor_id1] == visited_array_tag)) {
+                        pages_to_prefetch.push_back(getNodePID(neighbor_id1));
+                        offsets_within_pages.push_back(NodeAccessor::getVectorOffset(this, neighbor_id1));
+                        unvisited_neighbors.push_back(neighbor_id1);
+                    }
+                    const u32& neighbor_id2 = neighbors[i + 1];
+                    if (!(visited_array[neighbor_id2] == visited_array_tag)) {
+                        pages_to_prefetch.push_back(getNodePID(neighbor_id2));
+                        offsets_within_pages.push_back(NodeAccessor::getVectorOffset(this, neighbor_id2));
+                        unvisited_neighbors.push_back(neighbor_id2);
+                    }
+                    const u32& neighbor_id3 = neighbors[i + 2];
+                    if (!(visited_array[neighbor_id3] == visited_array_tag)) {
+                        pages_to_prefetch.push_back(getNodePID(neighbor_id3));
+                        offsets_within_pages.push_back(NodeAccessor::getVectorOffset(this, neighbor_id3));
+                        unvisited_neighbors.push_back(neighbor_id3);
+                    }
+                    const u32& neighbor_id4 = neighbors[i + 3];
+                    if (!(visited_array[neighbor_id4] == visited_array_tag)) {
+                        pages_to_prefetch.push_back(getNodePID(neighbor_id4));
+                        offsets_within_pages.push_back(NodeAccessor::getVectorOffset(this, neighbor_id4));
+                        unvisited_neighbors.push_back(neighbor_id4);
+                    }
+                    if (i + 4 >= neighbors.size()) {
+                        break;
+                    }
+                    i += 4;
+                }
                 for (; i < neighbors.size(); ++i) {
                     const u32& neighbor_id = neighbors[i];
                     if (!(visited_array[neighbor_id] == visited_array_tag)) {
@@ -507,13 +511,6 @@ std::vector<std::pair<float, u32>> HNSW<DistanceMetric>::searchLayer(
                 }
 
                 bm.prefetchPages(pages_to_prefetch.data(), pages_to_prefetch.size(), offsets_within_pages.data());
-                // for (const u32& neighbor_id : neighbors) {
-                //     if (!(visited_array[neighbor_id] == visited_array_tag)) {
-                //         pages_to_prefetch.push_back(getNodePID(neighbor_id));
-                //         offsets_within_pages.push_back(NodeAccessor::getVectorOffset(this, neighbor_id));
-                //     }
-                // }
-                //bm.prefetchPages(pages_to_prefetch.data(), pages_to_prefetch.size(), offsets_within_pages.data());
             } else {
                 for (size_t i = 0; i < neighbors.size(); ++i) {
                     const u32& neighbor_id = neighbors[i];
@@ -531,8 +528,8 @@ std::vector<std::pair<float, u32>> HNSW<DistanceMetric>::searchLayer(
             // bm.prefetchPages(&page_to_prefetch, 1, &next_neighbor_off);
             for (size_t i = 0; i < unvisited_neighbor_span.size(); ++i) {
                 const u32& neighbor_id = unvisited_neighbor_span[i];
-                // if (i + 1 < neighbors.size() && enable_prefetch_) {
-                //     u32 next_neighbor_id = neighbors[i + 1];
+                // if (i + 1 < unvisited_neighbor_span.size() && enable_prefetch_) {
+                //     u32 next_neighbor_id = unvisited_neighbor_span[i + 1];
                 //     //_mm_prefetch(reinterpret_cast<const char*>(&visited_array[next_neighbor_id]), _MM_HINT_T0);
                 //     PID page_to_prefetch = getNodePID(next_neighbor_id);
                 //     u32 next_neighbor_off = NodeAccessor::getVectorOffset(this, next_neighbor_id);
@@ -545,7 +542,7 @@ std::vector<std::pair<float, u32>> HNSW<DistanceMetric>::searchLayer(
                     #ifdef HNSW_DISABLE_OPTIMISTIC_READ
                     GuardS<HNSWPage> neighbor_page_guard(getNodePID(neighbor_id));
                     #else
-                    GuardO<HNSWPage> neighbor_page_guard(getNodePID(neighbor_id));
+                    GuardORelaxed<HNSWPage> neighbor_page_guard(getNodePID(neighbor_id));
                     #endif
                     NodeAccessor neighbor_acc(neighbor_page_guard.ptr, getNodeIndexInPage(neighbor_id), this);
                     float neighbor_dist;

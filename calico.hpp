@@ -81,11 +81,12 @@ void yield(u64 counter);
 struct PageState {
     std::atomic<u64> stateAndVersion;
 
-    static const u64 Unlocked = 0;
-    static const u64 MaxShared = 252;
-    static const u64 Locked = 253;
-    static const u64 Marked = 254;
-    static const u64 Evicted = 255;
+    static const u64 Evicted = 0;
+    static const u64 Unlocked = 1;
+    static const u64 SharedBase = 2;
+    static const u64 MaxShared = 253;
+    static const u64 Locked = 254;
+    static const u64 Marked = 255;
 
     static constexpr u64 stateMask = 0xFF00000000000000ULL;
     static constexpr u64 lowMask = 0x00FFFFFFFFFFFFFFULL;
@@ -93,7 +94,7 @@ struct PageState {
     static constexpr u64 versionMaskPacked = 0x00FFFFFF00000000ULL;
     static constexpr u32 versionBitsPacked = 24;
     static constexpr u64 versionMaxPacked = (1ULL << versionBitsPacked) - 1;
-    static constexpr u32 packedInvalidFrame = 0xFFFFFFFFu;
+    static constexpr u32 packedInvalidFrame = 0;  // Frame 0 is reserved and never allocated
 
     static bool packedMode;
     static void setPackedMode(bool value) { packedMode = value; }
@@ -115,9 +116,8 @@ struct PageState {
     }
 
     void init() {
-        u64 low = 0;
-        if (packedMode) low = (0ULL << 32) | static_cast<u64>(packedInvalidFrame);
-        stateAndVersion.store(compose(Evicted, low), std::memory_order_release);
+        // Zero-value entry design: all-zero represents evicted state
+        stateAndVersion.store(0, std::memory_order_release);
     }
 
     static inline u64 sameVersion(u64 oldStateAndVersion, u64 newState) {
@@ -139,7 +139,8 @@ struct PageState {
 
     void unlockXEvicted() {
         assert(getState() == Locked);
-        stateAndVersion.store(nextVersion(stateAndVersion.load(), Evicted), std::memory_order_release);
+        // Write zero for evicted state (zero-value entry design)
+        stateAndVersion.store(0, std::memory_order_release);
     }
 
     void downgradeLock() {
@@ -149,10 +150,10 @@ struct PageState {
 
     bool tryLockS(u64 oldStateAndVersion) {
         u64 s = getState(oldStateAndVersion);
-        if (s < MaxShared)
+        if (s >= Unlocked && s < MaxShared)
             return stateAndVersion.compare_exchange_strong(oldStateAndVersion, sameVersion(oldStateAndVersion, s + 1));
         if (s == Marked)
-            return stateAndVersion.compare_exchange_strong(oldStateAndVersion, sameVersion(oldStateAndVersion, 1));
+            return stateAndVersion.compare_exchange_strong(oldStateAndVersion, sameVersion(oldStateAndVersion, SharedBase));
         return false;
     }
 
@@ -160,7 +161,7 @@ struct PageState {
         while (true) {
             u64 oldStateAndVersion = stateAndVersion.load();
             u64 state = getState(oldStateAndVersion);
-            assert(state > 0 && state <= MaxShared);
+            assert(state > Unlocked && state <= MaxShared);
             if (stateAndVersion.compare_exchange_strong(oldStateAndVersion, sameVersion(oldStateAndVersion, state - 1)))
                 return;
         }
@@ -192,12 +193,6 @@ struct PageState {
         u64 desired = (expected & ~frameMask) | frame;
         stateAndVersion.store(desired, std::memory_order_release);
         return;
-        // while (true) {
-        //     u64 desired = (expected & ~frameMask) | frame;
-        //     if (stateAndVersion.compare_exchange_weak(expected, desired, std::memory_order_release,
-        //                                               std::memory_order_relaxed))
-        //         return;
-        // }
     }
 
     void clearFrameValue() {
@@ -378,6 +373,11 @@ struct BufferManager {
     std::unique_ptr<TwoLevelPageStateArray> pageState2Level; // Two-level array (for Array2Level mode)
     std::unique_ptr<ThreeLevelPageStateArray> pageState3Level; // Three-level array (for Array3Level mode)
     std::unique_ptr<std::atomic<u64>[]> pidToFrameArray;
+    std::atomic<u32>* translationRefCounts;  // Reference counts for OS page groups (lazily allocated via mmap)
+    u64 numRefCountGroups;  // Number of OS page groups in translation array
+    u64 translationOSPageSize;  // OS page size used for translation array (4KB or 2MB based on huge pages)
+    static constexpr u32 REF_COUNT_LOCK_BIT = 0x80000000u;  // Highest bit used as lock
+    static constexpr u32 REF_COUNT_MASK = 0x7FFFFFFFu;      // Lower 31 bits for count
     static constexpr u64 NUM_LOCK_SHARDS = 64;
     std::unique_ptr<pthread_rwlock_t[]> pid_locks;
     std::unique_ptr<std::atomic<PID>[]> frameToPidArray;
@@ -533,7 +533,7 @@ struct GuardO {
                 return;
             if ((stateAndVersion << 8) == (version << 8)) {  // same version
                 u64 state = PageState::getState(stateAndVersion);
-                if (state <= PageState::MaxShared) return;  // ignore shared locks
+                if (state > PageState::Unlocked && state <= PageState::MaxShared) return;  // ignore shared locks
                 if (state == PageState::Marked)
                     if (ps.stateAndVersion.compare_exchange_weak(
                             stateAndVersion, PageState::sameVersion(stateAndVersion, PageState::Unlocked)))
@@ -618,9 +618,15 @@ struct GuardORelaxed {
                 // }
                 case PageState::Evicted:
                     if (ps.tryLockX(v)) {
-                        ptr = reinterpret_cast<T*>(bm.handleFault(pid));
-                        bm.unfixX(pid);
-                        bm.ensureFreePages();
+                        try {
+                            ptr = reinterpret_cast<T*>(bm.handleFault(pid));
+                            bm.unfixX(pid);
+                            bm.ensureFreePages();
+                        } catch (...) {
+                            // Unlock page on failure to prevent livelock
+                            ps.unlockXEvicted();
+                            throw;
+                        }
                     }
                     break;
                 case PageState::Marked:
@@ -674,7 +680,7 @@ struct GuardORelaxed {
             }
             if (oldOCCVersion == currentOCCVersion) {  // same version
                 u64 state = PageState::getState(stateAndVersion);
-                if (state <= PageState::MaxShared) return;  // ignore shared locks
+                if (state > PageState::Unlocked && state <= PageState::MaxShared) return;  // ignore shared locks
                 if (state == PageState::Marked)
                     if (ps.stateAndVersion.compare_exchange_weak(
                             stateAndVersion, PageState::sameVersion(stateAndVersion, PageState::Unlocked)))
@@ -701,97 +707,6 @@ struct GuardORelaxed {
     }
 };
 
-template <class T>
-struct GuardO_NoThrow {
-    PID pid;
-    T* ptr;
-    u64 version;
-    static const u64 moved = ~0ull;
-
-    explicit GuardO_NoThrow(u64 pid) : pid(pid), ptr(nullptr) {
-        assert(pid != moved);
-        PageState& ps = bm.getPageState(pid);
-        for (u64 repeatCounter = 0;; repeatCounter++) {
-            u64 v = ps.stateAndVersion.load();
-            switch (PageState::getState(v)) {
-                case PageState::Marked: {
-                    u64 newV = PageState::sameVersion(v, PageState::Unlocked);
-                    if (ps.stateAndVersion.compare_exchange_weak(v, newV)) {
-                        ptr = reinterpret_cast<T*>(bm.residentPtr(pid, newV));
-                        version = newV;
-                        return;
-                    }
-                    break;
-                }
-                case PageState::Locked:
-                    break;
-                case PageState::Evicted:
-                    if (ps.tryLockX(v)) {
-                        ptr = reinterpret_cast<T*>(bm.handleFault(pid));
-                        bm.unfixX(pid);
-                        bm.ensureFreePages();
-                    }
-                    break;
-                default:
-#if defined(CALICO_SPECIALIZATION_CALICO)
-                    ptr = reinterpret_cast<T*>(bm.residentPtrCalico(pid, v));
-#elif defined(CALICO_SPECIALIZATION_HASH)
-                    ptr = reinterpret_cast<T*>(bm.residentPtrHash(pid, v));
-#else
-                    ptr = reinterpret_cast<T*>(bm.residentPtr(pid, v));
-#endif
-                    version = v;
-                    return;
-            }
-            yield(repeatCounter);
-        }
-    }
-
-    GuardO_NoThrow(GuardO_NoThrow&& other) noexcept {
-        pid = other.pid;
-        ptr = other.ptr;
-        version = other.version;
-        other.pid = moved;
-    }
-    
-    GuardO_NoThrow& operator=(GuardO_NoThrow&& other) noexcept {
-        pid = other.pid;
-        ptr = other.ptr;
-        version = other.version;
-        other.pid = moved;
-        other.ptr = nullptr;
-        return *this;
-    }
-
-    GuardO_NoThrow(const GuardO_NoThrow&) = delete;
-    GuardO_NoThrow& operator=(const GuardO_NoThrow&) = delete;
-
-    ~GuardO_NoThrow() noexcept {
-        // No version check here!
-    }
-
-    void check() {
-        if (pid != moved) {
-            PageState& ps = bm.getPageState(pid);
-            u64 stateAndVersion = ps.stateAndVersion.load();
-            if (version == stateAndVersion) return;
-            if ((stateAndVersion << 8) == (version << 8)) {
-                u64 state = PageState::getState(stateAndVersion);
-                if (state <= PageState::MaxShared) return;
-                if (state == PageState::Marked)
-                    if (ps.stateAndVersion.compare_exchange_weak(
-                            stateAndVersion, PageState::sameVersion(stateAndVersion, PageState::Unlocked)))
-                        return;
-            }
-            throw OLCRestartException();
-        }
-    }
-
-    T* operator->() {
-        assert(pid != moved);
-        return ptr;
-    }
-};
 
 template <class T>
 struct GuardX {
