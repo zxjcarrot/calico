@@ -354,5 +354,6 @@ int main(int argc, char** argv) {
     statThread.join();
     cerr << "space: " << (bm.allocCount.load() * pageSize) / (float)bm.gb << " GB " << endl;
 
+    delete bm_ptr;
     return 0;
 }
