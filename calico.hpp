@@ -366,6 +366,8 @@ struct BufferManager {
     char cachline_pad3[64];
     std::atomic<u64> writeCount;
     char cachline_pad4[64];
+    std::atomic<u64> holePunchCount;  // Counter for translation table hole-punching operations
+    char cachline_pad5[64];
 
     Page* virtMem;
     Page* frameMem;

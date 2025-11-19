@@ -489,14 +489,9 @@ BufferManager::BufferManager(unsigned nthreads)
         pageState2Level.reset();
         pageState3Level.reset();
     }
-    // if (disableHugePageForTranslationArray && useTraditional) {
-    //     if (hashMode == HashMode::Array1Access) {
-    //         madvise(pageState, virtCount * sizeof(PageState), MADV_NOHUGEPAGE);
-    //     }
-    // }
-    
     // Determine OS page size for translation array based on huge page usage
-    // If huge pages are disabled for translation array, use 4KB pages, otherwise 2MB
+    // Must align with the actual allocation: 4KB if huge pages disabled, 2MB otherwise
+    // Set NOHUGEPAGE_TRANSLATION_ARRAY=1 to disable huge pages and enable fine-grained hole-punching
     translationOSPageSize = (disableHugePageForTranslationArray && useTraditional) ? 4096 : (2 * 1024 * 1024);
     
     // Initialize reference counting for hole-punching (Array1Access mode only)
@@ -521,6 +516,7 @@ BufferManager::BufferManager(unsigned nthreads)
     allocCount = 1;  // pid 0 reserved for meta data
     readCount = 0;
     writeCount = 0;
+    holePunchCount = 0;
     batch = envOr("BATCH", 64);
 
     std::string translation_specialization = "general";
@@ -554,6 +550,9 @@ BufferManager::~BufferManager() {
         munmap(translationRefCounts, refCountSize);
         translationRefCounts = nullptr;
     }
+
+    // print hole punch count
+    std::cerr << "[BufferManager] Total hole punches (madvise count): " << holePunchCount << std::endl;
 }
 
 IOInterface& BufferManager::getIOInterface() {
@@ -761,7 +760,7 @@ void BufferManager::releaseFrame(PID pid) {
             while (true) {
                 u32 oldVal = translationRefCounts[refCountIdx].load(std::memory_order_acquire);
                 
-                // Check if locked (highest bit set) - should not happen during normal decrement
+                // Check if locked (highest bit set)
                 if (oldVal & REF_COUNT_LOCK_BIT) {
                     _mm_pause();
                     continue;
@@ -769,12 +768,16 @@ void BufferManager::releaseFrame(PID pid) {
                 
                 // Get current count (lower 31 bits)
                 u32 count = oldVal & REF_COUNT_MASK;
-                assert(count > 0);  // Should never decrement from 0
+                if (count == 0) {
+                    // Already at zero, nothing to decrement
+                    break;
+                }
                 
                 u32 newCount = count - 1;
                 
                 // If count will become zero, try to set lock bit for hole-punching
                 if (newCount == 0) {
+                    
                     u32 lockedVal = REF_COUNT_LOCK_BIT;  // Set lock bit, count = 0
                     if (translationRefCounts[refCountIdx].compare_exchange_weak(oldVal, lockedVal,
                                                                                 std::memory_order_acquire,
@@ -784,7 +787,12 @@ void BufferManager::releaseFrame(PID pid) {
                             reinterpret_cast<uintptr_t>(pageState) + 
                             (refCountIdx * entriesPerOSPage * sizeof(PageState))
                         );
-                        madvise(osPageStart, translationOSPageSize, MADV_DONTNEED);
+                        
+                        // Perform hole-punching via madvise
+                        int result = madvise(osPageStart, translationOSPageSize, MADV_DONTNEED);
+                        if (result == 0) {
+                            holePunchCount.fetch_add(1, std::memory_order_relaxed);
+                        }
                         
                         // Reset to 0 (unlock, count remains 0)
                         translationRefCounts[refCountIdx].store(0, std::memory_order_release);
