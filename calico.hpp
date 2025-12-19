@@ -263,7 +263,7 @@ struct LibaioInterface: public IOInterface {
     io_event events[maxIOs];
 
     LibaioInterface(int blockfd, BufferManager* bm_ptr);
-    ~LibaioInterface() {}
+    ~LibaioInterface() { io_destroy(ctx); }
     virtual void writePages(const std::vector<PID>& pages);
     virtual void readPages(const std::vector<PID>& pages, const std::vector<Page*>& destinations);
 };
@@ -332,6 +332,12 @@ struct ThreeLevelPageStateArray {
     }
 };
 
+struct PIDAllocator {
+    std::atomic<u64> next{0};
+    std::atomic<u64> end{0};
+    std::mutex lock;
+};
+
 struct BufferManager {
     static const u64 mb = 1024ull * 1024;
     static const u64 gb = 1024ull * 1024 * 1024;
@@ -353,7 +359,7 @@ struct BufferManager {
 
     static constexpr u64 invalidFrame = std::numeric_limits<u64>::max();
     static constexpr PID invalidPID = std::numeric_limits<PID>::max();
-    static constexpr u32 freePartitionCount = 1;
+    static constexpr u32 freePartitionCount = 64;
 
     char cachline_pad0[64];
     ResidentPageSet residentSet;
@@ -422,7 +428,7 @@ struct BufferManager {
     Page* preparePageForWrite(PID pid);
 
     void ensureFreePages();
-    Page* allocPage();
+    Page* allocPage(PIDAllocator* allocator = nullptr);
     void updateAllocCountSnapshot(u64 value);
     Page* handleFault(PID pid);
     void readPage(PID pid, Page* dest);
@@ -438,6 +444,8 @@ struct BufferManager {
     void unlockPartition(u32 partition);
     
     IOInterface& getIOInterface();
+
+    u64 countZeroRefCountGroups();
 };
 typedef u64 KeyType;
 
@@ -785,11 +793,14 @@ struct GuardX {
 template <class T>
 struct AllocGuard : public GuardX<T> {
     template <typename... Params>
-    AllocGuard(Params&&... params) {
-        GuardX<T>::ptr = reinterpret_cast<T*>(bm.allocPage());
+    AllocGuard(PIDAllocator* allocator, Params&&... params) {
+        GuardX<T>::ptr = reinterpret_cast<T*>(bm.allocPage(allocator));
         new (GuardX<T>::ptr) T(std::forward<Params>(params)...);
         GuardX<T>::pid = bm.toPID(GuardX<T>::ptr);
     }
+
+    template <typename... Params>
+    AllocGuard(Params&&... params) : AllocGuard(static_cast<PIDAllocator*>(nullptr), std::forward<Params>(params)...) {}
 };
 
 template <class T>
@@ -954,7 +965,7 @@ struct BTreeNode : public BTreeNodeHeader {
     void copyKeyValue(u16 srcSlot, BTreeNode* dst, u16 dstSlot);
     void insertFence(FenceKeySlot& fk, std::span<u8> key);
     void setFences(std::span<u8> lower, std::span<u8> upper);
-    void splitNode(BTreeNode* parent, unsigned sepSlot, std::span<u8> sep);
+    void splitNode(BTreeNode* parent, unsigned sepSlot, std::span<u8> sep, PIDAllocator* allocator);
 
     struct SeparatorInfo {
         unsigned len;      // len of new separator
@@ -1031,6 +1042,7 @@ struct BTree {
    public:
     unsigned slotId;
     std::atomic<bool> splitOrdered;
+    PIDAllocator pidAllocator;
 
     BTree();
     ~BTree();

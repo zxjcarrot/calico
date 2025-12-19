@@ -285,9 +285,15 @@ void LibaioInterface::writePages(const vector<PID>& pages) {
         io_prep_pwrite(cb + i, blockfd, page, pageSize, pageSize * pid);
     }
     int cnt = io_submit(ctx, pages.size(), cbPtr);
-    assert(cnt == (int)pages.size());
+    if (cnt != (int)pages.size()) {
+        std::cerr << "io_submit failed: " << cnt << " expected: " << pages.size() << " errno: " << -cnt << std::endl;
+        exit(EXIT_FAILURE);
+    }
     cnt = io_getevents(ctx, pages.size(), pages.size(), events, nullptr);
-    assert(cnt == (int)pages.size());
+    if (cnt != (int)pages.size()) {
+        std::cerr << "io_getevents failed: " << cnt << " expected: " << pages.size() << " errno: " << -cnt << std::endl;
+        exit(EXIT_FAILURE);
+    }
 }
 
 void LibaioInterface::readPages(const vector<PID>& pages, const vector<Page*>& destinations) {
@@ -302,9 +308,15 @@ void LibaioInterface::readPages(const vector<PID>& pages, const vector<Page*>& d
     }
 
     int cnt = io_submit(ctx, pages.size(), cbPtr);
-    assert(cnt == (int)pages.size());
+    if (cnt != (int)pages.size()) {
+        std::cerr << "io_submit read failed: " << cnt << " expected: " << pages.size() << " errno: " << -cnt << std::endl;
+        exit(EXIT_FAILURE);
+    }
     cnt = io_getevents(ctx, pages.size(), pages.size(), events, nullptr);
-    assert(cnt == (int)pages.size());
+    if (cnt != (int)pages.size()) {
+        std::cerr << "io_getevents read failed: " << cnt << " expected: " << pages.size() << " errno: " << -cnt << std::endl;
+        exit(EXIT_FAILURE);
+    }
 
     // Mark pages as clean after successful read
     for (u64 i = 0; i < pages.size(); i++) {
@@ -366,7 +378,7 @@ BufferManager::BufferManager(unsigned nthreads)
     virtMem = nullptr;
     frameMem = nullptr;
     bool disableHugePageForFrameMem = envOr("NOHUGEPAGE_FRAME_MEM", 0);
-    bool disableHugePageForTranslationArray = envOr("NOHUGEPAGE_TRANSLATION_ARRAY", 0);
+    bool disableHugePageForTranslationArray = envOr("NOHUGEPAGE_TRANSLATION_ARRAY", 1);
 
     u64 virtAllocSize = virtSize + (1 << 16);  // guard space for optimistic reads
 
@@ -435,7 +447,8 @@ BufferManager::BufferManager(unsigned nthreads)
             } else {
                 die("invalid config for hashmap");
             }
-            pidToFrameHash->reserve(virtCount);
+            // 
+            pidToFrameHash->reserve(physCount * 1.5);
             frameToPidHash->reserve(physCount);
         }
         // round robin cursors will skip empty partitions automatically
@@ -482,12 +495,15 @@ BufferManager::BufferManager(unsigned nthreads)
         if (disableHugePageForTranslationArray) {
             pageState = (PageState*)mmap(NULL, virtCount * sizeof(PageState), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
             if (pageState == MAP_FAILED) die("mmap pageState");
+            madvise(pageState, virtCount * sizeof(PageState), MADV_NOHUGEPAGE);
         } else {
             pageState = (PageState*)allocHuge(virtCount * sizeof(PageState));
         }
         //for (u64 i = 0; i < virtCount; i++) pageState[i].init();
         pageState2Level.reset();
         pageState3Level.reset();
+        // print pageState address
+        std::cerr << "pageState: " << (void*)pageState  << " length " << virtCount * sizeof(PageState) << std::endl;
     }
     // Determine OS page size for translation array based on huge page usage
     // Must align with the actual allocation: 4KB if huge pages disabled, 2MB otherwise
@@ -530,6 +546,7 @@ BufferManager::BufferManager(unsigned nthreads)
          << "blk:" << path << " virtgb:" << virtSize / gb << " physgb:" << (float)physSize / gb
          << " traditional:" << useTraditional << " mmap_os_pagecache:" << useMmapOSPageacche
          << " trad_hash:" << static_cast<int>(hashMode) << " exmap:" << useExmap << " hugepage: " << (disableHugePageForFrameMem == 0)
+         << " hugepage for translation array: " << (disableHugePageForTranslationArray == 0)
          << " num_threads:" << numThreads 
          << " translation_specialization:" << translation_specialization
          << endl;
@@ -546,6 +563,25 @@ BufferManager::~BufferManager() {
     
     // Cleanup lazily allocated reference counts
     if (translationRefCounts != nullptr) {
+        // print ref count stats using a histogram style
+        // dont use numRefCountGroups as there could be unallocated
+        // use allocCount as the maximum page id allocated to estimated the number of groups
+        u64 estimatedNumRefCountGroups = (allocCount + (translationOSPageSize / sizeof(PageState)) - 1) / (translationOSPageSize / sizeof(PageState));
+        std::unordered_map<u32, u64> histogram;
+        for (u64 i = 0; i < estimatedNumRefCountGroups; i++)
+        {
+            u32 count = translationRefCounts[i].load(std::memory_order_relaxed);
+            histogram[count]++;
+        }
+        std::cerr << "[BufferManager] Translation Reference Count Histogram:" << std::endl;
+        // sort the histogram by <ref count, num groups> and print them
+        std::vector<std::pair<u32, u64>> sorted_histogram(histogram.begin(), histogram.end());
+        std::sort(sorted_histogram.begin(), sorted_histogram.end());
+        for (const auto& entry : sorted_histogram)
+        {
+            std::cerr << "  Ref Count " << entry.first << ": " << entry.second << " groups" << std::endl;
+        }
+
         size_t refCountSize = numRefCountGroups * sizeof(std::atomic<u32>);
         munmap(translationRefCounts, refCountSize);
         translationRefCounts = nullptr;
@@ -553,6 +589,7 @@ BufferManager::~BufferManager() {
 
     // print hole punch count
     std::cerr << "[BufferManager] Total hole punches (madvise count): " << holePunchCount << std::endl;
+    // 
 }
 
 IOInterface& BufferManager::getIOInterface() {
@@ -766,47 +803,37 @@ void BufferManager::releaseFrame(PID pid) {
                     continue;
                 }
                 
-                // Get current count (lower 31 bits)
-                u32 count = oldVal & REF_COUNT_MASK;
-                if (count == 0) {
-                    // Already at zero, nothing to decrement
-                    break;
-                }
-                
-                u32 newCount = count - 1;
-                
-                // If count will become zero, try to set lock bit for hole-punching
-                if (newCount == 0) {
-                    
-                    u32 lockedVal = REF_COUNT_LOCK_BIT;  // Set lock bit, count = 0
-                    if (translationRefCounts[refCountIdx].compare_exchange_weak(oldVal, lockedVal,
-                                                                                std::memory_order_acquire,
-                                                                                std::memory_order_acquire)) {
-                        // Successfully locked with count=0, perform hole-punching
+                // Try to acquire lock first
+                u32 lockedVal = oldVal | REF_COUNT_LOCK_BIT;
+                if (translationRefCounts[refCountIdx].compare_exchange_weak(oldVal, lockedVal,
+                                                                            std::memory_order_acquire,
+                                                                            std::memory_order_acquire)) {
+                    // We have the lock.
+                    u32 count = oldVal & REF_COUNT_MASK;
+                    if (count > 0) {
+                        count--;
+                    }
+                    // must obtain the counter lock first before unlocking
+                    getPageState(pid).unlockXEvicted();  // Unlock the page state and set it to 0
+                    if (count == 0) {
+                         // Perform hole-punching via madvise
                         void* osPageStart = reinterpret_cast<void*>(
                             reinterpret_cast<uintptr_t>(pageState) + 
                             (refCountIdx * entriesPerOSPage * sizeof(PageState))
                         );
                         
-                        // Perform hole-punching via madvise
                         int result = madvise(osPageStart, translationOSPageSize, MADV_DONTNEED);
                         if (result == 0) {
                             holePunchCount.fetch_add(1, std::memory_order_relaxed);
+                        } else {
+                            std::cerr << "madvise MADV_DONTNEED failed for pid " << pid
+                                      << " errno: " << errno << std::endl;
                         }
-                        
-                        // Reset to 0 (unlock, count remains 0)
-                        translationRefCounts[refCountIdx].store(0, std::memory_order_release);
-                        break;
                     }
-                    // CAS failed, retry
-                } else {
-                    // Normal decrement without locking
-                    if (translationRefCounts[refCountIdx].compare_exchange_weak(oldVal, newCount,
-                                                                                std::memory_order_release,
-                                                                                std::memory_order_acquire)) {
-                        break;  // Successfully decremented
-                    }
-                    // CAS failed, retry
+                    
+                    // Release lock and store new count
+                    translationRefCounts[refCountIdx].store(count, std::memory_order_release);
+                    break;
                 }
             }
         }
@@ -845,10 +872,30 @@ void BufferManager::ensureFreePages() {
 }
 
 // allocated new page and fix it
-Page* BufferManager::allocPage() {
+Page* BufferManager::allocPage(PIDAllocator* allocator) {
     physUsedCount++;
     ensureFreePages();
-    u64 pid = allocCount++;
+    u64 pid;
+    if (allocator) {
+        std::lock_guard<std::mutex> g(allocator->lock);
+        if (allocator->next >= allocator->end) {
+            // make sure the allocated range is aligned to chunkSize
+            // ensure allocCount is advanced to the next multiple of chunkSize (512)
+            u64 chunkSize = 2048;
+            for (;;) {
+                u64 start = allocCount.load(std::memory_order_relaxed);
+                u64 next_aligned = ((start + 511ULL) & ~511ULL) + chunkSize; // next multiple of 512
+                if (allocCount.compare_exchange_weak(start, next_aligned, std::memory_order_acq_rel, std::memory_order_relaxed) == false) continue;
+                allocator->next = start;
+                allocator->end = next_aligned;
+                break;
+            }
+        }
+        pid = allocator->next++;
+    } else {
+        pid = allocCount++;
+    }
+
     if (pid >= virtCount) {
         cerr << "VIRTGB is too low" << endl;
         exit(EXIT_FAILURE);
@@ -1192,10 +1239,17 @@ void BufferManager::evict() {
 
     // 5. remove from hash table and unlock
     for (u64& pid : toEvict) {
-        if (useTraditional) releaseFrame(pid);
+        if (useTraditional) {
+            releaseFrame(pid);
+        }
         bool succ = residentSet.remove(pid);
         assert(succ);
-        getPageState(pid).unlockXEvicted();
+        if (useTraditional && hashMode == HashMode::Array1Access && translationRefCounts) {
+            // unlockXEvicted has been handled in releaseFrame for hole-punching case
+        } else {
+            getPageState(pid).unlockXEvicted();
+        }
+        
     }
 
     physUsedCount -= toEvict.size();
@@ -1559,14 +1613,14 @@ void BTreeNode::setFences(span<u8> lower, span<u8> upper) {
          prefixLen++);
 }
 
-void BTreeNode::splitNode(BTreeNode* parent, unsigned sepSlot, span<u8> sep) {
+void BTreeNode::splitNode(BTreeNode* parent, unsigned sepSlot, span<u8> sep, PIDAllocator* allocator) {
     assert(sepSlot > 0);
     assert(sepSlot < (pageSize / sizeof(PID)));
 
     BTreeNode tmp(isLeaf);
     BTreeNode* nodeLeft = &tmp;
 
-    AllocGuard<BTreeNode> newNode(isLeaf);
+    AllocGuard<BTreeNode> newNode(allocator, isLeaf);
     BTreeNode* nodeRight = newNode.ptr;
 
     nodeLeft->setFences(getLowerFence(), sep);
@@ -1662,7 +1716,7 @@ static unsigned btreeslotcounter = 0;
 BTree::BTree() : splitOrdered(false) {
     PID rootNodePid;
     {
-        AllocGuard<BTreeNode> rootNode(true);
+        AllocGuard<BTreeNode> rootNode(&pidAllocator, true);
         rootNodePid = rootNode.pid;
     }
     
@@ -1707,7 +1761,7 @@ void BTree::trySplit(GuardX<BTreeNode>&& node, GuardX<BTreeNode>&& parent, span<
         // parent already holds the lock on metadataPageId, so reuse it
         MetaDataPage* meta_page = reinterpret_cast<MetaDataPage*>(parent.ptr);
 
-        AllocGuard<BTreeNode> newRoot(false);
+        AllocGuard<BTreeNode> newRoot(&pidAllocator, false);
         newRoot->upperInnerNode = node.pid;
         {
             meta_page->roots[slotId] = newRoot.pid;
@@ -1722,7 +1776,7 @@ void BTree::trySplit(GuardX<BTreeNode>&& node, GuardX<BTreeNode>&& parent, span<
     node->getSep(sepKey, sepInfo);
 
     if (parent->hasSpaceFor(sepInfo.len, sizeof(PID))) {  // is there enough space in the parent for the separator?
-        node->splitNode(parent.ptr, sepInfo.slot, {sepKey, sepInfo.len});
+        node->splitNode(parent.ptr, sepInfo.slot, {sepKey, sepInfo.len}, &pidAllocator);
         return;
     }
 
@@ -1829,6 +1883,24 @@ bool BTree::remove(span<u8> key) {
         }
     }
 }
+
+u64 BufferManager::countZeroRefCountGroups() {
+    if (!translationRefCounts) return 0;
+    u64 count = 0;
+    u64 entriesPerOSPage = translationOSPageSize / sizeof(PageState);
+    u64 currentAllocCount = allocCount.load(std::memory_order_relaxed);
+    u64 estimatedNumRefCountGroups = (currentAllocCount + entriesPerOSPage - 1) / entriesPerOSPage;
+    
+    for (u64 i = 0; i < estimatedNumRefCountGroups; i++) {
+        u32 val = translationRefCounts[i].load(std::memory_order_relaxed);
+        if ((val & REF_COUNT_MASK) == 0) {
+            count++;
+        }
+    }
+    return count;
+}
+
+
 
 
 
