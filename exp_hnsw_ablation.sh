@@ -2,7 +2,7 @@
 
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}" )" && pwd)"
-RESULTS_BASE_DIR="${SCRIPT_DIR}/Calico-VLDB26/data/exps/in-memory/ablation"
+RESULTS_BASE_DIR="${CALICO_ABLATION_RESULTS_DIR:-${SCRIPT_DIR}/Calico-VLDB26/data/exps/in-memory/ablation_figure11}"
 
 DATASET="deep10M"
 #DATASET="sift1m"
@@ -15,19 +15,14 @@ VIRTMEM=24G
 BUILD_THREADS=64
 SEARCH_THREADS=1
 
-# Ablation stages:
-# 1: Hashtable only (traditional path) + huge frames
-# 2: + Calico array indexing
-# 4: + huge pages for translation array
-# 5: + optimistic read (no HNSW_DISABLE_OPTIMISTIC_READ)
-# 6: + group prefetching
-
+# Ablation stages from Figure 11 in main_revised.pdf:
 AB_STAGES=(
-  "1_hash_only:1:2:0:1:1:0:hash"   # name:TRADITIONAL:TRADHASH:NOHUGEPAGE_FRAME_MEM:NOHUGEPAGE_TRANSLATION_ARRAY:OPT_READ_DISABLED:PREFETCH:SPECIALIZATION
-  "2_array_index:1:0:0:1:1:0:calico"
-  "3_array_huge_frames_trans:1:0:0:0:1:0:calico"
-  "4_array_huge_frames_trans_optread:1:0:0:0:0:0:calico"
-  "5_array_huge_frames_trans_optread_prefetch:1:0:0:0:0:1:calico"
+  "1_hash_only:1:2:0:1:1:0:hash"   # Open-Addr Hash baseline with huge frame pages
+  "2_array_index:1:0:0:1:1:0:calico"   # + array indexing
+  "3_array_huge_frames:1:0:0:1:1:0:calico"   # + huge frame pages
+  "4_array_huge_frames_trans:1:0:0:0:1:0:calico"   # + huge translation-array pages
+  "5_array_huge_frames_trans_optread:1:0:0:0:0:0:calico"   # + optimistic reads
+  "6_array_huge_frames_trans_optread_prefetch:1:0:0:0:0:1:calico"   # + group prefetch
 )
 
 run_stage() {

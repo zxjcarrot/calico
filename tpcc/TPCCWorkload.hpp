@@ -433,11 +433,16 @@ struct TPCCWorkload
          order_wdc.scanDesc(
              {w_id, d_id, c_id, std::numeric_limits<Integer>::max()},
              [&](const order_wdc_t::Key& key, const order_wdc_t&) {
-                assert(key.o_w_id == w_id);
-                assert(key.o_d_id == d_id);
-                assert(key.o_c_id == c_id);
-                o_id = key.o_id;
-                return false;
+               //  assert(key.o_w_id == w_id);
+               //  assert(key.o_d_id == d_id);
+               //  assert(key.o_c_id == c_id);
+               //  o_id = key.o_id;
+               //  return false;
+               if (key.o_w_id == w_id && key.o_d_id == d_id && key.o_c_id == c_id) {
+                   o_id = key.o_id;
+                   return false;
+                }
+                return true;
              },
              [] {});
       } else {

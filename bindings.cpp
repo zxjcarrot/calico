@@ -12,6 +12,8 @@
 #include "diskann.hpp"
 #include "distance.hpp"
 #include "hnsw.hpp"
+#include "ivf.hpp"
+#include "pdx.hpp"
 
 #if defined(_WIN32)
 #include <psapi.h>
@@ -72,26 +74,20 @@ namespace py = pybind11;
 void initialize_system();
 void shutdown_system();
 void flush_system();
+void warmup_storage_to_alloc_count();
+std::vector<u64> snapshot_pid_to_frame_range(u64 start_pid, u64 count);
 
-// --- Automatic Initializer ---
-struct SystemInitializer {
-    SystemInitializer() {
-        std::cout << "Calico module loading: Initializing system..." << std::endl;
-        initialize_system();
-        std::cout << "Calico system initialized." << std::endl;
-    }
-    ~SystemInitializer() {
-        std::cout << "Calico module unloading: Shutting down system..." << std::endl;
-        shutdown_system();
-    }
-};
-static SystemInitializer initializer;
+static void ensure_system_initialized() {
+    initialize_system();
+}
 
 // --- Define the specific HNSW instance we will bind ---
 // For this binding, we will use a fixed dimension of 128 to match the explicit
 // template instantiation in hnsw.cpp. This is a common approach for high-performance bindings.
 constexpr size_t HNSW_DIM = 128;
 using HnswIndexType = HNSW<hnsw_distance::SIMDAcceleratedL2>;
+using IvfIndexType = IVFIndex;
+using PdxIndexType = PDXIndex;
 
 // --- Python Module Definition ---
 PYBIND11_MODULE(calico_py, m) {
@@ -115,11 +111,26 @@ PYBIND11_MODULE(calico_py, m) {
     //     .def(py::init<u64, size_t, size_t, bool>(), py::arg("max_elements"), py::arg("M") = 16,
     //          py::arg("ef_construction") = 200, py::arg("enable_prefetch") = true,
     //          "Initializes a new, empty HNSW index with runtime parameters.")
-    m.def("flush_storage", []() { flush_system(); },
+        m.def("initialize_storage", []() { ensure_system_initialized(); },
+            "Initializes the Calico storage subsystem on demand.");
+        m.def("shutdown_storage", []() { shutdown_system(); },
+            "Flushes and shuts down the Calico storage subsystem.");
+        m.def("flush_storage", []() { flush_system(); },
           "Flushes all dirty pages managed by the Calico buffer pool to persistent storage.");
+                m.def("warmup_storage_to_alloc_count", []() { warmup_storage_to_alloc_count(); },
+                    "Sequentially accesses pid 1 through allocCount-1 to fault recovered pages in ascending pid order.");
+                m.def("snapshot_pid_to_frame_range", [](u64 start_pid, u64 count) {
+                        return snapshot_pid_to_frame_range(start_pid, count);
+                }, py::arg("start_pid"), py::arg("count"),
+                    "Returns pid-to-frame mappings for a contiguous pid range. Evicted or unmapped pids are returned as invalidFrame.");
 
         py::class_<HnswIndexType>(m, "HnswIndex")
-                .def(py::init<u64, size_t, size_t, size_t, bool, bool>(),
+                .def(py::init([](u64 max_elements, size_t dim, size_t M, size_t ef_construction,
+                           bool enable_prefetch, bool skip_recovery) {
+                     ensure_system_initialized();
+                 return new HnswIndexType(max_elements, dim, M, ef_construction,
+                              enable_prefetch, skip_recovery);
+                   }),
                          py::arg("max_elements"),
                          py::arg("dim") = HNSW_DIM,
                          py::arg("M") = 16,
@@ -394,6 +405,403 @@ PYBIND11_MODULE(calico_py, m) {
         - 'process_rss_bytes': Total physical memory (RSS) used by the Python process.
     )doc");
 
+    py::class_<IvfIndexType>(m, "IVFIndex")
+        .def(py::init([](u64 max_elements, size_t dim, u32 num_clusters, u32 retrain_interval,
+                 bool enable_prefetch, bool skip_recovery) {
+             ensure_system_initialized();
+                 return new IvfIndexType(max_elements, dim, num_clusters, retrain_interval,
+                                         enable_prefetch, skip_recovery);
+             }),
+             py::arg("max_elements"),
+             py::arg("dim"),
+             py::arg("num_clusters") = IVF_DEFAULT_NUM_CLUSTERS,
+             py::arg("retrain_interval") = 0,
+             py::arg("enable_prefetch") = true,
+             py::arg("skip_recovery") = false,
+             "Initializes a flat IVF index with raw residual storage.")
+        .def("flush", [](IvfIndexType& self) { self.flush(); }, "Flushes all dirty pages managed by Calico.")
+        .def("was_recovered", &IvfIndexType::wasRecovered,
+             "Returns True if the IVF index state was recovered from existing storage.")
+        .def("is_trained", &IvfIndexType::isTrained, "Returns True if IVF centroids have been trained.")
+        .def("get_dim", &IvfIndexType::getDim, "Returns the vector dimension.")
+        .def("get_num_clusters", &IvfIndexType::getNumClusters, "Returns the IVF cluster count.")
+        .def("get_count", &IvfIndexType::size, "Returns the current number of stored vectors.")
+        .def("get_index_info", &IvfIndexType::getIndexInfo,
+             "Returns detailed IVF metadata and runtime statistics.")
+        .def(
+            "train",
+            [](IvfIndexType& self, py::array_t<float, py::array::c_style | py::array::forcecast> training_data,
+               u32 kmeans_iters) {
+                if (training_data.ndim() != 2) {
+                    throw std::runtime_error("Training data must be a 2-dimensional NumPy array.");
+                }
+                const size_t dim = self.getDim();
+                if (training_data.shape(1) != static_cast<py::ssize_t>(dim)) {
+                    throw std::runtime_error("Training data has incorrect dimension. Expected " +
+                                             std::to_string(dim) + ", but got " +
+                                             std::to_string(training_data.shape(1)));
+                }
+                self.train(training_data.data(), training_data.shape(0), kmeans_iters);
+            },
+            py::arg("training_data"), py::arg("kmeans_iters") = IVF_DEFAULT_KMEANS_ITERS,
+            "Trains IVF centroids on a representative sample of vectors.")
+        .def(
+            "add_points",
+            [](IvfIndexType& self, py::array_t<float, py::array::c_style | py::array::forcecast> items,
+               size_t num_threads) {
+                if (items.ndim() != 2) {
+                    throw std::runtime_error("Input array must be 2-dimensional (n_samples, dim).");
+                }
+                const size_t dim = self.getDim();
+                if (items.shape(1) != static_cast<py::ssize_t>(dim)) {
+                    throw std::runtime_error("Input array has incorrect dimension. Expected " +
+                                             std::to_string(dim) + ", but got " +
+                                             std::to_string(items.shape(1)));
+                }
+                const size_t count = items.shape(0);
+                std::vector<u32> ids(count);
+                const u64 start_id = self.size();
+                for (size_t i = 0; i < count; ++i) {
+                    ids[i] = static_cast<u32>(start_id + i);
+                }
+                self.addPoints(items.data(), ids.data(), count, num_threads);
+            },
+            py::arg("items"), py::arg("num_threads") = 0,
+            "Adds a batch of vectors to the IVF index using sequential IDs.")
+        .def(
+            "add_items",
+            [](IvfIndexType& self, py::array_t<float, py::array::c_style | py::array::forcecast> items,
+               size_t num_threads) {
+                if (items.ndim() != 2) {
+                    throw std::runtime_error("Input array must be 2-dimensional (n_samples, dim).");
+                }
+                const size_t dim = self.getDim();
+                if (items.shape(1) != static_cast<py::ssize_t>(dim)) {
+                    throw std::runtime_error("Input array has incorrect dimension. Expected " +
+                                             std::to_string(dim) + ", but got " +
+                                             std::to_string(items.shape(1)));
+                }
+                const size_t count = items.shape(0);
+                std::vector<u32> ids(count);
+                const u64 start_id = self.size();
+                for (size_t i = 0; i < count; ++i) {
+                    ids[i] = static_cast<u32>(start_id + i);
+                }
+                self.addPoints(items.data(), ids.data(), count, num_threads);
+            },
+            py::arg("items"), py::arg("num_threads") = 0,
+            "Alias for add_points().")
+        .def(
+            "search_knn",
+            [](IvfIndexType& self, py::array_t<float, py::array::c_style | py::array::forcecast> query, size_t k,
+               size_t nprobe, bool stats) -> py::object {
+                if (query.ndim() != 1) {
+                    throw std::runtime_error("Query must be a 1-dimensional NumPy array.");
+                }
+                const size_t dim = self.getDim();
+                if (query.shape(0) != static_cast<py::ssize_t>(dim)) {
+                    throw std::runtime_error("Query vector has incorrect dimension. Expected " +
+                                             std::to_string(dim) + ", but got " +
+                                             std::to_string(query.shape(0)));
+                }
+                auto result_vec = self.search(query.data(), k, nprobe, stats);
+                py::list labels;
+                py::list distances;
+                for (const auto& pair : result_vec) {
+                    distances.append(pair.first);
+                    labels.append(pair.second);
+                }
+                return py::make_tuple(py::array(labels), py::array(distances));
+            },
+            py::arg("query"), py::arg("k"), py::arg("nprobe"), py::arg("stats") = false,
+            "Searches the IVF index for the k nearest neighbors.")
+        .def(
+            "search_knn_parallel",
+            [](IvfIndexType& self, py::array_t<float, py::array::c_style | py::array::forcecast> queries,
+               size_t k, size_t nprobe, size_t num_threads, bool stats) -> py::object {
+                if (queries.ndim() != 2) {
+                    throw std::runtime_error("Queries must be a 2-dimensional NumPy array of shape (num_queries, dim).");
+                }
+                const size_t dim = self.getDim();
+                if (queries.shape(1) != static_cast<py::ssize_t>(dim)) {
+                    throw std::runtime_error("Query vectors have incorrect dimension. Expected " +
+                                             std::to_string(dim) + ", but got " +
+                                             std::to_string(queries.shape(1)));
+                }
+                if (k == 0) {
+                    throw std::runtime_error("k must be > 0");
+                }
+                const size_t num_queries = queries.shape(0);
+                std::span<const float> query_span(queries.data(), queries.size());
+                auto all_results_vec = self.searchBatch(query_span, k, nprobe, num_threads, stats);
+
+                std::vector<ssize_t> result_shape = {static_cast<ssize_t>(num_queries), static_cast<ssize_t>(k)};
+                py::array_t<int64_t> labels_arr(result_shape);
+                py::array_t<float> distances_arr(result_shape);
+                auto* labels_ptr = labels_arr.mutable_data();
+                auto* distances_ptr = distances_arr.mutable_data();
+
+                for (size_t i = 0; i < num_queries; ++i) {
+                    const auto& per_query = all_results_vec[i];
+                    for (size_t j = 0; j < k; ++j) {
+                        if (j < per_query.size()) {
+                            distances_ptr[i * k + j] = per_query[j].first;
+                            labels_ptr[i * k + j] = static_cast<int64_t>(per_query[j].second);
+                        } else {
+                            distances_ptr[i * k + j] = std::numeric_limits<float>::infinity();
+                            labels_ptr[i * k + j] = -1;
+                        }
+                    }
+                }
+                return py::make_tuple(labels_arr, distances_arr);
+            },
+            py::arg("queries"), py::arg("k"), py::arg("nprobe"), py::arg("num_threads") = 0,
+            py::arg("stats") = false,
+            "Searches a batch of query vectors in parallel.")
+        .def("reset_stats", &IvfIndexType::resetStats, "Resets IVF runtime statistics.")
+        .def(
+            "get_stats",
+            [](IvfIndexType& self) -> py::dict {
+                IVFStats stats = self.getStats();
+                py::dict result;
+                result["dist_comps"] = stats.dist_comps.load();
+                result["lists_probed"] = stats.lists_probed.load();
+                result["vectors_scanned"] = stats.vectors_scanned.load();
+                result["num_clusters"] = stats.num_clusters;
+                result["list_sizes"] = py::cast(stats.list_sizes);
+                result["avg_list_size"] = stats.avg_list_size;
+                return result;
+            },
+            "Returns IVF runtime and structural statistics.")
+        .def(
+            "get_stats_string", [](IvfIndexType& self) { return self.getStats().toString(); },
+            "Returns a formatted IVF statistics summary.")
+        .def(
+            "get_memory_usage",
+            [](IvfIndexType& self) -> py::dict {
+                py::dict result;
+                result["process_rss_bytes"] = getCurrentRSS();
+                return result;
+            },
+            "Returns process RSS memory usage.");
+
+    py::class_<PdxIndexType>(m, "PDXIndex")
+        .def(py::init([](u64 max_elements, size_t dim, u32 num_clusters, u32 retrain_interval,
+                 bool enable_prefetch, bool skip_recovery, float sampling_fraction,
+                 u32 transform_seed) {
+             ensure_system_initialized();
+                 return new PdxIndexType(max_elements, dim, num_clusters, retrain_interval,
+                                         enable_prefetch, skip_recovery, sampling_fraction,
+                                         transform_seed);
+             }),
+             py::arg("max_elements"),
+             py::arg("dim"),
+             py::arg("num_clusters") = PDX_DEFAULT_NUM_CLUSTERS,
+             py::arg("retrain_interval") = 0,
+             py::arg("enable_prefetch") = true,
+             py::arg("skip_recovery") = false,
+             py::arg("sampling_fraction") = 0.0f,
+             py::arg("transform_seed") = 42,
+             "Initializes a Calico-backed PDX index with transposed per-cluster storage.")
+        .def("flush", [](PdxIndexType& self) { self.flush(); }, "Flushes all dirty pages managed by Calico.")
+        .def("was_recovered", &PdxIndexType::wasRecovered,
+             "Returns True if the PDX index state was recovered from existing storage.")
+        .def("is_trained", &PdxIndexType::isTrained, "Returns True if PDX centroids have been trained.")
+        .def("get_dim", &PdxIndexType::getDim, "Returns the vector dimension.")
+        .def("get_num_clusters", &PdxIndexType::getNumClusters, "Returns the PDX cluster count.")
+        .def("get_count", &PdxIndexType::size, "Returns the current number of stored vectors.")
+        .def("get_sampling_fraction", &PdxIndexType::getSamplingFraction,
+             "Returns the effective build-time clustering sampling fraction.")
+        .def("get_index_info", &PdxIndexType::getIndexInfo,
+             "Returns detailed PDX metadata and runtime statistics.")
+        .def(
+            "train",
+            [](PdxIndexType& self, py::array_t<float, py::array::c_style | py::array::forcecast> training_data,
+               u32 kmeans_iters) {
+                if (training_data.ndim() != 2) {
+                    throw std::runtime_error("Training data must be a 2-dimensional NumPy array.");
+                }
+                const size_t dim = self.getDim();
+                if (training_data.shape(1) != static_cast<py::ssize_t>(dim)) {
+                    throw std::runtime_error("Training data has incorrect dimension. Expected " +
+                                             std::to_string(dim) + ", but got " +
+                                             std::to_string(training_data.shape(1)));
+                }
+                self.train(training_data.data(), training_data.shape(0), kmeans_iters);
+            },
+            py::arg("training_data"), py::arg("kmeans_iters") = PDX_DEFAULT_KMEANS_ITERS,
+            "Trains PDX centroids on transformed vectors, optionally with clustering-time sampling.")
+        .def(
+            "add_points",
+            [](PdxIndexType& self, py::array_t<float, py::array::c_style | py::array::forcecast> items,
+               size_t num_threads) {
+                if (items.ndim() != 2) {
+                    throw std::runtime_error("Input array must be 2-dimensional (n_samples, dim).");
+                }
+                const size_t dim = self.getDim();
+                if (items.shape(1) != static_cast<py::ssize_t>(dim)) {
+                    throw std::runtime_error("Input array has incorrect dimension. Expected " +
+                                             std::to_string(dim) + ", but got " +
+                                             std::to_string(items.shape(1)));
+                }
+                const size_t count = items.shape(0);
+                std::vector<u32> ids(count);
+                const u64 start_id = self.size();
+                for (size_t i = 0; i < count; ++i) {
+                    ids[i] = static_cast<u32>(start_id + i);
+                }
+                self.addPoints(items.data(), ids.data(), count, num_threads);
+            },
+            py::arg("items"), py::arg("num_threads") = 0,
+            "Adds a batch of vectors to the PDX index using sequential IDs.")
+        .def(
+            "add_items",
+            [](PdxIndexType& self, py::array_t<float, py::array::c_style | py::array::forcecast> items,
+               size_t num_threads) {
+                if (items.ndim() != 2) {
+                    throw std::runtime_error("Input array must be 2-dimensional (n_samples, dim).");
+                }
+                const size_t dim = self.getDim();
+                if (items.shape(1) != static_cast<py::ssize_t>(dim)) {
+                    throw std::runtime_error("Input array has incorrect dimension. Expected " +
+                                             std::to_string(dim) + ", but got " +
+                                             std::to_string(items.shape(1)));
+                }
+                const size_t count = items.shape(0);
+                std::vector<u32> ids(count);
+                const u64 start_id = self.size();
+                for (size_t i = 0; i < count; ++i) {
+                    ids[i] = static_cast<u32>(start_id + i);
+                }
+                self.addPoints(items.data(), ids.data(), count, num_threads);
+            },
+            py::arg("items"), py::arg("num_threads") = 0,
+            "Alias for add_points().")
+        .def(
+            "search_knn",
+            [](PdxIndexType& self, py::array_t<float, py::array::c_style | py::array::forcecast> query, size_t k,
+               size_t nprobe, bool stats) -> py::object {
+                if (query.ndim() != 1) {
+                    throw std::runtime_error("Query must be a 1-dimensional NumPy array.");
+                }
+                const size_t dim = self.getDim();
+                if (query.shape(0) != static_cast<py::ssize_t>(dim)) {
+                    throw std::runtime_error("Query vector has incorrect dimension. Expected " +
+                                             std::to_string(dim) + ", but got " +
+                                             std::to_string(query.shape(0)));
+                }
+                auto result_vec = self.search(query.data(), k, nprobe, stats);
+                py::list labels;
+                py::list distances;
+                for (const auto& pair : result_vec) {
+                    distances.append(pair.first);
+                    labels.append(pair.second);
+                }
+                return py::make_tuple(py::array(labels), py::array(distances));
+            },
+            py::arg("query"), py::arg("k"), py::arg("nprobe"), py::arg("stats") = false,
+            "Searches the PDX index for the k nearest neighbors.")
+        .def(
+            "search_knn_parallel",
+            [](PdxIndexType& self, py::array_t<float, py::array::c_style | py::array::forcecast> queries,
+               size_t k, size_t nprobe, size_t num_threads, bool stats) -> py::object {
+                if (queries.ndim() != 2) {
+                    throw std::runtime_error("Queries must be a 2-dimensional NumPy array of shape (num_queries, dim).");
+                }
+                const size_t dim = self.getDim();
+                if (queries.shape(1) != static_cast<py::ssize_t>(dim)) {
+                    throw std::runtime_error("Query vectors have incorrect dimension. Expected " +
+                                             std::to_string(dim) + ", but got " +
+                                             std::to_string(queries.shape(1)));
+                }
+                if (k == 0) {
+                    throw std::runtime_error("k must be > 0");
+                }
+                const size_t num_queries = queries.shape(0);
+                std::span<const float> query_span(queries.data(), queries.size());
+                auto all_results_vec = self.searchBatch(query_span, k, nprobe, num_threads, stats);
+
+                std::vector<ssize_t> result_shape = {static_cast<ssize_t>(num_queries), static_cast<ssize_t>(k)};
+                py::array_t<int64_t> labels_arr(result_shape);
+                py::array_t<float> distances_arr(result_shape);
+                auto* labels_ptr = labels_arr.mutable_data();
+                auto* distances_ptr = distances_arr.mutable_data();
+
+                for (size_t i = 0; i < num_queries; ++i) {
+                    const auto& per_query = all_results_vec[i];
+                    for (size_t j = 0; j < k; ++j) {
+                        if (j < per_query.size()) {
+                            distances_ptr[i * k + j] = per_query[j].first;
+                            labels_ptr[i * k + j] = static_cast<int64_t>(per_query[j].second);
+                        } else {
+                            distances_ptr[i * k + j] = std::numeric_limits<float>::infinity();
+                            labels_ptr[i * k + j] = -1;
+                        }
+                    }
+                }
+                return py::make_tuple(labels_arr, distances_arr);
+            },
+            py::arg("queries"), py::arg("k"), py::arg("nprobe"), py::arg("num_threads") = 0,
+            py::arg("stats") = false,
+            "Searches a batch of query vectors in parallel.")
+        .def("reset_stats", &PdxIndexType::resetStats, "Resets PDX runtime statistics.")
+        .def(
+            "get_stats",
+            [](PdxIndexType& self) -> py::dict {
+                PDXStats stats = self.getStats();
+                py::dict result;
+                result["dist_comps"] = stats.dist_comps.load();
+                result["lists_probed"] = stats.lists_probed.load();
+                result["vectors_scanned"] = stats.vectors_scanned.load();
+                result["vectors_pruned"] = stats.vectors_pruned.load();
+                const u64 horizontal_selected_page_samples = stats.horizontal_selected_page_samples.load();
+                if (horizontal_selected_page_samples > 0) {
+                    result["horizontal_selected_page_samples"] = horizontal_selected_page_samples;
+                    result["horizontal_selected_page_transitions"] = stats.horizontal_selected_page_transitions.load();
+                    result["horizontal_selected_logical_same_page"] = stats.horizontal_selected_logical_same_page.load();
+                    result["horizontal_selected_payload_same_page"] = stats.horizontal_selected_payload_same_page.load();
+                    result["horizontal_selected_logical_adjacent_page"] = stats.horizontal_selected_logical_adjacent_page.load();
+                    result["horizontal_selected_payload_adjacent_page"] = stats.horizontal_selected_payload_adjacent_page.load();
+                    result["horizontal_selected_logical_same_hugepage"] = stats.horizontal_selected_logical_same_hugepage.load();
+                    result["horizontal_selected_payload_same_hugepage"] = stats.horizontal_selected_payload_same_hugepage.load();
+                    result["horizontal_selected_logical_abs_delta_sum"] = stats.horizontal_selected_logical_abs_delta_sum.load();
+                    result["horizontal_selected_payload_abs_delta_sum"] = stats.horizontal_selected_payload_abs_delta_sum.load();
+                    result["horizontal_selected_payload_forward_transitions"] = stats.horizontal_selected_payload_forward_transitions.load();
+                    result["horizontal_selected_payload_backward_transitions"] = stats.horizontal_selected_payload_backward_transitions.load();
+                }
+                const u64 replay_pid_stream_queries = stats.replay_pid_stream_queries.load();
+                if (replay_pid_stream_queries > 0) {
+                    result["replay_pid_stream_queries"] = replay_pid_stream_queries;
+                    result["replay_pid_stream_samples"] = stats.replay_pid_stream_samples.load();
+                    result["replay_pid_stream_resident_samples"] = stats.replay_pid_stream_resident_samples.load();
+                    result["replay_pid_stream_calico_live_ns"] = stats.replay_pid_stream_calico_live_ns.load();
+                    result["replay_pid_stream_calico_live_touches"] = stats.replay_pid_stream_calico_live_touches.load();
+                    result["replay_pid_stream_calico_live_checksum"] = stats.replay_pid_stream_calico_live_checksum.load();
+                    result["replay_pid_stream_calico_bypass_ns"] = stats.replay_pid_stream_calico_bypass_ns.load();
+                    result["replay_pid_stream_calico_bypass_touches"] = stats.replay_pid_stream_calico_bypass_touches.load();
+                    result["replay_pid_stream_calico_bypass_checksum"] = stats.replay_pid_stream_calico_bypass_checksum.load();
+                    result["replay_pid_stream_vmcache_ns"] = stats.replay_pid_stream_vmcache_ns.load();
+                    result["replay_pid_stream_vmcache_touches"] = stats.replay_pid_stream_vmcache_touches.load();
+                    result["replay_pid_stream_vmcache_checksum"] = stats.replay_pid_stream_vmcache_checksum.load();
+                }
+                result["num_clusters"] = stats.num_clusters;
+                result["cluster_sizes"] = py::cast(stats.cluster_sizes);
+                result["avg_cluster_size"] = stats.avg_cluster_size;
+                return result;
+            },
+            "Returns PDX runtime and structural statistics.")
+        .def(
+            "get_stats_string", [](PdxIndexType& self) { return self.getStats().toString(); },
+            "Returns a formatted PDX statistics summary.")
+        .def(
+            "get_memory_usage",
+            [](PdxIndexType& self) -> py::dict {
+                py::dict result;
+                result["process_rss_bytes"] = getCurrentRSS();
+                return result;
+            },
+            "Returns process RSS memory usage.");
+
     // =========================================================================================
     // DiskANN Bindings Start
     // =========================================================================================
@@ -413,6 +821,7 @@ PYBIND11_MODULE(calico_py, m) {
 
     py::class_<DiskANNBase, std::unique_ptr<DiskANNBase>>(m, "DiskANN")
         .def(py::init([](size_t dimensions, uint64_t max_elements, size_t R_max_degree, bool is_dynamic) {
+                 ensure_system_initialized();
                  // *** MODIFIED HERE ***
                  // Pass the R_max_degree to the factory function.
                  return create_index(dimensions, max_elements, R_max_degree, is_dynamic);

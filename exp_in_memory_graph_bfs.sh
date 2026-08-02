@@ -15,9 +15,10 @@ THREAD_COUNTS=(1 4 8 16 32)
 # Common settings for all graph experiments
 export GRAPH=1
 export RNDREAD=0
-export BLOCK=/ssd/ssd0/xj/calico/heapfile
+export BLOCK="${BLOCK:-${SCRIPT_DIR}/heapfile}"
 export VIRTGB=48G
 export PHYSGB=24G
+export POOLGB=24G
 export DATASIZE=5e6
 export PERF=1
 
@@ -25,12 +26,18 @@ export PERF=1
 echo "Building calico..."
 make clean && make -j$(nproc)
 
+echo "Building predicache..."
+cd predictivetranslation-sigmod2026
+make clean && make predicache_oltp_query -j$(nproc)
+cd ..
+
 # Function to run a single graph experiment
 run_graph_experiment() {
     local thread_count="$1"
     local config_name="$2"
     local description="$3"
-    shift 3
+    local executable="$4"
+    shift 4
     local env_vars=("$@")
     
     # Create thread-specific directory
@@ -40,6 +47,7 @@ run_graph_experiment() {
     echo "=================================================================="
     echo "Running graph experiment: ${config_name} with ${thread_count} threads"
     echo "Description: ${description}"
+    echo "Executable: ${executable}"
     echo "=================================================================="
     
     # Set thread count
@@ -64,7 +72,7 @@ run_graph_experiment() {
     
     # Run the experiment
     echo "Starting graph BFS experiment..."
-    ./calico
+    ${executable}
     
     echo "Graph experiment ${config_name} with ${thread_count} threads completed successfully."
     echo
@@ -81,7 +89,8 @@ run_config_combinations() {
     local thread_count="$1"
     local base_name="$2"
     local base_description="$3"
-    shift 3
+    local executable="$4"
+    shift 4
     local base_env_vars=("$@")
     
     echo "=================================================================="
@@ -91,21 +100,25 @@ run_config_combinations() {
     # Combination 1: No prefetch, No huge pages
     run_graph_experiment ${thread_count} "${base_name}_noprefetch_nohuge" \
         "${base_description} (no prefetch, no huge pages)" \
+        "${executable}" \
         "${base_env_vars[@]}" "PREFETCH=0" "NOHUGEPAGE_FRAME_MEM=1"
     
     # Combination 2: No prefetch, With huge pages
     run_graph_experiment ${thread_count} "${base_name}_noprefetch_huge" \
         "${base_description} (no prefetch, with huge pages)" \
+        "${executable}" \
         "${base_env_vars[@]}" "PREFETCH=0" "NOHUGEPAGE_FRAME_MEM=0"
     
     # Combination 3: With prefetch, No huge pages
     run_graph_experiment ${thread_count} "${base_name}_prefetch_nohuge" \
         "${base_description} (with prefetch, no huge pages)" \
+        "${executable}" \
         "${base_env_vars[@]}" "PREFETCH=1" "NOHUGEPAGE_FRAME_MEM=1"
     
     # Combination 4: With prefetch, With huge pages
     run_graph_experiment ${thread_count} "${base_name}_prefetch_huge" \
         "${base_description} (with prefetch, with huge pages)" \
+        "${executable}" \
         "${base_env_vars[@]}" "PREFETCH=1" "NOHUGEPAGE_FRAME_MEM=0"
 }
 
@@ -117,7 +130,7 @@ GLOBAL_SUMMARY_FILE="${EXP_BASE_DIR}/experiment_summary.txt"
 echo "Graph BFS Experiment Summary - Multi-threaded" > "${GLOBAL_SUMMARY_FILE}"
 echo "Generated on: $(date)" >> "${GLOBAL_SUMMARY_FILE}"
 echo "Thread counts tested: ${THREAD_COUNTS[*]}" >> "${GLOBAL_SUMMARY_FILE}"
-echo "Common settings: GRAPH=1 RNDREAD=0 BLOCK=/home/zxjcarrot/Workspace/calico/heapfile VIRTGB=48G PHYSGB=24G DATASIZE=5e6 PERF=1" >> "${GLOBAL_SUMMARY_FILE}"
+echo "Common settings: GRAPH=1 RNDREAD=0 BLOCK=${BLOCK} VIRTGB=48G PHYSGB=24G DATASIZE=5e6 PERF=1" >> "${GLOBAL_SUMMARY_FILE}"
 echo "Testing combinations: PREFETCH=0|1, NOHUGEPAGE_FRAME_MEM=0|1 for each configuration" >> "${GLOBAL_SUMMARY_FILE}"
 echo "" >> "${GLOBAL_SUMMARY_FILE}"
 
@@ -133,24 +146,38 @@ for threads in "${THREAD_COUNTS[@]}"; do
     
     echo "Running graph BFS experiments with ${threads} threads..." >> "${GLOBAL_SUMMARY_FILE}"
     
+    # Configuration 0: PrediCache (new baseline)
+    run_config_combinations ${threads} "predicache" "PrediCache buffer manager" \
+        "./predictivetranslation-sigmod2026/predicache_oltp_query"
+    
     # Configuration 1: Calico array (traditional buffer pool with array translator)
     run_config_combinations ${threads} "calico_array" "Calico with traditional buffer pool using array translator" \
+        "./calico_oltp_query" \
         "TRADITIONAL=1" "TRADHASH=0"
 
     # Configuration 2: Calico mmap (virtual memory cache)
     run_config_combinations ${threads} "calico_mmap" "Calico with mmap (virtual memory cache)" \
+        "./calico_oltp_query" \
         "TRADITIONAL=0" "TRADHASH=0"
 
     # Configuration 3: Calico chained_hash (traditional buffer pool with unordered_map)
     run_config_combinations ${threads} "calico_chained_hash" "Calico with traditional buffer pool using chained hash (unordered_map) translator" \
+        "./calico_oltp_query" \
         "TRADITIONAL=1" "TRADHASH=1"
 
     # Configuration 4: Calico openaddr_hash (traditional buffer pool with open addressing)
     run_config_combinations ${threads} "calico_openaddr_hash" "Calico with traditional buffer pool using open addressing hash translator" \
+        "./calico_oltp_query" \
         "TRADITIONAL=1" "TRADHASH=2"
+
+    # Configuration 5: Robin Hood hash (martinus/robin-hood-hashing)
+    run_config_combinations ${threads} "calico_robinhood_hash" "Calico with traditional buffer pool using Robin Hood hash translator" \
+        "./calico_oltp_query" \
+        "TRADITIONAL=1" "TRADHASH=7"
     
-    # Configuration 5: Calico lockfree_hash (traditional buffer pool with lock free open addressing)
+    # Configuration 6: Calico lockfree_hash (traditional buffer pool with lock free open addressing)
     run_config_combinations ${threads} "calico_lockfree_hash" "Calico with traditional buffer pool using lock free open addressing hash translator" \
+        "./calico_oltp_query" \
         "TRADITIONAL=1" "TRADHASH=4"
 
     echo "Completed experiments with ${threads} threads" >> "${GLOBAL_SUMMARY_FILE}"
@@ -173,14 +200,16 @@ echo "Results saved in: ${EXP_BASE_DIR}"
 echo "Global summary file: ${GLOBAL_SUMMARY_FILE}"
 echo
 echo "Configuration combinations tested per thread count:"
+echo "  - predicache: 4 combinations (noprefetch_nohuge, noprefetch_huge, prefetch_nohuge, prefetch_huge)"
 echo "  - calico_array: 4 combinations (noprefetch_nohuge, noprefetch_huge, prefetch_nohuge, prefetch_huge)"
 echo "  - calico_mmap: 4 combinations (noprefetch_nohuge, noprefetch_huge, prefetch_nohuge, prefetch_huge)"
 echo "  - calico_chained_hash: 4 combinations (noprefetch_nohuge, noprefetch_huge, prefetch_nohuge, prefetch_huge)"
 echo "  - calico_openaddr_hash: 4 combinations (noprefetch_nohuge, noprefetch_huge, prefetch_nohuge, prefetch_huge)"
+echo "  - calico_robinhood_hash: 4 combinations (noprefetch_nohuge, noprefetch_huge, prefetch_nohuge, prefetch_huge)"
 echo "  - calico_lockfree_hash: 4 combinations (noprefetch_nohuge, noprefetch_huge, prefetch_nohuge, prefetch_huge)"
-echo "  Total per thread count: 20 experiment configurations"
+echo "  Total per thread count: 28 experiment configurations"
 echo "  Thread counts: ${THREAD_COUNTS[*]}"
-echo "  Total experiments: $((20 * ${#THREAD_COUNTS[@]}))"
+echo "  Total experiments: $((28 * ${#THREAD_COUNTS[@]}))"
 echo
 echo "Directory structure:"
 find "${EXP_BASE_DIR}" -type d | sort

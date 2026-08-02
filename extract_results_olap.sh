@@ -110,6 +110,7 @@ configs=(
     "calico"
     "chained_hash"
     "openaddr_hash"
+    "robinhood_hash"
     "lockfree_hash"
 )
 
@@ -214,8 +215,10 @@ echo "  - mmap: VMCache without huge pages"
 echo "  - mmap_huge: VMCache with huge pages"
 echo "  - calico: Traditional buffer pool with array translator (huge pages)"
 echo "  - chained_hash: Traditional buffer pool with chained hash (huge pages)"
+echo "  - openaddr_hash: Traditional buffer pool with Abseil flat hash (huge pages)"
+echo "  - robinhood_hash: Traditional buffer pool with Robin Hood hash (huge pages)"
 echo "  - lockfree_hash: Traditional buffer pool with lockfree hash (huge pages)"
-echo "  Total per row size: 5 configurations × 2 operation types × 2 layout types = 20 experiments"
+echo "  Total per row size: 7 configurations × 2 operation types × 2 layout types = 28 experiments"
 echo
 
 echo "Global Results Summary (all row sizes):"

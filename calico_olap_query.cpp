@@ -6,6 +6,7 @@
 #include <sys/time.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cassert>
 #include <chrono>
 #include <cmath>
@@ -150,6 +151,12 @@ static_assert(sizeof(OLAPPageRow) == pageSize, "OLAPPageRow must be pageSize byt
 // Type alias for backward compatibility
 using OLAPPage = OLAPPageColumnar;
 
+struct QueryStats {
+    u64 pagesScanned = 0;
+    u64 recordsCounted = 0;
+    u64 sum = 0;
+};
+
 // Environment variable helper with default value
 template<typename T>
 static T envOr(const char* name, T defaultValue) {
@@ -279,13 +286,13 @@ PID initializePagesRow(u64 numPages, unsigned nthreads) {
 }
 
 // Worker function for filtered count - executes ONE query and returns
-void workerFilteredCount(u64 startPid, u64 scanPages, double selectivity) {
+QueryStats workerFilteredCount(u64 startPid, u64 scanPages, double selectivity) {
+    QueryStats stats;
     u64 localCount = 0;
-    u64 scannedPagesInQuery = 0;
     PID currentPid = startPid;
     
     // Execute a single query - scan scanPages pages
-    while (scannedPagesInQuery < scanPages) {
+    while (stats.pagesScanned < scanPages) {
         // Use GuardO for RAII-style page fixing
         GuardO<OLAPPage> guard(currentPid);
         OLAPPage* page = guard.ptr;
@@ -303,7 +310,7 @@ void workerFilteredCount(u64 startPid, u64 scanPages, double selectivity) {
         PID nextPid = page->nextPage;
         // GuardO automatically unfixes page when it goes out of scope
         
-        scannedPagesInQuery++;
+        stats.pagesScanned++;
         
         // Move to next page, or stop if reached end
         if (nextPid == BufferManager::invalidPID) {
@@ -311,16 +318,19 @@ void workerFilteredCount(u64 startPid, u64 scanPages, double selectivity) {
         }
         currentPid = nextPid;
     }
+
+    stats.recordsCounted = localCount;
+    return stats;
 }
 
 // Worker function for non-filtered count (metadata only) - executes ONE query and returns
-void workerNonFilteredCount(u64 startPid, u64 scanPages) {
+QueryStats workerNonFilteredCount(u64 startPid, u64 scanPages) {
+    QueryStats stats;
     u64 localCount = 0;
-    u64 scannedPagesInQuery = 0;
     PID currentPid = startPid;
     
     // Execute a single query - scan scanPages pages
-    while (scannedPagesInQuery < scanPages) {
+    while (stats.pagesScanned < scanPages) {
         // Use GuardO for RAII-style page fixing
         GuardO<OLAPPage> guard(currentPid);
         OLAPPage* page = guard.ptr;
@@ -331,7 +341,7 @@ void workerNonFilteredCount(u64 startPid, u64 scanPages) {
         PID nextPid = page->nextPage;
         // GuardO automatically unfixes page when it goes out of scope
         
-        scannedPagesInQuery++;
+        stats.pagesScanned++;
         
         // Move to next page, or stop if reached end
         if (nextPid == BufferManager::invalidPID) {
@@ -339,34 +349,39 @@ void workerNonFilteredCount(u64 startPid, u64 scanPages) {
         }
         currentPid = nextPid;
     }
+
+    stats.recordsCounted = localCount;
+    return stats;
 }
 
 // Worker function for sum - executes ONE query and returns
-void workerSum(u64 startPid, u64 scanPages, double selectivity) {
+QueryStats workerSum(u64 startPid, u64 scanPages, double selectivity) {
+    QueryStats stats;
     u64 localSum = 0;
-    u64 scannedPagesInQuery = 0;
+    u64 localRecords = 0;
     PID currentPid = startPid;
     
     // Execute a single query - scan scanPages pages
-    while (scannedPagesInQuery < scanPages) {
+    while (stats.pagesScanned < scanPages) {
         // Use GuardO for RAII-style page fixing
         GuardO<OLAPPage> guard(currentPid);
         OLAPPage* page = guard.ptr;
         
         // Scan records with filter - columnar access (using column 5)
         const u64* values = page->col5();
-        u64 threshold = static_cast<u64>(1000 * (1.0 - selectivity));
-        
+        (void)selectivity;
         for (size_t i = 0; i < page->recordCount; i++) {
             // if (values[i] > threshold) {
                 localSum += values[i];
             // }
         }
+
+        localRecords += page->recordCount;
         
         PID nextPid = page->nextPage;
         // GuardO automatically unfixes page when it goes out of scope
         
-        scannedPagesInQuery++;
+        stats.pagesScanned++;
         
         // Move to next page, or stop if reached end
         if (nextPid == BufferManager::invalidPID) {
@@ -374,27 +389,33 @@ void workerSum(u64 startPid, u64 scanPages, double selectivity) {
         }
         currentPid = nextPid;
     }
+
+    stats.sum = localSum;
+    stats.recordsCounted = localRecords;
+    return stats;
 }
 
 // Worker function for non-filtered sum (metadata only) - executes ONE query and returns
-void workerNonFilteredSum(u64 startPid, u64 scanPages) {
+QueryStats workerNonFilteredSum(u64 startPid, u64 scanPages) {
+    QueryStats stats;
     u64 localSum = 0;
-    u64 scannedPagesInQuery = 0;
+    u64 localRecords = 0;
     PID currentPid = startPid;
     
     // Execute a single query - scan scanPages pages
-    while (scannedPagesInQuery < scanPages) {
+    while (stats.pagesScanned < scanPages) {
         // Use GuardO for RAII-style page fixing
         GuardO<OLAPPage> guard(currentPid);
         OLAPPage* page = guard.ptr;
         
         // Only read pre-computed sum from header
         localSum += page->sumValue;
+        localRecords += page->recordCount;
         
         PID nextPid = page->nextPage;
         // GuardO automatically unfixes page when it goes out of scope
         
-        scannedPagesInQuery++;
+        stats.pagesScanned++;
         
         // Move to next page, or stop if reached end
         if (nextPid == BufferManager::invalidPID) {
@@ -402,18 +423,22 @@ void workerNonFilteredSum(u64 startPid, u64 scanPages) {
         }
         currentPid = nextPid;
     }
+
+    stats.sum = localSum;
+    stats.recordsCounted = localRecords;
+    return stats;
 }
 
 // ========== ROW-ORIENTED WORKER FUNCTIONS ==========
 
 // Worker function for filtered count (row format) - executes ONE query and returns
-void workerFilteredCountRowFormat(u64 startPid, u64 scanPages, double selectivity) {
+QueryStats workerFilteredCountRowFormat(u64 startPid, u64 scanPages, double selectivity) {
+    QueryStats stats;
     u64 localCount = 0;
-    u64 scannedPagesInQuery = 0;
     PID currentPid = startPid;
     
     // Execute a single query - scan scanPages pages
-    while (scannedPagesInQuery < scanPages) {
+    while (stats.pagesScanned < scanPages) {
         // Use GuardO for RAII-style page fixing
         GuardO<OLAPPageRow> guard(currentPid);
         OLAPPageRow* page = guard.ptr;
@@ -432,7 +457,7 @@ void workerFilteredCountRowFormat(u64 startPid, u64 scanPages, double selectivit
         PID nextPid = page->nextPage;
         // GuardO automatically unfixes page when it goes out of scope
         
-        scannedPagesInQuery++;
+        stats.pagesScanned++;
         
         // Move to next page, or stop if reached end
         if (nextPid == BufferManager::invalidPID) {
@@ -440,16 +465,19 @@ void workerFilteredCountRowFormat(u64 startPid, u64 scanPages, double selectivit
         }
         currentPid = nextPid;
     }
+
+    stats.recordsCounted = localCount;
+    return stats;
 }
 
 // Worker function for non-filtered count (row format, metadata only) - executes ONE query and returns
-void workerNonFilteredCountRowFormat(u64 startPid, u64 scanPages) {
+QueryStats workerNonFilteredCountRowFormat(u64 startPid, u64 scanPages) {
+    QueryStats stats;
     u64 localCount = 0;
-    u64 scannedPagesInQuery = 0;
     PID currentPid = startPid;
     
     // Execute a single query - scan scanPages pages
-    while (scannedPagesInQuery < scanPages) {
+    while (stats.pagesScanned < scanPages) {
         // Use GuardO for RAII-style page fixing
         GuardO<OLAPPageRow> guard(currentPid);
         OLAPPageRow* page = guard.ptr;
@@ -460,7 +488,7 @@ void workerNonFilteredCountRowFormat(u64 startPid, u64 scanPages) {
         PID nextPid = page->nextPage;
         // GuardO automatically unfixes page when it goes out of scope
         
-        scannedPagesInQuery++;
+        stats.pagesScanned++;
         
         // Move to next page, or stop if reached end
         if (nextPid == BufferManager::invalidPID) {
@@ -468,23 +496,26 @@ void workerNonFilteredCountRowFormat(u64 startPid, u64 scanPages) {
         }
         currentPid = nextPid;
     }
+
+    stats.recordsCounted = localCount;
+    return stats;
 }
 
 // Worker function for sum (row format) - executes ONE query and returns
-void workerSumRowFormat(u64 startPid, u64 scanPages, double selectivity) {
+QueryStats workerSumRowFormat(u64 startPid, u64 scanPages, double selectivity) {
+    QueryStats stats;
     u64 localSum = 0;
-    u64 scannedPagesInQuery = 0;
+    u64 localRecords = 0;
     PID currentPid = startPid;
     
     // Execute a single query - scan scanPages pages
-    while (scannedPagesInQuery < scanPages) {
+    while (stats.pagesScanned < scanPages) {
         // Use GuardO for RAII-style page fixing
         GuardO<OLAPPageRow> guard(currentPid);
         OLAPPageRow* page = guard.ptr;
         
         // Scan records with filter - row-oriented access
-        u64 threshold = static_cast<u64>(1000 * (1.0 - selectivity));
-        
+        (void)selectivity;
         for (size_t i = 0; i < page->recordCount; i++) {
             const OLAPPageRow::Tuple* t = page->tuple(i);
             // Sum column 5 values (with optional filter)
@@ -492,11 +523,13 @@ void workerSumRowFormat(u64 startPid, u64 scanPages, double selectivity) {
                 localSum += t->columns[5];
             // }
         }
+
+        localRecords += page->recordCount;
         
         PID nextPid = page->nextPage;
         // GuardO automatically unfixes page when it goes out of scope
         
-        scannedPagesInQuery++;
+        stats.pagesScanned++;
         
         // Move to next page, or stop if reached end
         if (nextPid == BufferManager::invalidPID) {
@@ -504,27 +537,33 @@ void workerSumRowFormat(u64 startPid, u64 scanPages, double selectivity) {
         }
         currentPid = nextPid;
     }
+
+    stats.sum = localSum;
+    stats.recordsCounted = localRecords;
+    return stats;
 }
 
 // Worker function for non-filtered sum (row format, metadata only) - executes ONE query and returns
-void workerNonFilteredSumRowFormat(u64 startPid, u64 scanPages) {
+QueryStats workerNonFilteredSumRowFormat(u64 startPid, u64 scanPages) {
+    QueryStats stats;
     u64 localSum = 0;
-    u64 scannedPagesInQuery = 0;
+    u64 localRecords = 0;
     PID currentPid = startPid;
     
     // Execute a single query - scan scanPages pages
-    while (scannedPagesInQuery < scanPages) {
+    while (stats.pagesScanned < scanPages) {
         // Use GuardO for RAII-style page fixing
         GuardO<OLAPPageRow> guard(currentPid);
         OLAPPageRow* page = guard.ptr;
         
         // Only read pre-computed sum from header
         localSum += page->sumValue;
+        localRecords += page->recordCount;
         
         PID nextPid = page->nextPage;
         // GuardO automatically unfixes page when it goes out of scope
         
-        scannedPagesInQuery++;
+        stats.pagesScanned++;
         
         // Move to next page, or stop if reached end
         if (nextPid == BufferManager::invalidPID) {
@@ -532,12 +571,19 @@ void workerNonFilteredSumRowFormat(u64 startPid, u64 scanPages) {
         }
         currentPid = nextPid;
     }
+
+    stats.sum = localSum;
+    stats.recordsCounted = localRecords;
+    return stats;
 }
 
 // Run OLAP benchmark
 void runOLAPBenchmark(const OLAPConfig& config, PID firstPageId) {
     atomic<u64> txProgress(0);
     atomic<u64> txTotal(0);
+    atomic<u64> totalPagesScanned(0);
+    atomic<u64> totalRecordsCounted(0);
+    atomic<u64> totalSum(0);
     atomic<bool> keepRunning(true);
     
     // Get system name for reporting
@@ -548,6 +594,8 @@ void runOLAPBenchmark(const OLAPConfig& config, PID firstPageId) {
         systemName = "traditional-hash-unordered";
     else if (bm.hashMode == BufferManager::HashMode::OpenAddress)
         systemName = "traditional-hash-open";
+    else if (bm.hashMode == BufferManager::HashMode::RobinHood)
+        systemName = "traditional-hash-robinhood";
     else if (bm.hashMode == BufferManager::HashMode::Lockfree)
         systemName = "traditional-hash-lockfree";
     else if (bm.useExmap)
@@ -645,33 +693,38 @@ void runOLAPBenchmark(const OLAPConfig& config, PID firstPageId) {
                 u64 startPid = firstPageId + startOffset;
                 
                 // Execute one query - dispatch based on layout type
+                QueryStats stats;
                 if (config.layoutType == OLAPConfig::LayoutType::Columnar) {
                     // Columnar layout workers
                     switch (config.opType) {
                         case OLAPConfig::OpType::FilteredCount:
-                            workerFilteredCount(startPid, config.scanPages, config.selectivity);
+                            stats = workerFilteredCount(startPid, config.scanPages, config.selectivity);
                             break;
                         case OLAPConfig::OpType::NonFilteredCount:
-                            workerNonFilteredCount(startPid, config.scanPages);
+                            stats = workerNonFilteredCount(startPid, config.scanPages);
                             break;
                         case OLAPConfig::OpType::Sum:
-                            workerSum(startPid, config.scanPages, config.selectivity);
+                            stats = workerSum(startPid, config.scanPages, config.selectivity);
                             break;
                     }
                 } else {
                     // Row-oriented layout workers
                     switch (config.opType) {
                         case OLAPConfig::OpType::FilteredCount:
-                            workerFilteredCountRowFormat(startPid, config.scanPages, config.selectivity);
+                            stats = workerFilteredCountRowFormat(startPid, config.scanPages, config.selectivity);
                             break;
                         case OLAPConfig::OpType::NonFilteredCount:
-                            workerNonFilteredCountRowFormat(startPid, config.scanPages);
+                            stats = workerNonFilteredCountRowFormat(startPid, config.scanPages);
                             break;
                         case OLAPConfig::OpType::Sum:
-                            workerSumRowFormat(startPid, config.scanPages, config.selectivity);
+                            stats = workerSumRowFormat(startPid, config.scanPages, config.selectivity);
                             break;
                     }
                 }
+
+                totalPagesScanned.fetch_add(stats.pagesScanned, std::memory_order_relaxed);
+                totalRecordsCounted.fetch_add(stats.recordsCounted, std::memory_order_relaxed);
+                totalSum.fetch_add(stats.sum, std::memory_order_relaxed);
                 
                 // Query completed, increment progress
                 txProgress.fetch_add(1);
@@ -689,7 +742,18 @@ void runOLAPBenchmark(const OLAPConfig& config, PID firstPageId) {
         perf::Aggregator::instance().report(txProgress.load());
     }
     
-    cerr << "Benchmark complete. Total queries: " << txProgress.load() << endl;
+        const u64 totalQueries = txProgress.load();
+        const double avgPages = totalQueries ? static_cast<double>(totalPagesScanned.load()) / totalQueries : 0.0;
+        const double avgRecords = totalQueries ? static_cast<double>(totalRecordsCounted.load()) / totalQueries : 0.0;
+        const double avgSum = totalQueries ? static_cast<double>(totalSum.load()) / totalQueries : 0.0;
+
+        cerr << "Benchmark complete. Total queries: " << totalQueries << endl;
+        cerr << "Totals: pages_scanned=" << totalPagesScanned.load()
+            << " records_counted=" << totalRecordsCounted.load()
+            << " sum=" << totalSum.load() << endl;
+        cerr << "Averages per query: pages_scanned=" << avgPages
+            << " records_counted=" << avgRecords
+            << " sum=" << avgSum << endl;
 }
 
 int main(int argc, char** argv) {
@@ -731,8 +795,11 @@ int main(int argc, char** argv) {
     
     // Parse operation type
     const char* opTypeStr = getenv("OPTYPE");
+    cout << "OPTYPE: " << opTypeStr << endl;
     if (opTypeStr) {
         string op(opTypeStr);
+        op.erase(std::remove_if(op.begin(), op.end(), [](unsigned char c) { return std::isspace(c); }), op.end());
+        std::transform(op.begin(), op.end(), op.begin(), [](unsigned char c) { return std::tolower(c); });
         if (op == "filtered_count") {
             config.opType = OLAPConfig::OpType::FilteredCount;
         } else if (op == "nonfiltered_count") {
@@ -744,6 +811,7 @@ int main(int argc, char** argv) {
             cerr << "Valid options: filtered_count, nonfiltered_count, sum" << endl;
             return 1;
         }
+        cout << "OPTYPE: " << (int)config.opType << endl;
     }
     
     // Parse layout type
@@ -769,7 +837,8 @@ int main(int argc, char** argv) {
     // BufferManager constructor reads these environment variables:
     //   BLOCK - data file path (default: /tmp/calico.dat)
     //   TRADITIONAL - translation mode (0=vmcache, 1=traditional, 2=mmap+OS page cache)
-    //   TRADHASH - hash mode (0=Array1Access, 1=Unordered, 2=OpenAddress, 3=Array, 4=Lockfree)
+    //   TRADHASH - translation mode (0=Array1Access, 1=Unordered, 2=OpenAddress,
+    //              3=Array, 4=Lockfree, 5=Array2Level, 6=Array3Level, 7=RobinHood)
     //   EXMAP - use exmap (0=no, 1=yes)
     //   VIRTGB - virtual memory size in GB
     //   PHYSGB - physical memory size in GB

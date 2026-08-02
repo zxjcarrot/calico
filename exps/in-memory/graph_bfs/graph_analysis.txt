@@ -1,5 +1,5 @@
 Graph BFS Experiment Analysis - Multi-threaded
-Generated on: Mon Oct 13 11:34:18 CST 2025
+Generated on: Thu Nov  6 06:06:49 PM EST 2025
 
 Configuration Comparison:
 ========================
@@ -11,25 +11,16 @@ Total configurations: 5 base configs × 4 combinations × 5 thread counts = 100
 
 Overall Performance Ranking (by avg traversal time, lower is better):
   calico_mmap_noprefetch_huge (8 threads): 8770.5 ms (Base: calico_mmap, Prefetch: No, Huge: Yes)
-  calico_mmap_noprefetch_huge (4 threads): 9032.75 ms (Base: calico_mmap, Prefetch: No, Huge: Yes)
-  calico_mmap_noprefetch_huge (16 threads): 9511.62 ms (Base: calico_mmap, Prefetch: No, Huge: Yes)
-  calico_mmap_prefetch_huge (4 threads): 10219.8 ms (Base: calico_mmap, Prefetch: Yes, Huge: Yes)
-  calico_mmap_prefetch_huge (8 threads): 10333.9 ms (Base: calico_mmap, Prefetch: Yes, Huge: Yes)
-  calico_mmap_prefetch_huge (16 threads): 10900.2 ms (Base: calico_mmap, Prefetch: Yes, Huge: Yes)
-  calico_mmap_prefetch_huge (32 threads): 12279.3 ms (Base: calico_mmap, Prefetch: Yes, Huge: Yes)
-  calico_array_prefetch_huge (8 threads): 12300.2 ms (Base: calico_array, Prefetch: Yes, Huge: Yes)
-  calico_array_prefetch_huge (4 threads): 12508.5 ms (Base: calico_array, Prefetch: Yes, Huge: Yes)
-  calico_array_prefetch_huge (16 threads): 12687.9 ms (Base: calico_array, Prefetch: Yes, Huge: Yes)
 
 Best Configuration per Thread Count:
-  1 threads: 9244 ms (calico_mmap_noprefetch_huge, base: calico_mmap)
+  1 threads: 30844 ms (calico_openaddr_hash_noprefetch_huge, base: calico_openaddr_hash)
   4 threads: 9032.75 ms (calico_mmap_noprefetch_huge, base: calico_mmap)
   8 threads: 8770.5 ms (calico_mmap_noprefetch_huge, base: calico_mmap)
   16 threads: 9511.62 ms (calico_mmap_noprefetch_huge, base: calico_mmap)
   32 threads: 10824 ms (calico_mmap_noprefetch_huge, base: calico_mmap)
 
 Scalability Analysis (Average traversal time by thread count):
-  1 threads: 43666.95 ms average
+  1 threads: 56850.18 ms average
   4 threads: 56272.57 ms average
   8 threads: 54638.03 ms average
   16 threads: 58743.15 ms average
@@ -37,17 +28,17 @@ Scalability Analysis (Average traversal time by thread count):
 
 Prefetch Impact Analysis (across all thread counts):
 Average performance improvement with prefetch enabled:
-  calico_array: 29.00% improvement (25574ms → 18017.6ms)
-  calico_mmap: -5.00% improvement (15119.3ms → 16005.2ms)
-  calico_chained_hash: -11.00% improvement (87900ms → 98306.3ms)
+  calico_array: 21.00% improvement (24438.8ms → 19147.3ms)
+  calico_mmap: -13.00% improvement (14643.7ms → 16595.4ms)
+  calico_chained_hash: -13.00% improvement (86619.3ms → 98306.3ms)
   calico_openaddr_hash: -40.00% improvement (62770.1ms → 88238.8ms)
   calico_lockfree_hash: -24.00% improvement (72858.6ms → 91016.3ms)
 
 Huge Pages Impact Analysis (across all thread counts):
 Average performance improvement with huge pages enabled:
-  calico_array: 49.00% improvement (28999ms → 14592.6ms)
-  calico_mmap: 50.00% improvement (20806.6ms → 10318ms)
-  calico_chained_hash: 21.00% improvement (104543ms → 81663ms)
+  calico_array: 50.00% improvement (29099ms → 14487.2ms)
+  calico_mmap: 51.00% improvement (21005.1ms → 10234ms)
+  calico_chained_hash: 22.00% improvement (105112ms → 81663ms)
   calico_openaddr_hash: 11.00% improvement (80182.3ms → 70826.6ms)
   calico_lockfree_hash: 27.00% improvement (95164.5ms → 68710.4ms)
 
@@ -64,13 +55,13 @@ Memory Efficiency Ranking (by LLC misses/op, lower is better):
   calico_lockfree_hash_noprefetch_nohuge (16 threads): n/a LLC misses/op
 
 TLB Efficiency Ranking (by DTLB misses/op, lower is better):
-  calico_mmap_noprefetch_huge (1 threads): 28.5586 DTLB misses/op
   calico_mmap_noprefetch_huge (4 threads): 28.5718 DTLB misses/op
   calico_mmap_prefetch_huge (16 threads): 28.5752 DTLB misses/op
   calico_mmap_prefetch_huge (4 threads): 28.6118 DTLB misses/op
-  calico_mmap_prefetch_huge (1 threads): 28.6214 DTLB misses/op
   calico_mmap_noprefetch_huge (8 threads): 28.6246 DTLB misses/op
   calico_mmap_noprefetch_huge (16 threads): 28.6289 DTLB misses/op
   calico_mmap_prefetch_huge (8 threads): 28.643 DTLB misses/op
   calico_mmap_noprefetch_huge (32 threads): 28.6461 DTLB misses/op
   calico_mmap_prefetch_huge (32 threads): 28.6713 DTLB misses/op
+  calico_array_noprefetch_huge (8 threads): 29.3059 DTLB misses/op
+  calico_array_prefetch_huge (4 threads): 29.3382 DTLB misses/op

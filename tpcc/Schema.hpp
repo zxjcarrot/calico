@@ -3,6 +3,9 @@
 // -------------------------------------------------------------------------------------
 struct warehouse_t {
    static constexpr int id = 0;
+   // 976B is the largest common payload size that still satisfies the
+   // current 4KB B-tree maxKVSize limit in both Calico and PrediCache.
+   static constexpr unsigned paddedSize = 1576;
    struct Key {
       static constexpr int id = 0;
       Integer w_id;
@@ -15,6 +18,7 @@ struct warehouse_t {
    Varchar<9> w_zip;
    Numeric w_tax;
    Numeric w_ytd;
+   char w_padding[paddedSize - 112] = {};
    // -------------------------------------------------------------------------------------
    template <class T>
    static unsigned foldKey(uint8_t* out, const T& record)
@@ -33,8 +37,11 @@ struct warehouse_t {
    static constexpr unsigned maxFoldLength() { return 0 + sizeof(Key::w_id); };
 };
 
+static_assert(sizeof(warehouse_t) == warehouse_t::paddedSize, "warehouse_t padding mismatch");
+
 struct district_t {
    static constexpr int id = 1;
+   static constexpr unsigned paddedSize = 976;
    struct Key {
       static constexpr int id = 1;
       Integer d_w_id;
@@ -49,6 +56,7 @@ struct district_t {
    Numeric d_tax;
    Numeric d_ytd;
    Integer d_next_o_id;
+   char d_padding[paddedSize - 120] = {};
 
    template <class T>
    static unsigned foldKey(uint8_t* out, const T& record)
@@ -68,6 +76,8 @@ struct district_t {
    }
    static constexpr unsigned maxFoldLength() { return 0 + sizeof(Key::d_w_id) + sizeof(Key::d_id); };
 };
+
+static_assert(sizeof(district_t) == district_t::paddedSize, "district_t padding mismatch");
 
 struct customer_t {
    static constexpr int id = 2;

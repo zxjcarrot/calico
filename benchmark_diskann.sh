@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # --- Configuration ---
-source ~/anaconda3/etc/profile.d/conda.sh
-conda activate fl-dedup
+# source ~/anaconda3/etc/profile.d/conda.sh
+# conda activate fl-dedup
 
 PYTHON_CMD=$(which python3)
 BENCHMARK_SCRIPT="benchmark_diskann.py"

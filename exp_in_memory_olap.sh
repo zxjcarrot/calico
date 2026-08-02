@@ -14,6 +14,11 @@ EXP_BASE_DIR="${SCRIPT_DIR}/exps/in-memory/olap_row"
 FIXED_PAGE_SIZE_KB=8
 FIXED_PAGE_SIZE_BYTES=$((FIXED_PAGE_SIZE_KB * 1024))
 
+# PrediCache page size: 4KB (fixed in predicache/page.hpp)
+PREDICACHE_PAGE_SIZE_KB=8
+PREDICACHE_PAGE_SIZE_BYTES=$((PREDICACHE_PAGE_SIZE_KB * 1024))
+PREDICACHE_MAX_ROW_SIZE=$((PREDICACHE_PAGE_SIZE_BYTES - 64))
+
 # Row sizes to test (in bytes) - exponential growth from 128B to 4096B
 ROW_SIZES=(128 256 512 1024 2048 4096)
 
@@ -25,7 +30,7 @@ RUN_DURATION=60
 THREADS=1
 
 # Common settings for all experiments
-export BLOCK=/ssd/ssd0/xj/calico/heapfile
+export BLOCK="${BLOCK:-${SCRIPT_DIR}/heapfile}"
 export RUNFOR=${RUN_DURATION}
 export THREADS=${THREADS}
 
@@ -38,12 +43,13 @@ LAYOUT_TYPES=("columnar" "row")
 # Function to calculate number of pages based on data size (fixed 8KB page size)
 calculate_num_pages() {
     local data_size_gb="$1"
+    local page_size_kb="${2:-$FIXED_PAGE_SIZE_KB}"
     
     # Convert GB to KB: 50GB = 50 * 1024 * 1024 KB
     local data_size_kb=$((data_size_gb * 1024 * 1024))
     
-    # Calculate number of pages (fixed 8KB page size)
-    local num_pages=$((data_size_kb / FIXED_PAGE_SIZE_KB))
+    # Calculate number of pages based on page size
+    local num_pages=$((data_size_kb / page_size_kb))
     
     echo "$num_pages"
 }
@@ -75,6 +81,28 @@ ensure_page_size_and_compile() {
         cd "${SCRIPT_DIR}"
         make -j$(nproc) > /dev/null 2>&1
     fi
+
+    echo "============================================"
+    echo "Ensuring PrediCache page size is set to ${PREDICACHE_PAGE_SIZE_KB}KB (${PREDICACHE_PAGE_SIZE_BYTES} bytes)"
+    echo "============================================"
+
+    # Check current page size in predicache/page.hpp
+    local predicache_page_size=$(grep "static const u64 pageSize" "${SCRIPT_DIR}/predictivetranslation-sigmod2026/page.hpp" | \
+                                grep -oP 'pageSize = \K[0-9]+')
+
+    if [[ "$predicache_page_size" != "$PREDICACHE_PAGE_SIZE_BYTES" ]]; then
+        echo "Updating PrediCache page size to ${PREDICACHE_PAGE_SIZE_KB}KB..."
+        sed -i "s/static const u64 pageSize = [0-9]*;/static const u64 pageSize = ${PREDICACHE_PAGE_SIZE_BYTES};/" \
+            "${SCRIPT_DIR}/predictivetranslation-sigmod2026/page.hpp"
+
+        echo "Recompiling PrediCache with updated page size..."
+        make -C "${SCRIPT_DIR}/predictivetranslation-sigmod2026" clean > /dev/null 2>&1
+        make -C "${SCRIPT_DIR}/predictivetranslation-sigmod2026" predicache_olap_query -j$(nproc) > /dev/null 2>&1
+        echo "Successfully compiled PrediCache with page size: ${PREDICACHE_PAGE_SIZE_KB}KB"
+    else
+        echo "PrediCache page size already set to ${PREDICACHE_PAGE_SIZE_KB}KB"
+        make -C "${SCRIPT_DIR}/predictivetranslation-sigmod2026" predicache_olap_query -j$(nproc) > /dev/null 2>&1
+    fi
     echo ""
 }
 
@@ -85,7 +113,9 @@ run_olap_experiment() {
     local op_type="$3"
     local layout_type="$4"
     local description="$5"
-    shift 5
+    local executable="$6"
+    local page_size_kb="$7"
+    shift 7
     local env_vars=("$@")
     
     # Create row-size-specific directory with layout subdirectory
@@ -93,15 +123,15 @@ run_olap_experiment() {
     mkdir -p "${row_dir}"
     
     echo "=================================================================="
-    echo "Running OLAP experiment: ${config_name} with ${row_size}B rows (${FIXED_PAGE_SIZE_KB}KB pages), op=${op_type}, layout=${layout_type}"
+    echo "Running OLAP experiment: ${config_name} with ${row_size}B rows (${page_size_kb}KB pages), op=${op_type}, layout=${layout_type}"
     echo "Description: ${description}"
     echo "=================================================================="
     
-    # Calculate number of pages (fixed 8KB page size)
-    local num_pages=$(calculate_num_pages ${DATA_SIZE_GB})
+    # Calculate number of pages based on page size
+    local num_pages=$(calculate_num_pages ${DATA_SIZE_GB} ${page_size_kb})
     
     echo "Row size: ${row_size}B"
-    echo "Page size: ${FIXED_PAGE_SIZE_KB}KB (fixed)"
+    echo "Page size: ${page_size_kb}KB"
     echo "Data size: ${DATA_SIZE_GB}GB"
     echo "Number of pages: ${num_pages}"
     echo "Operation type: ${op_type}"
@@ -129,9 +159,9 @@ run_olap_experiment() {
     
     # Run the experiment
     echo "Starting OLAP experiment..."
-    ./calico_olap_query
+    ${executable}
     
-    echo "Experiment ${config_name} with ${row_size}B rows (${FIXED_PAGE_SIZE_KB}KB pages), op=${op_type}, layout=${layout_type} completed successfully."
+    echo "Experiment ${config_name} with ${row_size}B rows (${page_size_kb}KB pages), op=${op_type}, layout=${layout_type} completed successfully."
     echo
     
     # Unset configuration-specific environment variables
@@ -149,6 +179,10 @@ mkdir -p "${EXP_BASE_DIR}"
 
 # Ensure page size is set to 8KB and compile once
 ensure_page_size_and_compile
+
+# Build predicache OLAP benchmark
+echo "Building predicache OLAP benchmark..."
+make -C "${SCRIPT_DIR}/predictivetranslation-sigmod2026" predicache_olap_query -j$(nproc)
 
 # Calculate number of pages (fixed 8KB page size)
 num_pages=$(calculate_num_pages ${DATA_SIZE_GB})
@@ -208,23 +242,42 @@ EOF
             
             # Configuration 1: mmap (without huge pages)
             run_olap_experiment ${row_size} "mmap" "${op_type}" "${layout_type}" "Calico mmap without huge pages" \
+                "./calico_olap_query" "${FIXED_PAGE_SIZE_KB}" \
                 "TRADITIONAL=0" "NOHUGEPAGE_FRAME_MEM=1"
             
             # Configuration 2: mmap_huge (using huge pages)
             run_olap_experiment ${row_size} "mmap_huge" "${op_type}" "${layout_type}" "Calico mmap with huge pages" \
+                "./calico_olap_query" "${FIXED_PAGE_SIZE_KB}" \
                 "TRADITIONAL=0" "NOHUGEPAGE_FRAME_MEM=0"
             
             # Configuration 3: calico (traditional buffer pool with array translator, huge pages)
             run_olap_experiment ${row_size} "calico" "${op_type}" "${layout_type}" "Calico traditional with array translator and huge pages" \
+                "./calico_olap_query" "${FIXED_PAGE_SIZE_KB}" \
                 "TRADITIONAL=1" "TRADHASH=0" "NOHUGEPAGE_FRAME_MEM=0"
             
             # Configuration 4: chained_hash (traditional buffer pool with chained hash, huge pages)
             run_olap_experiment ${row_size} "chained_hash" "${op_type}" "${layout_type}" "Calico traditional with chained hash and huge pages" \
+                "./calico_olap_query" "${FIXED_PAGE_SIZE_KB}" \
                 "TRADITIONAL=1" "TRADHASH=1" "NOHUGEPAGE_FRAME_MEM=0"
 
             # Configuration 4: openaddr (traditional buffer pool with open addressing, huge pages)
             run_olap_experiment ${row_size} "openaddr_hash" "${op_type}" "${layout_type}" "Calico traditional with openaddr hash and huge pages" \
+                "./calico_olap_query" "${FIXED_PAGE_SIZE_KB}" \
                 "TRADITIONAL=1" "TRADHASH=2" "NOHUGEPAGE_FRAME_MEM=0"
+
+            # Configuration 5: Robin Hood hash (martinus/robin-hood-hashing, huge pages)
+            run_olap_experiment ${row_size} "robinhood_hash" "${op_type}" "${layout_type}" "Calico traditional with Robin Hood hash and huge pages" \
+                "./calico_olap_query" "${FIXED_PAGE_SIZE_KB}" \
+                "TRADITIONAL=1" "TRADHASH=7" "NOHUGEPAGE_FRAME_MEM=0"
+
+            # Configuration 6: PrediCache (page size = 4KB)
+            if [ ${row_size} -le ${PREDICACHE_MAX_ROW_SIZE} ]; then
+                run_olap_experiment ${row_size} "predicache" "${op_type}" "${layout_type}" "PrediCache buffer manager" \
+                    "${SCRIPT_DIR}/predictivetranslation-sigmod2026/predicache_olap_query" "${PREDICACHE_PAGE_SIZE_KB}" \
+                    "POOLGB=${PHYSMEM}"
+            else
+                echo "Skipping predicache for row size ${row_size}B (max ${PREDICACHE_MAX_ROW_SIZE}B for 4KB pages)"
+            fi
             
             # # Configuration 5: lockfree_hash (traditional buffer pool with lockfree hash, huge pages)
             # run_olap_experiment ${row_size} "lockfree_hash" "${op_type}" "${layout_type}" "Calico traditional with lockfree hash and huge pages" \
@@ -255,8 +308,10 @@ echo "  - mmap: VMCache without huge pages"
 echo "  - mmap_huge: VMCache with huge pages"
 echo "  - calico: Traditional buffer pool with array translator (huge pages)"
 echo "  - chained_hash: Traditional buffer pool with chained hash (huge pages)"
-echo "  - lockfree_hash: Traditional buffer pool with lockfree hash (huge pages)"
-echo "  Total per row size: 5 configurations × 2 operation types × 2 layout types = 20 experiments"
+echo "  - openaddr_hash: Traditional buffer pool with Abseil flat hash (huge pages)"
+echo "  - robinhood_hash: Traditional buffer pool with Robin Hood hash (huge pages)"
+echo "  - predicache: PrediCache buffer manager where the row size permits it"
+echo "  Total per row size: 7 configurations × 2 operation types × 2 layout types = 28 experiments (minus skipped PrediCache cases)"
 echo
 echo "Directory structure:"
 find "${EXP_BASE_DIR}" -type d | sort

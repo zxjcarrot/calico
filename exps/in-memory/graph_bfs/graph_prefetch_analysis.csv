@@ -1,6 +1,6 @@
 BaseConfig,Prefetch_Avg_ms,NoPrefetch_Avg_ms,Improvement_%
-calico_array,18017.57,25574.04,29.00
-calico_mmap,16005.25,15119.33,-5.00
-calico_chained_hash,98306.32,87900.04,-11.00
+calico_array,19147.34,24438.80,21.00
+calico_mmap,16595.44,14643.66,-13.00
+calico_chained_hash,98306.32,86619.27,-13.00
 calico_openaddr_hash,88238.77,62770.06,-40.00
 calico_lockfree_hash,91016.32,72858.63,-24.00

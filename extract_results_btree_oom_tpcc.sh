@@ -14,7 +14,7 @@ SCRIPT_DIR="$(detect_script_dir)"
 EXP_BASE_DIR="${SCRIPT_DIR}/Calico-VLDB26/data/exps/larger-than-memory/btree_tpcc"
 
 # Warehouse scales to process (must match exp_larger_than_memory_btree_tpcc.sh)
-DATA_SIZES=(20 40 80 100 200 400)
+DATA_SIZES=(20 40 80 100 200 400 800)
 
 # Detect total core count once for throughput-per-core estimation
 TOTAL_CORES=$(lscpu -p | grep -v '^#' | wc -l)
@@ -64,7 +64,25 @@ extract_avg_throughput() {
         return
     fi
 
-    awk -F',' '$1 == "avg_throughput" { print $2 }' "$tx_file"
+    # Try to find the summary line first
+    local summary_val=$(awk -F',' '$1 == "avg_throughput" { print $2 }' "$tx_file")
+    
+    if [ -n "$summary_val" ]; then
+        echo "$summary_val"
+    else
+        # Calculate average from data rows if summary is missing
+        # Skip header (NR>1) and ensure $2 is a number
+        awk -F',' '
+            NR > 1 && $2 ~ /^[0-9]+(\.[0-9]+)?$/ { 
+                sum += $2; 
+                count++; 
+            } 
+            END { 
+                if (count > 0) print sum / count; 
+                else print "n/a"; 
+            }
+        ' "$tx_file"
+    fi
 }
 
 extract_avg_cpu_util() {
@@ -124,12 +142,155 @@ extract_avg_ssd_bandwidth() {
     ' "$iostat_file"
 }
 
+extract_avg_rss() {
+    local rss_file="$1"
+
+    if [ ! -f "$rss_file" ]; then
+        echo "n/a"
+        return
+    fi
+
+    awk '
+        NR > 1 && $2 ~ /^[0-9]+$/ {
+            values[count] = $2;
+            count++;
+        }
+        END {
+            if (count > 0) {
+                start_idx = (count > 60) ? count - 60 : 0;
+                sum = 0;
+                for (i = start_idx; i < count; i++) {
+                    sum += values[i];
+                }
+                samples = count - start_idx;
+                # Convert KB to GB
+                printf "%.2f", (sum / samples) / (1024 * 1024);
+            } else {
+                print "n/a";
+            }
+        }
+    ' "$rss_file"
+}
+
 extract_leanstore_metrics() {
     local tx_file="$1"
     local metric="$2"
 
     if [ ! -f "$tx_file" ]; then
         echo "n/a"
+        return
+    fi
+
+    if grep -q '^t,OLTP_TX,' "$tx_file"; then
+        case "$metric" in
+            "throughput")
+                awk -F',' '
+                    $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+(\.[0-9]+)?$/ {
+                        values[count] = $2;
+                        count++;
+                    }
+                    END {
+                        if (count > 0) {
+                            start_idx = (count > 60) ? count - 60 : 0;
+                            sum = 0;
+                            for (i = start_idx; i < count; i++) sum += values[i];
+                            samples = count - start_idx;
+                            if (samples > 0) print sum / samples; else print "n/a";
+                        } else {
+                            print "n/a";
+                        }
+                    }
+                ' "$tx_file"
+                ;;
+            "l1_per_tx")
+                awk -F',' '
+                    $1 ~ /^[0-9]+$/ && $11 ~ /^[0-9]+(\.[0-9]+)?$/ {
+                        values[count] = $11;
+                        count++;
+                    }
+                    END {
+                        if (count > 0) {
+                            start_idx = (count > 60) ? count - 60 : 0;
+                            sum = 0;
+                            for (i = start_idx; i < count; i++) sum += values[i];
+                            samples = count - start_idx;
+                            if (samples > 0) print sum / samples; else print "n/a";
+                        } else {
+                            print "n/a";
+                        }
+                    }
+                ' "$tx_file"
+                ;;
+            "llc_per_tx")
+                awk -F',' '
+                    $1 ~ /^[0-9]+$/ && $12 ~ /^[0-9]+(\.[0-9]+)?$/ {
+                        values[count] = $12;
+                        count++;
+                    }
+                    END {
+                        if (count > 0) {
+                            start_idx = (count > 60) ? count - 60 : 0;
+                            sum = 0;
+                            for (i = start_idx; i < count; i++) sum += values[i];
+                            samples = count - start_idx;
+                            if (samples > 0) print sum / samples; else print "n/a";
+                        } else {
+                            print "n/a";
+                        }
+                    }
+                ' "$tx_file"
+                ;;
+            "cycles_per_tx")
+                awk -F',' '
+                    $1 ~ /^[0-9]+$/ && $9 ~ /^[0-9]+(\.[0-9]+)?$/ {
+                        values[count] = $9;
+                        count++;
+                    }
+                    END {
+                        if (count > 0) {
+                            start_idx = (count > 60) ? count - 60 : 0;
+                            sum = 0;
+                            for (i = start_idx; i < count; i++) sum += values[i];
+                            samples = count - start_idx;
+                            if (samples > 0) print sum / samples; else print "n/a";
+                        } else {
+                            print "n/a";
+                        }
+                    }
+                ' "$tx_file"
+                ;;
+            "insts_per_tx")
+                awk -F',' '
+                    $1 ~ /^[0-9]+$/ && $8 ~ /^[0-9]+(\.[0-9]+)?$/ {
+                        values[count] = $8;
+                        count++;
+                    }
+                    END {
+                        if (count > 0) {
+                            start_idx = (count > 60) ? count - 60 : 0;
+                            sum = 0;
+                            for (i = start_idx; i < count; i++) sum += values[i];
+                            samples = count - start_idx;
+                            if (samples > 0) print sum / samples; else print "n/a";
+                        } else {
+                            print "n/a";
+                        }
+                    }
+                ' "$tx_file"
+                ;;
+            "ipc")
+                local insts=$(extract_leanstore_metrics "$tx_file" "insts_per_tx")
+                local cycles=$(extract_leanstore_metrics "$tx_file" "cycles_per_tx")
+                if [ "$insts" != "n/a" ] && [ "$cycles" != "n/a" ] && [ "$cycles" != "0" ]; then
+                    echo "scale=6; $insts / $cycles" | bc
+                else
+                    echo "n/a"
+                fi
+                ;;
+            *)
+                echo "n/a"
+                ;;
+        esac
         return
     fi
 
@@ -310,15 +471,19 @@ extract_wiredtiger_metrics() {
 }
 
 # Summary CSV header
-echo "datasize,config_name,active_cores,avg_throughput,avg_throughput_per_core,llc_miss_per_op,dtlb_miss_per_op,cycles_per_op,insts_per_op,ipc,avg_ssd_bandwidth_mb_s" > "${EXP_BASE_DIR}/results_summary_all.csv"
+echo "datasize,config_name,active_cores,avg_throughput,avg_throughput_per_core,llc_miss_per_op,dtlb_miss_per_op,cycles_per_op,insts_per_op,ipc,avg_ssd_bandwidth_mb_s,avg_rss_gb" > "${EXP_BASE_DIR}/results_summary_all.csv"
 
 # Configurations emitted by exp_larger_than_memory_btree_tpcc.sh
 configs=(
     "calico_mmap_nohuge"
     "calico_array_huge"
     "calico_openaddr_hash_huge"
+    "calico_robinhood_hash_huge"
+    "predicache_tpcc_pt_on"
+    "predicache_tpcc_pt_off"
     "leanstore"
     "wiredtiger"
+    "lmdb"
 )
 
 echo "Extracting results from TPCC experiment files for all warehouse scales..."
@@ -335,7 +500,7 @@ for datasize in "${DATA_SIZES[@]}"; do
     echo "Processing results for datasize ${datasize} warehouses..."
 
     datasize_summary_csv="${datasize_dir}/results_summary.csv"
-    echo "config_name,active_cores,avg_throughput,avg_throughput_per_core,llc_miss_per_op,dtlb_miss_per_op,cycles_per_op,insts_per_op,ipc,avg_ssd_bandwidth_mb_s" > "$datasize_summary_csv"
+    echo "config_name,active_cores,avg_throughput,avg_throughput_per_core,llc_miss_per_op,dtlb_miss_per_op,cycles_per_op,insts_per_op,ipc,avg_ssd_bandwidth_mb_s,avg_rss_gb" > "$datasize_summary_csv"
 
     for config in "${configs[@]}"; do
         echo "  Processing $config..."
@@ -343,6 +508,7 @@ for datasize in "${DATA_SIZES[@]}"; do
         tx_file="${datasize_dir}/${config}_tx.csv"
         perf_file="${datasize_dir}/${config}_perf.csv"
         iostat_file="${datasize_dir}/${config}_iostat.log"
+        rss_file="${datasize_dir}/${config}_rss.log"
 
         active_cores="n/a"
         config_json="${datasize_dir}/config.json"
@@ -375,7 +541,7 @@ for datasize in "${DATA_SIZES[@]}"; do
             cycles_per_op=$(extract_leanstore_metrics "$tx_file" "cycles_per_tx")
             insts_per_op=$(extract_leanstore_metrics "$tx_file" "insts_per_tx")
             ipc=$(extract_leanstore_metrics "$tx_file" "ipc")
-        elif [ "$config" = "wiredtiger" ]; then
+        elif [ "$config" = "wiredtiger" ] || [ "$config" = "lmdb" ]; then
             avg_throughput=$(extract_wiredtiger_metrics "$tx_file" "throughput")
             llc_miss_per_op="n/a"
             dtlb_miss_per_op="n/a"
@@ -392,6 +558,7 @@ for datasize in "${DATA_SIZES[@]}"; do
         fi
 
         avg_ssd_bandwidth=$(extract_avg_ssd_bandwidth "$iostat_file")
+        avg_rss_gb=$(extract_avg_rss "$rss_file")
 
         avg_throughput_per_core="n/a"
         if [ "$avg_throughput" != "n/a" ]; then
@@ -410,9 +577,10 @@ for datasize in "${DATA_SIZES[@]}"; do
         insts_per_op=${insts_per_op:-"n/a"}
         ipc=${ipc:-"n/a"}
         avg_ssd_bandwidth=${avg_ssd_bandwidth:-"n/a"}
+        avg_rss_gb=${avg_rss_gb:-"n/a"}
 
-    echo "$config,$active_cores,$avg_throughput,$avg_throughput_per_core,$llc_miss_per_op,$dtlb_miss_per_op,$cycles_per_op,$insts_per_op,$ipc,$avg_ssd_bandwidth" >> "$datasize_summary_csv"
-    echo "$datasize,$config,$active_cores,$avg_throughput,$avg_throughput_per_core,$llc_miss_per_op,$dtlb_miss_per_op,$cycles_per_op,$insts_per_op,$ipc,$avg_ssd_bandwidth" >> "${EXP_BASE_DIR}/results_summary_all.csv"
+    echo "$config,$active_cores,$avg_throughput,$avg_throughput_per_core,$llc_miss_per_op,$dtlb_miss_per_op,$cycles_per_op,$insts_per_op,$ipc,$avg_ssd_bandwidth,$avg_rss_gb" >> "$datasize_summary_csv"
+    echo "$datasize,$config,$active_cores,$avg_throughput,$avg_throughput_per_core,$llc_miss_per_op,$dtlb_miss_per_op,$cycles_per_op,$insts_per_op,$ipc,$avg_ssd_bandwidth,$avg_rss_gb" >> "${EXP_BASE_DIR}/results_summary_all.csv"
     done
 
     echo "  Warehouse-scale summary: $datasize_summary_csv"
@@ -433,9 +601,13 @@ echo "Configurations processed:"
 echo "  - calico_mmap_nohuge"
 echo "  - calico_array_huge"
 echo "  - calico_openaddr_hash_huge"
+echo "  - calico_robinhood_hash_huge"
+echo "  - predicache_tpcc_pt_on"
+echo "  - predicache_tpcc_pt_off"
 echo "  - leanstore"
 echo "  - wiredtiger"
-echo "  Total per warehouse scale: 5 configurations"
+echo "  - lmdb"
+echo "  Total per warehouse scale: ${#configs[@]} configurations"
 echo
 
 echo "Global Results Summary (all warehouse scales):"

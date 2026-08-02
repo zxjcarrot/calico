@@ -13,6 +13,7 @@
 #include <chrono>
 #include <cmath>
 #include <csignal>
+#include <cstdlib>
 #include <exception>
 #include <fstream>
 #include <iostream>
@@ -50,6 +51,209 @@ bool PageState::packedMode = false;
 
 // Definition for LibaioInterface static member
 const u64 LibaioInterface::maxIOs;
+const u64 IOUringInterface::maxIOs;
+const u64 IOUringInterface::queueDepth;
+
+static u64 monotonicMicros() {
+    return static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+                               std::chrono::steady_clock::now().time_since_epoch())
+                               .count());
+}
+
+static constexpr bool kEnableAsyncPrefetchStats = false;
+
+static bool asyncDiagnosticsEnabled() {
+    static const bool enabled = []() {
+        const char* raw = std::getenv("CALICO_ASYNC_DIAGNOSTICS");
+        if (raw == nullptr || raw[0] == '\0') {
+            return false;
+        }
+        char* end = nullptr;
+        return std::strtol(raw, &end, 10) != 0 && end != raw;
+    }();
+    return enabled;
+}
+
+static u64 asyncWaitWarnMicros() {
+    static const u64 warn_us = []() {
+        const char* raw = std::getenv("CALICO_ASYNC_WAIT_WARN_US");
+        if (raw == nullptr || raw[0] == '\0') {
+            return static_cast<u64>(50000);
+        }
+        char* end = nullptr;
+        const long long parsed = std::strtoll(raw, &end, 10);
+        if (end == raw || parsed <= 0) {
+            return static_cast<u64>(50000);
+        }
+        return static_cast<u64>(parsed);
+    }();
+    return warn_us;
+}
+
+static u64 asyncWaitLogEveryMicros() {
+    static const u64 period_us = []() {
+        const char* raw = std::getenv("CALICO_ASYNC_WAIT_LOG_EVERY_US");
+        if (raw == nullptr || raw[0] == '\0') {
+            return static_cast<u64>(250000);
+        }
+        char* end = nullptr;
+        const long long parsed = std::strtoll(raw, &end, 10);
+        if (end == raw || parsed <= 0) {
+            return static_cast<u64>(250000);
+        }
+        return static_cast<u64>(parsed);
+    }();
+    return period_us;
+}
+
+static u64 asyncWaitRescueMicros() {
+    static const u64 rescue_us = []() {
+        const char* raw = std::getenv("CALICO_ASYNC_WAIT_RESCUE_US");
+        if (raw == nullptr || raw[0] == '\0') {
+            return static_cast<u64>(500000);
+        }
+        char* end = nullptr;
+        const long long parsed = std::strtoll(raw, &end, 10);
+        if (end == raw || parsed <= 0) {
+            return static_cast<u64>(500000);
+        }
+        return static_cast<u64>(parsed);
+    }();
+    return rescue_us;
+}
+
+static u64 asyncWaitPollMicros() {
+    static const u64 poll_us = []() {
+        const char* raw = std::getenv("CALICO_ASYNC_WAIT_POLL_US");
+        if (raw == nullptr || raw[0] == '\0') {
+            return static_cast<u64>(1000);
+        }
+        char* end = nullptr;
+        const long long parsed = std::strtoll(raw, &end, 10);
+        if (end == raw || parsed <= 0) {
+            return static_cast<u64>(1000);
+        }
+        return static_cast<u64>(parsed);
+    }();
+    return poll_us;
+}
+
+static u64 packAsyncRequestUserData(u32 slot, u64 token) {
+    return (static_cast<u64>(slot) << 32) | (token & 0xffffffffULL);
+}
+
+static u32 unpackAsyncRequestSlot(u64 user_data) {
+    return static_cast<u32>(user_data >> 32);
+}
+
+static u32 unpackAsyncRequestTokenLow(u64 user_data) {
+    return static_cast<u32>(user_data & 0xffffffffULL);
+}
+
+static u64 packSyncReadUserData(u32 batch_index) {
+    return packAsyncRequestUserData(BufferManager::invalidAsyncRequestSlot, batch_index);
+}
+
+static void logAsyncRequestSnapshot(const char* event, const AsyncReadRequest& request,
+                                    const IOUringInterface* io_interface = nullptr, int submit_ret = 0);
+
+static bool processAsyncReadCompletion(IOUringInterface* io_interface, io_uring_cqe* cqe) {
+    const u64 user_data = io_uring_cqe_get_data64(cqe);
+    const u32 slot = unpackAsyncRequestSlot(user_data);
+    if (slot == BufferManager::invalidAsyncRequestSlot) {
+        return false;
+    }
+
+    BufferManager* bm_ptr = io_interface->bm_ptr;
+    AsyncReadRequest* request = bm_ptr->asyncReadRequests.get() + slot;
+    const u32 token_low = unpackAsyncRequestTokenLow(user_data);
+    const u64 live_token = request->token.load(std::memory_order_acquire);
+    const u32 live_status = request->status.load(std::memory_order_acquire);
+    if ((live_token & 0xffffffffULL) != token_low || live_status != AsyncReadRequest::Submitted) {
+        return true;
+    }
+
+    const int result = cqe->res;
+    request->result.store(result, std::memory_order_release);
+    request->completionMicros.store(monotonicMicros(), std::memory_order_release);
+    request->completionWorker.store(workerThreadId, std::memory_order_release);
+    bm_ptr->recordAsyncInFlightTransition(request->completionMicros.load(std::memory_order_acquire), -1);
+    if (result == static_cast<int>(pageSize)) {
+        const PID pid = request->pid.load(std::memory_order_acquire);
+        const u32 frame = request->frame.load(std::memory_order_acquire);
+        if (frame != std::numeric_limits<u32>::max() && frame < bm_ptr->physCount) {
+            bm_ptr->frameMem[frame].dirty = false;
+        }
+        bm_ptr->readCount.fetch_add(1, std::memory_order_relaxed);
+        if constexpr (kEnableAsyncPrefetchStats) {
+            bm_ptr->asyncCompletionCount.fetch_add(1, std::memory_order_relaxed);
+        }
+        request->status.store(AsyncReadRequest::Completed, std::memory_order_release);
+        logAsyncRequestSnapshot("completion_ok", *request, io_interface);
+        bm_ptr->finalizeCompletedAsyncRead(pid, slot);
+    } else {
+        request->status.store(AsyncReadRequest::Failed, std::memory_order_release);
+        logAsyncRequestSnapshot("completion_failed", *request, io_interface);
+    }
+
+    return true;
+}
+
+[[maybe_unused]] static const char* asyncReadStatusName(u32 status) {
+    switch (status) {
+        case AsyncReadRequest::Idle:
+            return "Idle";
+        case AsyncReadRequest::Submitted:
+            return "Submitted";
+        case AsyncReadRequest::Completed:
+            return "Completed";
+        case AsyncReadRequest::Failed:
+            return "Failed";
+        case AsyncReadRequest::Rescuing:
+            return "Rescuing";
+        default:
+            return "Unknown";
+    }
+}
+
+static void logAsyncRequestSnapshot(const char* event, const AsyncReadRequest& request,
+                                    const IOUringInterface* io_interface, int submit_ret) {
+    // if (!asyncDiagnosticsEnabled()) {
+    //     return;
+    // }
+
+    // const PID pid = request.pid.load(std::memory_order_acquire);
+    // const u32 frame = request.frame.load(std::memory_order_acquire);
+    // const u64 token = request.token.load(std::memory_order_acquire);
+    // const u64 submit_micros = request.submitMicros.load(std::memory_order_acquire);
+    // const u64 completion_micros = request.completionMicros.load(std::memory_order_acquire);
+    // const u32 submit_worker = request.submitWorker.load(std::memory_order_acquire);
+    // const u32 completion_worker = request.completionWorker.load(std::memory_order_acquire);
+    // const u32 waiter_count = request.waiterCount.load(std::memory_order_acquire);
+    // const int result = request.result.load(std::memory_order_acquire);
+    // const u32 status = request.status.load(std::memory_order_acquire);
+    // const u64 now_micros = monotonicMicros();
+
+    // std::cerr << "[AsyncRead] event=" << event << " token=" << token << " pid=" << pid << " frame=" << frame
+    //           << " status=" << asyncReadStatusName(status) << " result=" << result << " submit_worker="
+    //           << submit_worker << " completion_worker=" << completion_worker << " waiter_count=" << waiter_count
+    //           << " age_us=" << (submit_micros == 0 ? 0 : (now_micros - submit_micros)) << " completion_age_us="
+    //           << (completion_micros == 0 ? 0 : (now_micros - completion_micros));
+
+    // if (bm_ptr != nullptr && frame != std::numeric_limits<u32>::max() && frame < bm_ptr->physCount) {
+    //     const PID mapped_pid = bm_ptr->frameToPidArray ? bm_ptr->frameToPidArray[frame].load(std::memory_order_acquire)
+    //                                                    : BufferManager::invalidPID;
+    //     std::cerr << " mapped_pid=" << mapped_pid;
+    // }
+    // if (io_interface != nullptr) {
+    //     std::cerr << " sq_ready=" << io_uring_sq_ready(const_cast<io_uring*>(&io_interface->ring))
+    //               << " cq_ready=" << io_uring_cq_ready(const_cast<io_uring*>(&io_interface->ring));
+    // }
+    // if (submit_ret != 0) {
+    //     std::cerr << " submit_ret=" << submit_ret;
+    // }
+    // std::cerr << std::endl;
+}
 
 __attribute__((target("sse4.2"))) uint64_t hash64(uint64_t key, uint32_t seed) {
     uint64_t k = 0x8648DBDB;
@@ -198,7 +402,7 @@ void* allocHuge(size_t size) {
 
 // use when lock is not free
 void yield(u64 counter) { 
-    //_mm_pause(); 
+    _mm_pause();
 }
 
 ResidentPageSet::ResidentPageSet(u64 maxCount) : count(next_pow2(maxCount * 1.5)), mask(count - 1), clockPos(0) {
@@ -321,7 +525,421 @@ void LibaioInterface::readPages(const vector<PID>& pages, const vector<Page*>& d
     // Mark pages as clean after successful read
     for (u64 i = 0; i < pages.size(); i++) {
         destinations[i]->dirty = false;
-        bm_ptr->readCount++;
+        // bm_ptr->readCount++;
+    }
+}
+
+IOUringInterface::IOUringInterface(int blockfd, BufferManager* bm_ptr) : blockfd(blockfd), bm_ptr(bm_ptr) {
+    const int ret = io_uring_queue_init(queueDepth, &ring, 0);
+    if (ret < 0) {
+        std::cerr << "io_uring_queue_init failed: " << strerror(-ret) << std::endl;
+        exit(EXIT_FAILURE);
+    }
+}
+
+IOUringInterface::~IOUringInterface() { io_uring_queue_exit(&ring); }
+
+namespace {
+inline void forceAsyncReadSQE(io_uring_sqe* sqe) {
+    sqe->flags |= IOSQE_ASYNC;
+}
+
+struct AtomicFlagGuard {
+    std::atomic_flag& lock;
+
+    explicit AtomicFlagGuard(std::atomic_flag& lock) : lock(lock) {
+        while (lock.test_and_set(std::memory_order_acquire)) {
+            _mm_pause();
+        }
+    }
+
+    ~AtomicFlagGuard() { lock.clear(std::memory_order_release); }
+};
+
+struct AtomicFlagTryGuard {
+    std::atomic_flag* lock;
+    bool owns;
+
+    explicit AtomicFlagTryGuard(std::atomic_flag& lock) : lock(&lock), owns(!lock.test_and_set(std::memory_order_acquire)) {}
+
+    ~AtomicFlagTryGuard() {
+        if (owns) {
+            lock->clear(std::memory_order_release);
+        }
+    }
+
+    bool owns_lock() const { return owns; }
+};
+}  // namespace
+
+void IOUringInterface::writePages(const vector<PID>& pages) {
+    AtomicFlagGuard guard(submitLock);
+    for (PID pid : pages) {
+        Page* page = bm_ptr->preparePageForWrite(pid);
+        const ssize_t ret = pwrite(blockfd, page, pageSize, pageSize * pid);
+        if (ret != static_cast<ssize_t>(pageSize)) {
+            std::cerr << "pwrite failed in IOUringInterface::writePages for pid " << pid << " errno=" << errno
+                      << std::endl;
+            exit(EXIT_FAILURE);
+        }
+    }
+}
+
+void IOUringInterface::readPages(const vector<PID>& pages, const vector<Page*>& destinations) {
+    assert(pages.size() == destinations.size());
+    if (pages.empty()) {
+        return;
+    }
+
+    AtomicFlagGuard submit_guard(submitLock);
+    AtomicFlagGuard completion_guard(completionLock);
+    reapCompletions(false);
+
+    for (size_t batch_begin = 0; batch_begin < pages.size(); batch_begin += maxIOs) {
+        const size_t batch_count = std::min<size_t>(maxIOs, pages.size() - batch_begin);
+        for (size_t batch_idx = 0; batch_idx < batch_count; ++batch_idx) {
+            io_uring_sqe* sqe = io_uring_get_sqe(&ring);
+            if (sqe == nullptr) {
+                std::cerr << "io_uring_get_sqe failed in IOUringInterface::readPages" << std::endl;
+                exit(EXIT_FAILURE);
+            }
+
+            const size_t request_idx = batch_begin + batch_idx;
+            io_uring_prep_read(sqe, blockfd, destinations[request_idx], pageSize, pageSize * pages[request_idx]);
+            io_uring_sqe_set_data64(sqe, packSyncReadUserData(static_cast<u32>(batch_idx)));
+        }
+
+        size_t submitted = 0;
+        while (submitted < batch_count) {
+            const int ret = io_uring_submit(&ring);
+            if (ret < 0) {
+                std::cerr << "io_uring_submit failed in IOUringInterface::readPages: " << strerror(-ret)
+                          << std::endl;
+                exit(EXIT_FAILURE);
+            }
+            if (ret == 0) {
+                std::cerr << "io_uring_submit made no progress in IOUringInterface::readPages" << std::endl;
+                exit(EXIT_FAILURE);
+            }
+            submitted += static_cast<size_t>(ret);
+        }
+
+        std::vector<bool> completed(batch_count, false);
+        size_t remaining = batch_count;
+        while (remaining > 0) {
+            io_uring_cqe* cqe = nullptr;
+            const int ret = io_uring_wait_cqe(&ring, &cqe);
+            if (ret < 0) {
+                std::cerr << "io_uring_wait_cqe failed in IOUringInterface::readPages: " << strerror(-ret)
+                          << std::endl;
+                exit(EXIT_FAILURE);
+            }
+
+            const u64 user_data = io_uring_cqe_get_data64(cqe);
+            const u32 slot = unpackAsyncRequestSlot(user_data);
+            if (slot == BufferManager::invalidAsyncRequestSlot) {
+                const u32 batch_idx = unpackAsyncRequestTokenLow(user_data);
+                if (batch_idx >= batch_count || completed[batch_idx]) {
+                    std::cerr << "invalid sync read completion in IOUringInterface::readPages" << std::endl;
+                    exit(EXIT_FAILURE);
+                }
+
+                const size_t request_idx = batch_begin + batch_idx;
+                if (cqe->res != static_cast<int>(pageSize)) {
+                    std::cerr << "io_uring read failed in IOUringInterface::readPages for pid " << pages[request_idx]
+                              << " res=" << cqe->res << std::endl;
+                    exit(EXIT_FAILURE);
+                }
+
+                completed[batch_idx] = true;
+                destinations[request_idx]->dirty = false;
+                bm_ptr->readCount.fetch_add(1, std::memory_order_relaxed);
+                --remaining;
+            } else {
+                processAsyncReadCompletion(this, cqe);
+            }
+
+            io_uring_cqe_seen(&ring, cqe);
+        }
+    }
+}
+
+void BufferManager::recordAsyncInFlightTransition(u64 now_micros, int delta) {
+    if constexpr (!kEnableAsyncPrefetchStats) {
+        return;
+    }
+
+    AtomicFlagGuard guard(asyncInFlightStatsLock);
+
+    const u64 current = asyncInFlightCurrent.load(std::memory_order_relaxed);
+    const u64 last_transition = asyncInFlightLastTransitionMicros.load(std::memory_order_relaxed);
+    if (last_transition != 0 && now_micros > last_transition && current > 0) {
+        asyncInFlightWeightedMicros.fetch_add(current * (now_micros - last_transition), std::memory_order_relaxed);
+    }
+
+    if (current == 0 && delta > 0 && asyncInFlightStartMicros.load(std::memory_order_relaxed) == 0) {
+        asyncInFlightStartMicros.store(now_micros, std::memory_order_relaxed);
+    }
+
+    const long long next_signed = static_cast<long long>(current) + static_cast<long long>(delta);
+    const u64 next = next_signed > 0 ? static_cast<u64>(next_signed) : 0;
+    asyncInFlightCurrent.store(next, std::memory_order_relaxed);
+    asyncInFlightLastTransitionMicros.store(now_micros, std::memory_order_relaxed);
+
+    u64 peak = asyncInFlightPeak.load(std::memory_order_relaxed);
+    while (next > peak && !asyncInFlightPeak.compare_exchange_weak(peak, next, std::memory_order_relaxed,
+                                                                   std::memory_order_relaxed)) {
+    }
+}
+
+double BufferManager::averageAsyncInFlightIO(u64 now_micros) const {
+    if constexpr (!kEnableAsyncPrefetchStats) {
+        return 0.0;
+    }
+
+    AtomicFlagGuard guard(asyncInFlightStatsLock);
+
+    const u64 start = asyncInFlightStartMicros.load(std::memory_order_relaxed);
+    if (start == 0 || now_micros <= start) {
+        return 0.0;
+    }
+
+    u64 weighted = asyncInFlightWeightedMicros.load(std::memory_order_relaxed);
+    const u64 current = asyncInFlightCurrent.load(std::memory_order_relaxed);
+    const u64 last_transition = asyncInFlightLastTransitionMicros.load(std::memory_order_relaxed);
+    if (current > 0 && last_transition != 0 && now_micros > last_transition) {
+        weighted += current * (now_micros - last_transition);
+    }
+
+    const u64 active_window = now_micros - start;
+    if (active_window == 0) {
+        return 0.0;
+    }
+    return static_cast<double>(weighted) / static_cast<double>(active_window);
+}
+
+bool IOUringInterface::submitAsyncRead(PID pid, Page* destination, AsyncReadRequest* request) {
+    const PID pids[] = {pid};
+    Page* const destinations[] = {destination};
+    AsyncReadRequest* const requests[] = {request};
+    return submitAsyncReads(pids, destinations, requests, 1) == 1;
+}
+
+size_t IOUringInterface::submitAsyncReads(const PID* pids, Page* const* destinations,
+                                          AsyncReadRequest* const* requests, size_t count) {
+    auto try_reap_completions = [&]() {
+        AtomicFlagTryGuard completion_guard(completionLock);
+        if (completion_guard.owns_lock()) {
+            reapCompletions(false);
+        }
+    };
+
+    auto try_submit = [&]() -> size_t {
+        AtomicFlagGuard submit_guard(submitLock);
+        size_t prepared = 0;
+        for (; prepared < count; ++prepared) {
+            io_uring_sqe* sqe = io_uring_get_sqe(&ring);
+            if (sqe == nullptr) {
+                break;
+            }
+
+            AsyncReadRequest* request = requests[prepared];
+            const u32 slot = static_cast<u32>(request - bm_ptr->asyncReadRequests.get());
+            const u64 token = request->token.load(std::memory_order_acquire);
+            io_uring_prep_read(sqe, blockfd, destinations[prepared], pageSize, pageSize * pids[prepared]);
+            //forceAsyncReadSQE(sqe);
+            io_uring_sqe_set_data64(sqe, packAsyncRequestUserData(slot, token));
+        }
+
+        if (prepared == 0) {
+            return 0;
+        }
+
+        const int ret = io_uring_submit(&ring);
+        if (ret < 0) {
+            if constexpr (kEnableAsyncPrefetchStats) {
+                bm_ptr->asyncSubmitBackpressureCount.fetch_add(1, std::memory_order_relaxed);
+            }
+            for (size_t i = 0; i < prepared; ++i) {
+                logAsyncRequestSnapshot("submit_error", *requests[i], this, ret);
+            }
+            std::cerr << "io_uring_submit failed: " << strerror(-ret) << std::endl;
+            return 0;
+        }
+        if (ret == 0) {
+            if constexpr (kEnableAsyncPrefetchStats) {
+                bm_ptr->asyncSubmitBackpressureCount.fetch_add(1, std::memory_order_relaxed);
+            }
+            for (size_t i = 0; i < prepared; ++i) {
+                logAsyncRequestSnapshot("submit_zero", *requests[i], this, ret);
+            }
+            return 0;
+        }
+
+        const size_t submitted = std::min<size_t>(prepared, static_cast<size_t>(ret));
+        const u64 now_micros = monotonicMicros();
+        for (size_t i = 0; i < submitted; ++i) {
+            bm_ptr->recordAsyncInFlightTransition(now_micros, 1);
+            logAsyncRequestSnapshot("submit_ok", *requests[i], this, ret);
+        }
+        if (submitted < prepared) {
+            if constexpr (kEnableAsyncPrefetchStats) {
+                bm_ptr->asyncSubmitBackpressureCount.fetch_add(prepared - submitted, std::memory_order_relaxed);
+            }
+            for (size_t i = submitted; i < prepared; ++i) {
+                logAsyncRequestSnapshot("submit_partial", *requests[i], this, ret);
+            }
+        }
+        return submitted;
+    };
+
+    try_reap_completions();
+    const size_t first_attempt = try_submit();
+    if (first_attempt > 0 || count == 0) {
+        return first_attempt;
+    }
+
+    try_reap_completions();
+    const size_t second_attempt = try_submit();
+    if (second_attempt > 0 || count == 0) {
+        return second_attempt;
+    }
+
+    if constexpr (kEnableAsyncPrefetchStats) {
+        bm_ptr->asyncSubmitBackpressureCount.fetch_add(count, std::memory_order_relaxed);
+    }
+    for (size_t i = 0; i < count; ++i) {
+        logAsyncRequestSnapshot("submit_no_sqe", *requests[i], this);
+    }
+    return 0;
+}
+
+void IOUringInterface::pollAsyncCompletions() {
+    AtomicFlagTryGuard completion_guard(completionLock);
+    if (completion_guard.owns_lock()) {
+        reapCompletions(false);
+    }
+}
+
+void IOUringInterface::waitForAsyncRead(AsyncReadRequest& request) {
+    struct WaiterScope {
+        AsyncReadRequest& request;
+        explicit WaiterScope(AsyncReadRequest& req) : request(req) {
+            request.waiterCount.fetch_add(1, std::memory_order_acq_rel);
+        }
+        ~WaiterScope() { request.waiterCount.fetch_sub(1, std::memory_order_acq_rel); }
+    } waiter_scope(request);
+
+    const u64 wait_start_micros = monotonicMicros();
+    bool slow_wait_counted = false;
+    for (;;) {
+        const u32 status = request.status.load(std::memory_order_acquire);
+        if (status != AsyncReadRequest::Submitted) {
+            if (status == AsyncReadRequest::Rescuing) {
+                std::this_thread::yield();
+                continue;
+            }
+            return;
+        }
+
+        const u64 now_micros = monotonicMicros();
+        const u64 elapsed_micros = now_micros - wait_start_micros;
+        if (elapsed_micros >= asyncWaitRescueMicros()) {
+            u32 expected = AsyncReadRequest::Submitted;
+            if (request.status.compare_exchange_strong(expected, AsyncReadRequest::Rescuing,
+                                                       std::memory_order_acq_rel,
+                                                       std::memory_order_acquire)) {
+                const PID pid = request.pid.load(std::memory_order_acquire);
+                Page* destination = nullptr;
+                if (bm_ptr->useTraditional) {
+                    const u32 frame = request.frame.load(std::memory_order_acquire);
+                    if (frame != std::numeric_limits<u32>::max() && frame < bm_ptr->physCount) {
+                        destination = bm_ptr->frameMem + frame;
+                    }
+                } else if (pid != std::numeric_limits<PID>::max() && pid < bm_ptr->virtCount) {
+                    destination = bm_ptr->virtMem + pid;
+                }
+
+                int rescue_result = -EIO;
+                if (destination != nullptr && pid != std::numeric_limits<PID>::max()) {
+                    rescue_result = pread(blockfd, destination, pageSize, pageSize * pid);
+                }
+
+                request.result.store(rescue_result, std::memory_order_release);
+                request.completionMicros.store(monotonicMicros(), std::memory_order_release);
+                request.completionWorker.store(workerThreadId, std::memory_order_release);
+                bm_ptr->recordAsyncInFlightTransition(request.completionMicros.load(std::memory_order_acquire), -1);
+
+                if (rescue_result == static_cast<int>(pageSize)) {
+                    if (destination != nullptr) {
+                        destination->dirty = false;
+                    }
+                    bm_ptr->readCount.fetch_add(1, std::memory_order_relaxed);
+                    request.status.store(AsyncReadRequest::Completed, std::memory_order_release);
+                    logAsyncRequestSnapshot("wait_rescue_ok", request, this);
+                    bm_ptr->finalizeCompletedAsyncRead(pid, static_cast<u32>(&request - bm_ptr->asyncReadRequests.get()));
+                } else {
+                    request.status.store(AsyncReadRequest::Failed, std::memory_order_release);
+                    logAsyncRequestSnapshot("wait_rescue_failed", request, this, rescue_result);
+                }
+                return;
+            }
+            continue;
+        }
+
+        {
+            AtomicFlagTryGuard guard(completionLock);
+            if (!guard.owns_lock()) {
+                std::this_thread::yield();
+                continue;
+            }
+            reapCompletions(false);
+            if (request.status.load(std::memory_order_acquire) != AsyncReadRequest::Submitted) {
+                return;
+            }
+
+            if (asyncDiagnosticsEnabled()) {
+                if (elapsed_micros >= asyncWaitWarnMicros()) {
+                    if constexpr (kEnableAsyncPrefetchStats) {
+                        if (!slow_wait_counted) {
+                            bm_ptr->asyncSlowWaitCount.fetch_add(1, std::memory_order_relaxed);
+                            slow_wait_counted = true;
+                        }
+                    }
+                    u64 previous_log = request.lastWaitLogMicros.load(std::memory_order_acquire);
+                    if ((previous_log == 0 || (now_micros - previous_log) >= asyncWaitLogEveryMicros()) &&
+                        request.lastWaitLogMicros.compare_exchange_strong(previous_log, now_micros,
+                                                                          std::memory_order_acq_rel,
+                                                                          std::memory_order_acquire)) {
+                        logAsyncRequestSnapshot("wait_slow", request, this);
+                    }
+                }
+            }
+
+            reapCompletions(true);
+        }
+    }
+}
+
+void IOUringInterface::reapCompletions(bool wait_for_one) {
+    io_uring_cqe* cqe = nullptr;
+    int ret = 0;
+    if (wait_for_one) {
+        __kernel_timespec timeout;
+        timeout.tv_sec = 0;
+        timeout.tv_nsec = static_cast<long>(asyncWaitPollMicros() * 1000);
+        ret = io_uring_wait_cqe_timeout(&ring, &cqe, &timeout);
+        if (ret == -ETIME) {
+            return;
+        }
+    } else {
+        ret = io_uring_peek_cqe(&ring, &cqe);
+    }
+    while (ret == 0) {
+        processAsyncReadCompletion(this, cqe);
+
+        io_uring_cqe_seen(&ring, cqe);
+        ret = io_uring_peek_cqe(&ring, &cqe);
     }
 }
 
@@ -340,13 +958,20 @@ double envOrDouble(const char* env, double value) {
     return value;
 }
 
+static bool ignorePidAllocator() {
+    static const bool enabled = envOr("IGNORE_PID_ALLOCATOR", 0) != 0;
+    return enabled;
+}
+
 BufferManager::BufferManager(unsigned nthreads)
     : virtSize(envOr("VIRTGB", 16) * gb),
       physSize(envOrF("PHYSGB", 4) * gb),
       virtCount(virtSize / pageSize),
       physCount(physSize / pageSize),
-      residentSet(physCount) {
-    numThreads = nthreads;
+      residentSet(physCount * 2) {
+    // `calico_oltp_query` constructs BufferManager with the default constructor.
+    // Honor THREADS from env here so hash table specialization matches runtime worker count.
+    numThreads = std::max(1u, static_cast<unsigned>(envOr("THREADS", nthreads)));
     assert(virtSize >= physSize);
     const char* path = getenv("BLOCK") ? getenv("BLOCK") : "./heapfile";
     blockfd = open(path, O_RDWR | O_DIRECT, S_IRWXU);
@@ -357,6 +982,7 @@ BufferManager::BufferManager(unsigned nthreads)
 
     useTraditional = envOr("TRADITIONAL", 0);
     useExmap = (!useTraditional) && envOr("EXMAP", 0);
+    useIOUring = !useExmap && envOr("USE_IOURING", 1);
     u64 tradHashSetting = useTraditional ? envOr("TRADHASH", 0) : 0;
     if (!useTraditional)
         hashMode = HashMode::Array1Access;
@@ -372,13 +998,15 @@ BufferManager::BufferManager(unsigned nthreads)
         hashMode = HashMode::Array2Level;
     else if (tradHashSetting == 6)
         hashMode = HashMode::Array3Level;
+    else if (tradHashSetting == 7)
+        hashMode = HashMode::RobinHood;
     else
         hashMode = HashMode::Array1Access;
     PageState::setPackedMode(hashMode == HashMode::Array1Access || hashMode == HashMode::Array2Level || hashMode == HashMode::Array3Level);
     virtMem = nullptr;
     frameMem = nullptr;
     bool disableHugePageForFrameMem = envOr("NOHUGEPAGE_FRAME_MEM", 0);
-    bool disableHugePageForTranslationArray = envOr("NOHUGEPAGE_TRANSLATION_ARRAY", 1);
+    bool disableHugePageForTranslationArray = envOr("NOHUGEPAGE_TRANSLATION_ARRAY", 0);
 
     u64 virtAllocSize = virtSize + (1 << 16);  // guard space for optimistic reads
 
@@ -388,22 +1016,14 @@ BufferManager::BufferManager(unsigned nthreads)
         if (disableHugePageForFrameMem) {
             madvise(frameMem, physCount * sizeof(Page), MADV_NOHUGEPAGE);
         }
-        partitionFrameSpan =
-            std::max<u32>(1, static_cast<u32>((physCount + freePartitionCount - 1) / freePartitionCount));
-        for (u32 i = 0; i < freePartitionCount; i++) {
-            auto& partition = freePartitions[i];
-            partition.lock.clear(std::memory_order_relaxed);
-            partition.frames.clear();
-            u32 start = i * partitionFrameSpan;
-            if (start >= physCount) continue;
-            u32 end = std::min<u32>(start + partitionFrameSpan, physCount);
-            partition.frames.reserve(end - start);
-            // Reserve frame 0 as invalid marker - start from frame 1
-            u32 frameStart = (start == 0) ? 1 : start;
-            for (u32 frame = frameStart; frame < end; frame++) partition.frames.push_back(frame);
-            //if (!partition.frames.empty()) std::random_shuffle(partition.frames.begin(), partition.frames.end());
-            std::reverse(partition.frames.begin(), partition.frames.end());
-            partition.top = partition.frames.size();
+        std::vector<u32> initial_free_frames;
+        initial_free_frames.reserve(physCount > 0 ? physCount - 1 : 0);
+        for (u32 frame = 1; frame < physCount; ++frame) {
+            initial_free_frames.push_back(frame);
+        }
+        if (!initial_free_frames.empty()) {
+            freeFrameQueue.enqueue_bulk(initial_free_frames.data(), initial_free_frames.size());
+            memset(frameMem, 0, physCount * sizeof(Page));
         }
         frameToPidArray.reset(new std::atomic<PID>[physCount]);
         for (u64 i = 0; i < physCount; i++) frameToPidArray[i].store(invalidPID, std::memory_order_relaxed);
@@ -426,7 +1046,7 @@ BufferManager::BufferManager(unsigned nthreads)
             frameToPidHash.reset();
         } else {
             if (hashMode == HashMode::Unordered) {
-                if (numThreads == -1) {
+                if (numThreads > 1) {
                     pidToFrameHash = std::make_unique<ShardedUnorderedMap<PID, u64>>();
                     frameToPidHash = std::make_unique<ShardedUnorderedMap<u64, PID>>();
                 } else {
@@ -434,12 +1054,20 @@ BufferManager::BufferManager(unsigned nthreads)
                     frameToPidHash = std::make_unique<ShardedUnorderedMap<u64, PID, 1>>();
                 }
             } else if (hashMode == HashMode::OpenAddress) {
-                if (numThreads == -1) {
+                if (numThreads > 1) {
                     pidToFrameHash = std::make_unique<ShardedOpenAddressMap<PID, u64>>();
                     frameToPidHash = std::make_unique<ShardedOpenAddressMap<u64, PID>>();
                 } else {
                     pidToFrameHash = std::make_unique<ShardedOpenAddressMap<PID, u64, 1>>();
                     frameToPidHash = std::make_unique<ShardedOpenAddressMap<u64, PID, 1>>();
+                }
+            } else if (hashMode == HashMode::RobinHood) {
+                if (numThreads > 1) {
+                    pidToFrameHash = std::make_unique<ShardedRobinHoodMap<PID, u64>>();
+                    frameToPidHash = std::make_unique<ShardedRobinHoodMap<u64, PID>>();
+                } else {
+                    pidToFrameHash = std::make_unique<ShardedRobinHoodMap<PID, u64, 1>>();
+                    frameToPidHash = std::make_unique<ShardedRobinHoodMap<u64, PID, 1>>();
                 }
             } else if (hashMode == HashMode::Lockfree) {
                 pidToFrameHash = std::make_unique<LockFreeHashMap<PID, u64>>();
@@ -451,7 +1079,6 @@ BufferManager::BufferManager(unsigned nthreads)
             pidToFrameHash->reserve(physCount * 1.5);
             frameToPidHash->reserve(physCount);
         }
-        // round robin cursors will skip empty partitions automatically
     } else {
         if (useExmap) {
             exmapfd = open("/dev/exmap", O_RDWR);
@@ -510,9 +1137,13 @@ BufferManager::BufferManager(unsigned nthreads)
     // Set NOHUGEPAGE_TRANSLATION_ARRAY=1 to disable huge pages and enable fine-grained hole-punching
     translationOSPageSize = (disableHugePageForTranslationArray && useTraditional) ? 4096 : (2 * 1024 * 1024);
     
+    // Translation refcount/hole-punching can add noticeable overhead on OOM miss paths.
+    // Keep it opt-in for throughput experiments.
+    enableTranslationRefCount = envOr("TRANSLATION_REFCOUNT", 0);
+    numRefCountGroups = 0;
     // Initialize reference counting for hole-punching (Array1Access mode only)
     translationRefCounts = nullptr;
-    if (hashMode == HashMode::Array1Access && useTraditional) {
+    if (enableTranslationRefCount && hashMode == HashMode::Array1Access && useTraditional) {
         // Each OS page holds translationOSPageSize/sizeof(PageState) translation entries
         u64 entriesPerOSPage = translationOSPageSize / sizeof(PageState);
         numRefCountGroups = (virtCount + entriesPerOSPage - 1) / entriesPerOSPage;
@@ -533,7 +1164,50 @@ BufferManager::BufferManager(unsigned nthreads)
     readCount = 0;
     writeCount = 0;
     holePunchCount = 0;
+    asyncSubmitCount = 0;
+    asyncCoalescedCount = 0;
+    asyncGuardWaitCount = 0;
+    asyncSyncFaultCount = 0;
+    asyncFailedCompletionCount = 0;
+    asyncCompletionCount = 0;
+    asyncSubmitBackpressureCount = 0;
+    asyncSlowWaitCount = 0;
+    asyncInFlightCurrent = 0;
+    asyncInFlightPeak = 0;
+    asyncInFlightWeightedMicros = 0;
+    asyncInFlightStartMicros = 0;
+    asyncInFlightLastTransitionMicros = 0;
+    nextAsyncReadToken = 1;
     batch = envOr("BATCH", 64);
+
+    //if (useIOUring) {
+        const u64 async_request_capacity = useTraditional ? physCount : IOUringInterface::queueDepth;
+        asyncReadRequests = std::make_unique<AsyncReadRequest[]>(async_request_capacity);
+        for (u64 i = 0; i < async_request_capacity; ++i) {
+            asyncReadRequests[i].reset();
+        }
+        if (!useTraditional) {
+            pidToAsyncRequestSlot = std::make_unique<std::atomic<u32>[]>(virtCount);
+            std::vector<u32> initial_async_slots;
+            initial_async_slots.reserve(async_request_capacity);
+            for (u64 i = 0; i < virtCount; ++i) {
+                pidToAsyncRequestSlot[i].store(invalidAsyncRequestSlot, std::memory_order_relaxed);
+            }
+            for (u32 slot = 0; slot < async_request_capacity; ++slot) {
+                initial_async_slots.push_back(slot);
+            }
+            if (!initial_async_slots.empty()) {
+                freeAsyncRequestSlotQueue.enqueue_bulk(initial_async_slots.data(), initial_async_slots.size());
+            }
+        }
+
+        const u64 configured_interfaces = envOr("IOURING_INTERFACES", numThreads);
+        const u64 interface_count = std::max<u64>(1, configured_interfaces);
+        ioUringInterfaces.reserve(interface_count);
+        for (u64 i = 0; i < interface_count; ++i) {
+            ioUringInterfaces.push_back(std::make_unique<IOUringInterface>(blockfd, this));
+        }
+    // }
 
     std::string translation_specialization = "general";
     #ifdef CALICO_SPECIALIZATION_CALICO
@@ -547,7 +1221,11 @@ BufferManager::BufferManager(unsigned nthreads)
          << " traditional:" << useTraditional << " mmap_os_pagecache:" << useMmapOSPageacche
          << " trad_hash:" << static_cast<int>(hashMode) << " exmap:" << useExmap << " hugepage: " << (disableHugePageForFrameMem == 0)
          << " hugepage for translation array: " << (disableHugePageForTranslationArray == 0)
+         << " translation_refcount:" << enableTranslationRefCount
+            << " use_io_uring:" << useIOUring
          << " num_threads:" << numThreads 
+            << " ignore_pid_allocator:" << ignorePidAllocator()
+            << " page_state_size:" << sizeof(PageState)
          << " translation_specialization:" << translation_specialization
          << endl;
 }
@@ -589,18 +1267,39 @@ BufferManager::~BufferManager() {
 
     // print hole punch count
     std::cerr << "[BufferManager] Total hole punches (madvise count): " << holePunchCount << std::endl;
+    if constexpr (kEnableAsyncPrefetchStats) {
+        const u64 async_summary_micros = monotonicMicros();
+        std::cerr << "[BufferManager] Async reads submitted=" << asyncSubmitCount.load(std::memory_order_relaxed)
+                  << " coalesced=" << asyncCoalescedCount.load(std::memory_order_relaxed)
+                  << " guard_waits=" << asyncGuardWaitCount.load(std::memory_order_relaxed)
+                  << " completions=" << asyncCompletionCount.load(std::memory_order_relaxed)
+                  << " submit_backpressure=" << asyncSubmitBackpressureCount.load(std::memory_order_relaxed)
+                  << " slow_waits=" << asyncSlowWaitCount.load(std::memory_order_relaxed)
+                  << " avg_inflight=" << averageAsyncInFlightIO(async_summary_micros)
+                  << " peak_inflight=" << asyncInFlightPeak.load(std::memory_order_relaxed)
+                  << " sync_fallback_faults=" << asyncSyncFaultCount.load(std::memory_order_relaxed)
+                  << " failed_completions=" << asyncFailedCompletionCount.load(std::memory_order_relaxed)
+                  << std::endl;
+    }
     // 
 }
 
+bool BufferManager::asyncReadEnabled() const { return useIOUring; }
+
 IOInterface& BufferManager::getIOInterface() {
-    static bool useIOUring = envOr("USE_IOURING", 0);
-    // if (useIOUring) {
-    //     thread_local IOUringInterface instance(blockfd, this);
-    //     return instance;
-    // } else {
-    //     thread_local LibaioInterface instance(blockfd, this);
-    //     return instance;
-    // }
+        // const size_t interface_count = ioUringInterfaces.size();
+        // const size_t interface_idx = interface_count == 1
+        //                                  ? 0
+        //                                  : (std::hash<std::thread::id>{}(std::this_thread::get_id()) % interface_count);
+        
+        // return *ioUringInterfaces[interface_idx];
+    if (asyncReadEnabled()) {
+        const size_t interface_count = ioUringInterfaces.size();
+        const size_t interface_idx = interface_count == 1
+                                         ? 0
+                                         : (std::hash<std::thread::id>{}(std::this_thread::get_id()) % interface_count);
+        return *ioUringInterfaces[interface_idx];
+    }
     thread_local LibaioInterface instance(blockfd, this);
     return instance;
 }
@@ -621,10 +1320,12 @@ PID BufferManager::toPID(void* page) {
             assert(pid != invalidPID);
             return pid;
         } else {
+            // Keep retrying until hash translation entry is visible.
             PID pid;
-            bool ok = frameToPidHash->tryGet(static_cast<u64>(idx), pid);
-            assert(ok);
-            return pid;
+            for (u64 repeatCounter = 0;; ++repeatCounter) {
+                if (frameToPidHash->tryGet(static_cast<u64>(idx), pid)) return pid;
+                yield(repeatCounter);
+            }
         }
     }
     return ptr - virtMem;
@@ -653,12 +1354,16 @@ Page* BufferManager::residentPtrCalico(PID pid, u64 stateAndVersion) {
 }
 
 Page* BufferManager::residentPtrHash(PID pid, u64 stateAndVersion) {
-    // Specialized for hash table lookup - ignores stateAndVersion
+    // Specialized for hash table lookup.
+    // IMPORTANT: in release builds assert() is compiled out, so never rely on
+    // uninitialized `frame` after a failed lookup.
     u64 frame;
-    bool ok = pidToFrameHash->tryGet(pid, frame);
-    assert(ok);
-    assert(frame < physCount);
-    return frameMem + static_cast<size_t>(frame);
+    for (u64 repeatCounter = 0;; ++repeatCounter) {
+        if (pidToFrameHash->tryGet(pid, frame)) {
+            if (frame < physCount) return frameMem + static_cast<size_t>(frame);
+        }
+        yield(repeatCounter);
+    }
 }
 
 Page* BufferManager::residentPtr(PID pid, u64 stateAndVersion) {
@@ -686,11 +1391,7 @@ Page* BufferManager::residentPtr(PID pid, u64 stateAndVersion) {
         return frameMem + static_cast<size_t>(frame);
     }
 
-    u64 frame;
-    bool ok = pidToFrameHash->tryGet(pid, frame);
-    assert(ok);
-    assert(frame < physCount);
-    return frameMem + static_cast<size_t>(frame);
+    return residentPtrHash(pid, stateAndVersion);
 }
 
 Page* BufferManager::toPtr(PID pid) { return residentPtr(pid); }
@@ -701,32 +1402,293 @@ Page* BufferManager::preparePageForWrite(PID pid) {
     return page;
 }
 
-static thread_local u32 freePartitionCursor = []() -> u32 {
-    auto h = std::hash<std::thread::id>{}(std::this_thread::get_id());
-    return static_cast<u32>(h % BufferManager::freePartitionCount);
-}();
+u64 BufferManager::resolveMappedFrame(PID pid, u64 stateAndVersion) {
+    if (!useTraditional) {
+        return invalidFrame;
+    }
 
-u32 BufferManager::popFreeFrame() {
-    for (u32 attempt = 0; attempt < freePartitionCount; ++attempt) {
-        u32 partition = (freePartitionCursor + attempt) % freePartitionCount;
-        auto& part = freePartitions[partition];
-        if (part.frames.empty()) continue;
+    if (hashMode == HashMode::Array1Access || hashMode == HashMode::Array2Level || hashMode == HashMode::Array3Level) {
+        return PageState::extractFrame(stateAndVersion);
+    }
+    if (hashMode == HashMode::Array) {
+        return pidToFrameArray[pid].load(std::memory_order_acquire);
+    }
 
-        lockPartition(partition);
-        if (part.top > 0) {
-            u32 frame = part.frames[--part.top];
-            unlockPartition(partition);
-            freePartitionCursor = (partition + 1) % freePartitionCount;
+    u64 frame = invalidFrame;
+    for (u64 repeatCounter = 0;; ++repeatCounter) {
+        if (pidToFrameHash->tryGet(pid, frame)) {
             return frame;
         }
-        unlockPartition(partition);
+        yield(repeatCounter);
     }
-    throw std::runtime_error("no free frames available");
 }
 
-Page* BufferManager::acquireFrameForPid(PID pid) {
+u32 BufferManager::resolveAsyncRequestSlot(PID pid, u64 stateAndVersion) {
+    if (useTraditional) {
+        const u64 frame = resolveMappedFrame(pid, stateAndVersion);
+        return frame == invalidFrame ? invalidAsyncRequestSlot : static_cast<u32>(frame);
+    }
+    return pidToAsyncRequestSlot[pid].load(std::memory_order_acquire);
+}
+
+void BufferManager::releaseAsyncRequestSlot(PID pid, u32 slot) {
+    if (slot == invalidAsyncRequestSlot) {
+        return;
+    }
+
+    if (!useTraditional) {
+        const u32 previous = pidToAsyncRequestSlot[pid].exchange(invalidAsyncRequestSlot, std::memory_order_acq_rel);
+        if (previous != slot) {
+            throw std::runtime_error("async request slot mismatch");
+        }
+        asyncReadRequests[slot].reset();
+        const bool enqueued = freeAsyncRequestSlotQueue.enqueue(slot);
+        if (!enqueued) {
+            throw std::runtime_error("failed to enqueue async request slot");
+        }
+        return;
+    }
+
+    asyncReadRequests[slot].reset();
+}
+
+bool BufferManager::finalizeCompletedAsyncRead(PID pid, u32 slot) {
+    if (slot == invalidAsyncRequestSlot) {
+        return false;
+    }
+
+    PageState& ps = getPageState(pid);
+    for (u64 repeatCounter = 0;; ++repeatCounter) {
+        u64 current = ps.stateAndVersion.load(std::memory_order_acquire);
+        const u64 state = PageState::getState(current);
+        if (state == PageState::ReadInFlight) {
+            const u64 unlocked = PageState::sameVersion(current, PageState::Unlocked);
+            if (ps.stateAndVersion.compare_exchange_weak(current, unlocked, std::memory_order_acq_rel,
+                                                         std::memory_order_acquire)) {
+                residentSet.insert(pid);
+                releaseAsyncRequestSlot(pid, slot);
+                return true;
+            }
+            yield(repeatCounter);
+            continue;
+        }
+
+        return PageState::isResidentState(current);
+    }
+}
+
+void BufferManager::rollbackFailedAsyncRead(PID pid, u64 stateAndVersion) {
+    PageState& ps = getPageState(pid);
+    for (u64 repeatCounter = 0;; ++repeatCounter) {
+        u64 current = ps.stateAndVersion.load(std::memory_order_acquire);
+        const u64 state = PageState::getState(current);
+        if (state == PageState::Evicted) {
+            return;
+        }
+        if (state != PageState::ReadInFlight) {
+            return;
+        }
+
+        const u64 locked = PageState::sameVersion(current, PageState::Locked);
+        if (ps.stateAndVersion.compare_exchange_weak(current, locked, std::memory_order_acq_rel,
+                                                     std::memory_order_acquire)) {
+            const u32 request_slot = resolveAsyncRequestSlot(pid, locked);
+            if (request_slot != invalidAsyncRequestSlot) {
+                auto* owner_interface = reinterpret_cast<IOUringInterface*>(
+                    asyncReadRequests[request_slot].ownerInterface.load(std::memory_order_acquire));
+                logAsyncRequestSnapshot("rollback_failed", asyncReadRequests[request_slot], owner_interface);
+            }
+            releaseFrame(pid);
+            releaseAsyncRequestSlot(pid, request_slot);
+            if (!(useTraditional && hashMode == HashMode::Array1Access && translationRefCounts)) {
+                ps.unlockXEvicted();
+            }
+            physUsedCount.fetch_sub(1, std::memory_order_relaxed);
+            if constexpr (kEnableAsyncPrefetchStats) {
+                asyncFailedCompletionCount.fetch_add(1, std::memory_order_relaxed);
+            }
+            return;
+        }
+        yield(repeatCounter);
+    }
+}
+
+Page* BufferManager::waitForPendingRead(PID pid, u64 stateAndVersion, u64* resolvedVersion) {
+    if (PageState::getState(stateAndVersion) != PageState::ReadInFlight) {
+        if (resolvedVersion != nullptr) {
+            *resolvedVersion = stateAndVersion;
+        }
+        return nullptr;
+    }
+
+    PageState& ps = getPageState(pid);
+    const u64 currentStateAndVersion = ps.stateAndVersion.load(std::memory_order_acquire);
+    if (PageState::getState(currentStateAndVersion) != PageState::ReadInFlight) {
+        if (resolvedVersion != nullptr) {
+            *resolvedVersion = currentStateAndVersion;
+        }
+        return nullptr;
+    }
+
+    const u32 request_slot = resolveAsyncRequestSlot(pid, currentStateAndVersion);
+    if (request_slot == invalidAsyncRequestSlot) {
+        if (resolvedVersion != nullptr) {
+            *resolvedVersion = currentStateAndVersion;
+        }
+        return nullptr;
+    }
+
+    AsyncReadRequest& request = asyncReadRequests[request_slot];
+    if (request.pid.load(std::memory_order_acquire) != pid ||
+        request.status.load(std::memory_order_acquire) == AsyncReadRequest::Idle) {
+        if (resolvedVersion != nullptr) {
+            *resolvedVersion = ps.stateAndVersion.load(std::memory_order_acquire);
+        }
+        return nullptr;
+    }
+
+    if constexpr (kEnableAsyncPrefetchStats) {
+        asyncGuardWaitCount.fetch_add(1, std::memory_order_relaxed);
+    }
+    IOInterface* owner_interface = reinterpret_cast<IOInterface*>(
+        request.ownerInterface.load(std::memory_order_acquire));
+    if (owner_interface != nullptr) {
+        owner_interface->waitForAsyncRead(request);
+    } else {
+        getIOInterface().waitForAsyncRead(request);
+    }
+
+    for (u64 repeatCounter = 0;; ++repeatCounter) {
+        u64 current = ps.stateAndVersion.load(std::memory_order_acquire);
+        const u64 state = PageState::getState(current);
+        if (state == PageState::ReadInFlight) {
+            if (request.status.load(std::memory_order_acquire) == AsyncReadRequest::Failed ||
+                request.result.load(std::memory_order_acquire) != static_cast<int>(pageSize)) {
+                rollbackFailedAsyncRead(pid, current);
+                const u64 reloaded = ps.stateAndVersion.load(std::memory_order_acquire);
+                if (resolvedVersion != nullptr) {
+                    *resolvedVersion = reloaded;
+                }
+                return nullptr;
+            }
+            const u64 unlocked = PageState::sameVersion(current, PageState::Unlocked);
+            if (ps.stateAndVersion.compare_exchange_weak(current, unlocked, std::memory_order_acq_rel,
+                                                         std::memory_order_acquire)) {
+                residentSet.insert(pid);
+                releaseAsyncRequestSlot(pid, request_slot);
+                if (resolvedVersion != nullptr) {
+                    *resolvedVersion = unlocked;
+                }
+#if defined(CALICO_SPECIALIZATION_CALICO)
+                return residentPtrCalico(pid, unlocked);
+#elif defined(CALICO_SPECIALIZATION_HASH)
+                return residentPtrHash(pid, unlocked);
+#else
+                return residentPtr(pid, unlocked);
+#endif
+            }
+            continue;
+        }
+
+        if (resolvedVersion != nullptr) {
+            *resolvedVersion = current;
+        }
+        if (!PageState::isResidentState(current)) {
+            return nullptr;
+        }
+
+#if defined(CALICO_SPECIALIZATION_CALICO)
+        return residentPtrCalico(pid, current);
+#elif defined(CALICO_SPECIALIZATION_HASH)
+        return residentPtrHash(pid, current);
+#else
+        return residentPtr(pid, current);
+#endif
+        yield(repeatCounter);
+    }
+}
+
+Page* BufferManager::resolveOptimisticRead(PID pid, u64& version) {
+    PageState& ps = getPageState(pid);
+    for (u64 repeatCounter = 0;; ++repeatCounter) {
+        u64 v = ps.stateAndVersion.load(std::memory_order_acquire);
+        switch (PageState::getState(v)) {
+            case PageState::Marked: {
+                const u64 newV = PageState::sameVersion(v, PageState::Unlocked);
+                if (ps.stateAndVersion.compare_exchange_weak(v, newV, std::memory_order_acq_rel,
+                                                             std::memory_order_acquire)) {
+                    version = newV;
+#if defined(CALICO_SPECIALIZATION_CALICO)
+                    return residentPtrCalico(pid, newV);
+#elif defined(CALICO_SPECIALIZATION_HASH)
+                    return residentPtrHash(pid, newV);
+#else
+                    return residentPtr(pid, newV);
+#endif
+                }
+                break;
+            }
+            case PageState::Locked:
+                break;
+            case PageState::ReadInFlight: {
+                if (Page* page = waitForPendingRead(pid, v, &version)) {
+                    return page;
+                }
+                break;
+            }
+            case PageState::Evicted:
+                if (ps.tryLockX(v)) {
+                    try {
+                        Page* page = handleFault(pid);
+                        unfixX(pid);
+                        version = ps.stateAndVersion.load(std::memory_order_acquire);
+                        (void)page;
+#if defined(CALICO_SPECIALIZATION_CALICO)
+                        return residentPtrCalico(pid, version);
+#elif defined(CALICO_SPECIALIZATION_HASH)
+                        return residentPtrHash(pid, version);
+#else
+                        return residentPtr(pid, version);
+#endif
+                    } catch (...) {
+                        ps.unlockXEvicted();
+                        throw;
+                    }
+                }
+                break;
+            default:
+                version = v;
+#if defined(CALICO_SPECIALIZATION_CALICO)
+                return residentPtrCalico(pid, v);
+#elif defined(CALICO_SPECIALIZATION_HASH)
+                return residentPtrHash(pid, v);
+#else
+                return residentPtr(pid, v);
+#endif
+        }
+        yield(repeatCounter);
+    }
+}
+
+u32 BufferManager::popFreeFrame(bool allow_eviction) {
+    u32 frame = 0;
+    for (u64 repeatCounter = 0;; ++repeatCounter) {
+        if (freeFrameQueue.try_dequeue(frame)) return frame;
+
+        // No free frame available right now; force an eviction attempt and retry.
+        if (allow_eviction) {
+            evict();
+        } else {
+            return 0;
+        }
+        // yield(repeatCounter);
+    }
+}
+
+Page* BufferManager::acquireFrameForPid(PID pid, bool allow_eviction) {
     if (!useTraditional) return virtMem + pid;
-    u32 frame = popFreeFrame();
+    u32 frame = popFreeFrame(allow_eviction);
+    if (frame == 0) return nullptr;
     if (hashMode == HashMode::Array) {
         //pthread_rwlock_wrlock(&pid_locks[pid_lock_shard(pid)]);
         pidToFrameArray[pid].store(static_cast<u64>(frame), std::memory_order_release);
@@ -780,9 +1742,9 @@ void BufferManager::releaseFrame(PID pid) {
         frameId = pidToFrameArray[pid].exchange(invalidFrame, std::memory_order_acq_rel);
         assert(frameId != invalidFrame);
         frameToPidArray[static_cast<size_t>(frameId)].store(invalidPID, std::memory_order_release);
-    } else if (hashMode == HashMode::Array1Access || hashMode == HashMode::Array2Level) {
+    } else if (hashMode == HashMode::Array1Access || hashMode == HashMode::Array2Level || hashMode == HashMode::Array3Level) {
         //pthread_rwlock_wrlock(&pid_locks[pid_lock_shard(pid)]);
-        frameId = pageState[pid].getFrameValue();
+        frameId = getPageState(pid).getFrameValue();
         assert(frameId != PageState::packedInvalidFrame);
         getPageState(pid).clearFrameValue();
         frameToPidArray[static_cast<size_t>(frameId)].store(invalidPID, std::memory_order_release);
@@ -840,35 +1802,22 @@ void BufferManager::releaseFrame(PID pid) {
     } else {
         bool ok = pidToFrameHash->erase(pid, frameId);
         assert(ok);
+        static_cast<void>(ok);
         PID ignored;
         bool ok2 = frameToPidHash->erase(frameId, ignored);
         assert(ok2);
+        static_cast<void>(ok2);
     }
 
     assert(frameId < physCount);
     u32 frameIdx = static_cast<u32>(frameId);
-    u32 partition = partitionForFrame(frameId);
-    auto& part = freePartitions[partition];
-    lockPartition(partition);
-    assert(part.top < part.frames.size());
-    part.frames[part.top++] = frameIdx;
-    unlockPartition(partition);
+    if (!freeFrameQueue.enqueue(frameIdx)) {
+        throw std::runtime_error("failed to enqueue free frame");
+    }
 }
-
-u32 BufferManager::partitionForFrame(u64 frame) const {
-    if (partitionFrameSpan == 0) return 0;
-    u32 partition = static_cast<u32>(frame / partitionFrameSpan);
-    return (partition >= freePartitionCount) ? (freePartitionCount - 1) : partition;
-}
-
-void BufferManager::lockPartition(u32 partition) {
-    while (freePartitions[partition].lock.test_and_set(std::memory_order_acquire)) _mm_pause();
-}
-
-void BufferManager::unlockPartition(u32 partition) { freePartitions[partition].lock.clear(std::memory_order_release); }
 
 void BufferManager::ensureFreePages() {
-    if (physUsedCount >= physCount * 0.95) evict();
+    if (physUsedCount * 100 >= physCount * 99.99) evict();
 }
 
 // allocated new page and fix it
@@ -876,22 +1825,22 @@ Page* BufferManager::allocPage(PIDAllocator* allocator) {
     physUsedCount++;
     ensureFreePages();
     u64 pid;
-    if (allocator) {
-        std::lock_guard<std::mutex> g(allocator->lock);
+    if (allocator && !ignorePidAllocator()) {
+        allocator->lockSpin();
         if (allocator->next >= allocator->end) {
-            // make sure the allocated range is aligned to chunkSize
-            // ensure allocCount is advanced to the next multiple of chunkSize (512)
-            u64 chunkSize = 2048;
+            static const u64 pidAllocChunkPages = std::max<u64>(1, envOr("PID_ALLOC_CHUNK_PAGES", 256));
             for (;;) {
                 u64 start = allocCount.load(std::memory_order_relaxed);
-                u64 next_aligned = ((start + 511ULL) & ~511ULL) + chunkSize; // next multiple of 512
-                if (allocCount.compare_exchange_weak(start, next_aligned, std::memory_order_acq_rel, std::memory_order_relaxed) == false) continue;
+                u64 next_aligned = ((start + pidAllocChunkPages - 1) / pidAllocChunkPages) * pidAllocChunkPages;
+                u64 next_reserved = next_aligned + pidAllocChunkPages;
+                if (allocCount.compare_exchange_weak(start, next_reserved, std::memory_order_acq_rel, std::memory_order_relaxed) == false) continue;
                 allocator->next = start;
-                allocator->end = next_aligned;
+                allocator->end = next_reserved;
                 break;
             }
         }
         pid = allocator->next++;
+        allocator->unlockSpin();
     } else {
         pid = allocCount++;
     }
@@ -903,6 +1852,7 @@ Page* BufferManager::allocPage(PIDAllocator* allocator) {
     u64 stateAndVersion = getPageState(pid).stateAndVersion;
     bool succ = getPageState(pid).tryLockX(stateAndVersion);
     assert(succ);
+    static_cast<void>(succ);
     Page* page = acquireFrameForPid(pid);
 
     if (useExmap) {
@@ -943,8 +1893,11 @@ void BufferManager::updateAllocCountSnapshot(u64 latest_alloc) {
 }
 
 Page* BufferManager::handleFault(PID pid) {
+    if constexpr (kEnableAsyncPrefetchStats) {
+        asyncSyncFaultCount.fetch_add(1, std::memory_order_relaxed);
+    }
     physUsedCount++;
-    //ensureFreePages();
+    ensureFreePages();
     Page* page = acquireFrameForPid(pid);
     readPage(pid, page);
     residentSet.insert(pid);
@@ -975,11 +1928,14 @@ Page* BufferManager::fixX(PID pid) {
         } else {
             // Original vmcache or traditional mode logic
             switch (state) {
+                case PageState::ReadInFlight: {
+                    waitForPendingRead(pid, stateAndVersion, nullptr);
+                    break;
+                }
                 case PageState::Evicted: {
                     if (ps.tryLockX(stateAndVersion)) {
                         try {
                             Page* page = handleFault(pid);
-                            ensureFreePages();
                             return page;
                         } catch (...) {
                             // Unlock page on failure to prevent livelock
@@ -1038,6 +1994,10 @@ Page* BufferManager::fixS(PID pid) {
         } else {
             // Original vmcache or traditional mode logic
             switch (state) {
+                case PageState::ReadInFlight: {
+                    waitForPendingRead(pid, stateAndVersion, nullptr);
+                    break;
+                }
                 case PageState::Locked: {
                     break;
                 }
@@ -1046,7 +2006,6 @@ Page* BufferManager::fixS(PID pid) {
                         try {
                             handleFault(pid);
                             ps.unlockX();
-                            ensureFreePages();
                         } catch (...) {
                             // Unlock page on failure to prevent livelock
                             ps.unlockXEvicted();
@@ -1095,6 +2054,7 @@ void BufferManager::readPage(PID pid, Page* dest) {
     } else {
         int ret = pread(blockfd, dest, pageSize, pid * pageSize);
         assert(ret == pageSize);
+        static_cast<void>(ret);
         dest->dirty = false;
         readCount++;
     }
@@ -1139,6 +2099,10 @@ void BufferManager::flushAll() {
             if (state == PageState::Evicted) {
                 break;
             }
+            if (state == PageState::ReadInFlight) {
+                waitForPendingRead(pid, state_and_version, nullptr);
+                continue;
+            }
             if (state == PageState::Locked) {
                 yield(repeatCounter);
                 continue;
@@ -1178,19 +2142,49 @@ void BufferManager::evict() {
     vector<PID> toWrite;
     toWrite.reserve(batch);
 
+    u64 tries = 0;
+    u64 selected = 0;
     // 0. find candidates, lock dirty ones in shared mode
-    while (toEvict.size() + toWrite.size() < batch) {
+    //while (toEvict.size() + toWrite.size() < batch) {
+    while (selected < batch && tries < 10000){
+        tries += 1;
         residentSet.iterateClockBatch(batch, [&](PID pid) {
+            if (selected >= batch) {
+                return;
+            }
             PageState& ps = getPageState(pid);
             u64 v = ps.stateAndVersion;
             switch (PageState::getState(v)) {
-                case PageState::Marked:
-                    if (residentPtr(pid)->dirty) {
-                        if (ps.tryLockS(v)) toWrite.push_back(pid);
-                    } else {
-                        toEvict.push_back(pid);
+                case PageState::Marked: {
+                    // Acquire S-lock before touching page contents. Without this,
+                    // concurrent eviction can clear hash translation and make
+                    // residentPtrHash observe a transient miss.
+                    if (ps.tryLockS(v)) {
+                        u64 sharedStateAndVersion = PageState::sameVersion(v, PageState::SharedBase);
+#if defined(CALICO_SPECIALIZATION_CALICO)
+                        Page* page_ptr = residentPtrCalico(pid, sharedStateAndVersion);
+#elif defined(CALICO_SPECIALIZATION_HASH)
+                        Page* page_ptr = residentPtrHash(pid, sharedStateAndVersion);
+#else
+                        Page* page_ptr = residentPtr(pid, sharedStateAndVersion);
+#endif
+                        if (page_ptr->dirty) {
+                            toWrite.push_back(pid);
+                            selected++;
+                        } else {
+                            // Upgrade single-reader shared lock to X lock in place.
+                            u64 expectedShared = sharedStateAndVersion;
+                            if (ps.stateAndVersion.compare_exchange_weak(
+                                    expectedShared, PageState::sameVersion(sharedStateAndVersion, PageState::Locked))) {
+                                toEvict.push_back(pid);
+                                selected++;
+                            } else {
+                                ps.unlockS();
+                            }
+                        }
                     }
                     break;
+                }
                 case PageState::Unlocked:
                     ps.tryMark(v);
                     break;
@@ -1211,7 +2205,10 @@ void BufferManager::evict() {
                                  [&](PID pid) {
                                      PageState& ps = getPageState(pid);
                                      u64 v = ps.stateAndVersion;
-                                     return (PageState::getState(v) != PageState::Marked) || !ps.tryLockX(v);
+                                     u64 state = PageState::getState(v);
+                                     if (state == PageState::Locked) return false;  // Already locked in phase 0.
+                                     if (state != PageState::Marked) return true;
+                                     return !ps.tryLockX(v);
                                  }),
                   toEvict.end());
 
@@ -1219,7 +2216,7 @@ void BufferManager::evict() {
     for (auto& pid : toWrite) {
         PageState& ps = getPageState(pid);
         u64 v = ps.stateAndVersion;
-        if ((PageState::getState(v) == 1) &&
+        if ((PageState::getState(v) == PageState::SharedBase) && // single shared reader
             ps.stateAndVersion.compare_exchange_weak(v, PageState::sameVersion(v, PageState::Locked)))
             toEvict.push_back(pid); // there were no new readers joined during the write-back, let's evict the page
         else
@@ -1244,6 +2241,7 @@ void BufferManager::evict() {
         }
         bool succ = residentSet.remove(pid);
         assert(succ);
+        static_cast<void>(succ);
         if (useTraditional && hashMode == HashMode::Array1Access && translationRefCounts) {
             // unlockXEvicted has been handled in releaseFrame for hole-punching case
         } else {
@@ -1255,6 +2253,151 @@ void BufferManager::evict() {
     physUsedCount -= toEvict.size();
 }
 
+bool BufferManager::submitAsyncPrefetch(PID pid) {
+    submitAsyncPrefetchPages(&pid, 1, nullptr);
+    const u64 stateAndVersion = getPageState(pid).stateAndVersion.load(std::memory_order_acquire);
+    return PageState::getState(stateAndVersion) == PageState::ReadInFlight;
+}
+
+void BufferManager::submitAsyncPrefetchPages(const PID* pages, int n_pages, const u32* offsets_within_pages) {
+    //if (!asyncReadEnabled()) {
+        prefetchPages(pages, n_pages, offsets_within_pages);
+        return;
+    //}
+
+    if (!useTraditional || hashMode == HashMode::Array1Access) {
+        for (int i = 0; i < n_pages; ++i) {
+            PageState& ps = pageState[pages[i]];
+            _mm_prefetch(reinterpret_cast<const char*>(&ps), _MM_HINT_T0);
+        }
+    }
+
+    std::vector<PID> prefetch_pids;
+    std::vector<Page*> prefetch_frames;
+    std::vector<AsyncReadRequest*> prefetch_requests;
+    std::vector<u32> prefetch_request_slots;
+    prefetch_pids.reserve(n_pages);
+    prefetch_frames.reserve(n_pages);
+    prefetch_requests.reserve(n_pages);
+    prefetch_request_slots.reserve(n_pages);
+
+    auto rollback_prefetch = [&](size_t begin_idx) {
+        for (size_t idx = begin_idx; idx < prefetch_pids.size(); ++idx) {
+            const PID pid = prefetch_pids[idx];
+            releaseFrame(pid);
+            releaseAsyncRequestSlot(pid, prefetch_request_slots[idx]);
+            if (!(useTraditional && hashMode == HashMode::Array1Access && translationRefCounts)) {
+                getPageState(pid).unlockXEvicted();
+            }
+            physUsedCount.fetch_sub(1, std::memory_order_relaxed);
+        }
+    };
+
+    for (int i = 0; i < n_pages; ++i) {
+        const PID pid = pages[i];
+        assert(pid < virtCount);
+
+        PageState& ps = getPageState(pid);
+        const u64 stateAndVersion = ps.stateAndVersion.load(std::memory_order_acquire);
+        const u64 state = PageState::getState(stateAndVersion);
+
+
+        if (PageState::isResidentState(stateAndVersion)) {
+            if (state == PageState::Locked) {
+                continue;
+            }
+            char* tmp = !useTraditional ? reinterpret_cast<char*>(virtMem + static_cast<size_t>(pid))
+                     : reinterpret_cast<char*>(frameMem + static_cast<size_t>(PageState::extractFrame(stateAndVersion)));
+            tmp += (offsets_within_pages == nullptr ? 0 : offsets_within_pages[i]);
+            _mm_prefetch(reinterpret_cast<const char*>(tmp), _MM_HINT_T0);
+            continue;
+        }
+
+        if (state == PageState::ReadInFlight) {
+            if constexpr (kEnableAsyncPrefetchStats) {
+                asyncCoalescedCount.fetch_add(1, std::memory_order_relaxed);
+            }
+            continue;
+        }
+
+        if (state != PageState::Evicted || !ps.tryLockX(stateAndVersion)) {
+            continue;
+        }
+
+        physUsedCount.fetch_add(1, std::memory_order_relaxed);
+        ensureFreePages();
+        Page* frame = acquireFrameForPid(pid);
+        u32 request_slot = invalidAsyncRequestSlot;
+        if (useTraditional) {
+            request_slot = static_cast<u32>(frame - frameMem);
+        } else if (!freeAsyncRequestSlotQueue.try_dequeue(request_slot)) {
+            releaseFrame(pid);
+            ps.unlockXEvicted();
+            physUsedCount.fetch_sub(1, std::memory_order_relaxed);
+            if constexpr (kEnableAsyncPrefetchStats) {
+                asyncSubmitBackpressureCount.fetch_add(1, std::memory_order_relaxed);
+            }
+            continue;
+        } else {
+            pidToAsyncRequestSlot[pid].store(request_slot, std::memory_order_release);
+        }
+
+        AsyncReadRequest& request = asyncReadRequests[request_slot];
+        prefetch_pids.push_back(pid);
+        prefetch_frames.push_back(frame);
+        prefetch_requests.push_back(&request);
+        prefetch_request_slots.push_back(request_slot);
+    }
+
+    if (prefetch_pids.empty()) {
+        return;
+    }
+
+    IOInterface& io_interface = getIOInterface();
+    for (size_t idx = 0; idx < prefetch_pids.size(); ++idx) {
+        AsyncReadRequest& request = *prefetch_requests[idx];
+        request.pid.store(prefetch_pids[idx], std::memory_order_release);
+        request.frame.store(useTraditional ? static_cast<u32>(prefetch_frames[idx] - frameMem) : invalidAsyncRequestSlot,
+                            std::memory_order_release);
+        request.ownerInterface.store(reinterpret_cast<uintptr_t>(&io_interface), std::memory_order_release);
+        request.token.store(nextAsyncReadToken.fetch_add(1, std::memory_order_relaxed), std::memory_order_release);
+        request.submitMicros.store(monotonicMicros(), std::memory_order_release);
+        request.completionMicros.store(0, std::memory_order_release);
+        request.lastWaitLogMicros.store(0, std::memory_order_release);
+        request.submitWorker.store(workerThreadId, std::memory_order_release);
+        request.completionWorker.store(std::numeric_limits<u32>::max(), std::memory_order_release);
+        request.waiterCount.store(0, std::memory_order_release);
+        request.result.store(0, std::memory_order_release);
+        request.status.store(AsyncReadRequest::Submitted, std::memory_order_release);
+    }
+
+    size_t submitted_begin = 0;
+    while (submitted_begin < prefetch_pids.size()) {
+        const size_t submitted =
+            io_interface.submitAsyncReads(prefetch_pids.data() + submitted_begin, prefetch_frames.data() + submitted_begin,
+                                          prefetch_requests.data() + submitted_begin,
+                                          prefetch_pids.size() - submitted_begin);
+        if (submitted == 0) {
+            break;
+        }
+
+        for (size_t idx = submitted_begin; idx < submitted_begin + submitted; ++idx) {
+            PageState& ps = getPageState(prefetch_pids[idx]);
+            const u64 lockedStateAndVersion = ps.stateAndVersion.load(std::memory_order_acquire);
+            ps.stateAndVersion.store(PageState::sameVersion(lockedStateAndVersion, PageState::ReadInFlight),
+                                     std::memory_order_release);
+            if constexpr (kEnableAsyncPrefetchStats) {
+                asyncSubmitCount.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        submitted_begin += submitted;
+    }
+
+    if (submitted_begin < prefetch_pids.size()) {
+        rollback_prefetch(submitted_begin);
+    }
+}
+
 void BufferManager::prefetchPages(const PID* pages, int n_pages, const u32* offsets_within_pages) {
     //if (!useTraditional || hashMode == HashMode::Array1Access || hashMode == HashMode::Array || hashMode == HashMode::Array2Level) {
     if (!useTraditional || hashMode == HashMode::Array1Access) {
@@ -1264,11 +2407,19 @@ void BufferManager::prefetchPages(const PID* pages, int n_pages, const u32* offs
             _mm_prefetch(reinterpret_cast<const char*>(tmp), _MM_HINT_T0);
         }
     }
-    
+
     // if (!useTraditional) {
-    //    // For mmap mode, all pages are always "resident"
-    //    return;
+    //     // In vmcache mode pages are addressed directly via virtMem, not frameMem.
+    //     for (int i = 0; i < n_pages; i++) {
+    //         PID pid = pages[i];
+    //         assert(pid < virtCount);
+    //         char* tmp = reinterpret_cast<char*>(virtMem + static_cast<size_t>(pid)) +
+    //                     (offsets_within_pages == nullptr ? 0 : offsets_within_pages[i]);
+    //         _mm_prefetch(reinterpret_cast<const char*>(tmp), _MM_HINT_T0);
+    //     }
+    //     return;
     // }
+
     // Use unique_ptr to defer allocation until we know we have pages to read
     std::unique_ptr<vector<PID>> pidsToRead;
     std::unique_ptr<vector<Page*>> destinations;
@@ -1277,19 +2428,24 @@ void BufferManager::prefetchPages(const PID* pages, int n_pages, const u32* offs
     for (int i = 0; i < n_pages; i++) {
         PID pid = pages[i];
         assert(pid < virtCount);
-        if (i + 1 < n_pages) {
-            // Prefetch next PageState
-            PageState& next_ps = getPageState(pages[i + 1]);
-            char* tmp = (char*)&next_ps;
-            _mm_prefetch(reinterpret_cast<const char*>(tmp), _MM_HINT_T0);
-        }
+        // if (i + 1 < n_pages) {
+        //     // Prefetch next PageState
+        //     PageState& next_ps = getPageState(pages[i + 1]);
+        //     char* tmp = (char*)&next_ps;
+        //     _mm_prefetch(reinterpret_cast<const char*>(tmp), _MM_HINT_T0);
+        // }
 
         //PageState& ps = getPageState(pid);
         PageState& ps = pageState[pages[i]];
         u64 stateAndVersion = ps.stateAndVersion.load(std::memory_order_acquire);
         u64 state = PageState::getState(stateAndVersion);
 
-        if (hashMode == HashMode::Lockfree || hashMode == HashMode::Unordered || hashMode == HashMode::OpenAddress) {
+        if (state == PageState::ReadInFlight) {
+            continue;
+        }
+
+        if (hashMode == HashMode::Lockfree || hashMode == HashMode::Unordered ||
+            hashMode == HashMode::OpenAddress || hashMode == HashMode::RobinHood) {
             // Double check that the page is still mapped
             u64 frame;
             if (pidToFrameHash->tryGet(pid, frame)) {
@@ -1299,14 +2455,10 @@ void BufferManager::prefetchPages(const PID* pages, int n_pages, const u32* offs
         }
 
         // Skip pages that are already in memory (not evicted)
-        if (state != PageState::Evicted) {
-            u64 frame = PageState::extractFrame(stateAndVersion);
-            // u64 v = ps.getFrameValue();
-            // u64 frame = PageState::extractFrame(v);
-            //pthread_rwlock_unlock(&pid_locks[pid_lock_shard(pid)]);
-            // assert(frame != PageState::packedInvalidFrame);
-            // assert(frame < physCount);
-            char *tmp = (char*)(frameMem + static_cast<size_t>(frame)) + (offsets_within_pages == nullptr ? 0 : offsets_within_pages[i]);
+        if (PageState::isResidentState(stateAndVersion)) {
+            char* tmp = !useTraditional ? reinterpret_cast<char*>(virtMem + static_cast<size_t>(pid))
+                     : reinterpret_cast<char*>(frameMem + static_cast<size_t>(PageState::extractFrame(stateAndVersion)));
+            tmp += (offsets_within_pages == nullptr ? 0 : offsets_within_pages[i]);
             _mm_prefetch(reinterpret_cast<const char*>(tmp), _MM_HINT_T0);
             // if (offsets_within_pages != nullptr) {
             //       // Touch the page to bring it into cache
@@ -1319,9 +2471,10 @@ void BufferManager::prefetchPages(const PID* pages, int n_pages, const u32* offs
 
         // Lock the page first before allocating frame
         if (ps.tryLockX(stateAndVersion)) {
-            ensureFreePages();
+            if (!useTraditional)
+                ensureFreePages();
             // Try to acquire a frame for this page
-            Page* frame = acquireFrameForPid(pid);
+            Page* frame = acquireFrameForPid(pid, false);
             if (frame != nullptr) {
                 // Allocate vectors only when we have the first page to read
                 if (!pidsToRead) {
@@ -1343,17 +2496,7 @@ void BufferManager::prefetchPages(const PID* pages, int n_pages, const u32* offs
 
     // Batch read all pages that need to be loaded
     if (pidsToRead && !pidsToRead->empty()) {
-        if (pidsToRead->size() >= LibaioInterface::maxIOs) {
-            // Split into multiple batches if too many pages
-            for (size_t i = 0; i < pidsToRead->size(); i += LibaioInterface::maxIOs) {
-                size_t batchSize = std::min(LibaioInterface::maxIOs, pidsToRead->size() - i);
-                vector<PID> batch(pidsToRead->begin() + i, pidsToRead->begin() + i + batchSize);
-                vector<Page*> batchDest(destinations->begin() + i, destinations->begin() + i + batchSize);
-                getIOInterface().readPages(batch, batchDest);
-            }
-        } else {
-            getIOInterface().readPages(*pidsToRead, *destinations);
-        }
+        getIOInterface().readPages(*pidsToRead, *destinations);
 
         // Unlock all successfully loaded pages
         for (PID pid : *pidsToRead) {
@@ -1365,33 +2508,33 @@ void BufferManager::prefetchPages(const PID* pages, int n_pages, const u32* offs
     }
 }
 
-// BTreeNode Method Implementations
+void BufferManager::prefetchResidentPages(const PID* pages, int n_pages, const u32* offsets_within_pages) {
+    if (!useTraditional || hashMode == HashMode::Array1Access) {
+        for (int i = 0; i < n_pages; i++) {
+            PageState& ps = pageState[pages[i]];
+            char* tmp = reinterpret_cast<char*>(&ps);
+            _mm_prefetch(reinterpret_cast<const char*>(tmp), _MM_HINT_T0);
+        }
+    }
 
-static unsigned min(unsigned a, unsigned b) { return a < b ? a : b; }
+    for (int i = 0; i < n_pages; i++) {
+        PID pid = pages[i];
+        assert(pid < virtCount);
 
-template <class T>
-static T loadUnaligned(void* p) {
-    T x;
-    memcpy(&x, p, sizeof(T));
-    return x;
-}
+        u64 stateAndVersion = pageState[pid].stateAndVersion.load(std::memory_order_acquire);
+        u64 state = PageState::getState(stateAndVersion);
+        if (state == PageState::Evicted || state == PageState::ReadInFlight || state == PageState::Locked) continue;
 
-// Get order-preserving head of key (assuming little endian)
-static u32 head(u8* key, unsigned keyLen) {
-    switch (keyLen) {
-        case 0:
-            return 0;
-        case 1:
-            return static_cast<u32>(key[0]) << 24;
-        case 2:
-            return static_cast<u32>(__builtin_bswap16(loadUnaligned<u16>(key))) << 16;
-        case 3:
-            return (static_cast<u32>(__builtin_bswap16(loadUnaligned<u16>(key))) << 16) |
-                   (static_cast<u32>(key[2]) << 8);
-        default:
-            return __builtin_bswap32(loadUnaligned<u32>(key));
+        u64 frame = PageState::extractFrame(stateAndVersion);
+        char* tmp = reinterpret_cast<char*>(frameMem + static_cast<size_t>(frame)) +
+                    (offsets_within_pages == nullptr ? 0 : offsets_within_pages[i]);
+        _mm_prefetch(reinterpret_cast<const char*>(tmp), _MM_HINT_T0);
     }
 }
+
+// BTreeNode Method Implementations
+
+[[maybe_unused]] static unsigned min(unsigned a, unsigned b) { return a < b ? a : b; }
 
 bool BTreeNode::hasSpaceFor(unsigned keyLen, unsigned payloadLen) {
     return spaceNeeded(keyLen, payloadLen) <= freeSpaceAfterCompaction();
@@ -1423,59 +2566,6 @@ void BTreeNode::searchHint(u32 keyHead, u16& lowerOut, u16& upperOut) {
         lowerOut = pos * dist;
         if (pos2 < hintCount) upperOut = (pos2 + 1) * dist;
     }
-}
-
-u16 BTreeNode::lowerBound(span<u8> skey, bool& foundExactOut) {
-    foundExactOut = false;
-
-    // check prefix
-    int cmp = memcmp(skey.data(), getPrefix(), min(skey.size(), prefixLen));
-    if (cmp < 0)  // key is less than prefix
-        return 0;
-    if (cmp > 0)  // key is greater than prefix
-        return count;
-    if (skey.size() < prefixLen)  // key is equal but shorter than prefix
-        return 0;
-    u8* key = skey.data() + prefixLen;
-    unsigned keyLen = skey.size() - prefixLen;
-
-    // check hint
-    u16 lower = 0;
-    u16 upper = count;
-    u32 keyHead = head(key, keyLen);
-    searchHint(keyHead, lower, upper);
-
-    // binary search on remaining range
-    while (lower < upper) {
-        u16 mid = ((upper - lower) / 2) + lower;
-        if (keyHead < slot[mid].head) {
-            upper = mid;
-        } else if (keyHead > slot[mid].head) {
-            lower = mid + 1;
-        } else {  // head is equal, check full key
-            int cmp = memcmp(key, getKey(mid), min(keyLen, slot[mid].keyLen));
-            if (cmp < 0) {
-                upper = mid;
-            } else if (cmp > 0) {
-                lower = mid + 1;
-            } else {
-                if (keyLen < slot[mid].keyLen) {  // key is shorter
-                    upper = mid;
-                } else if (keyLen > slot[mid].keyLen) {  // key is longer
-                    lower = mid + 1;
-                } else {
-                    foundExactOut = true;
-                    return mid;
-                }
-            }
-        }
-    }
-    return lower;
-}
-
-u16 BTreeNode::lowerBound(span<u8> key) {
-    bool ignore;
-    return lowerBound(key, ignore);
 }
 
 void BTreeNode::insertInPage(span<u8> key, span<u8> payload) {
@@ -1847,7 +2937,7 @@ bool BTree::remove(span<u8> key) {
             GuardO<BTreeNode> parent(metadataPageId);
             GuardO<BTreeNode> node(reinterpret_cast<MetaDataPage*>(parent.ptr)->getRoot(slotId), parent);
 
-            u16 pos;
+            u16 pos = 0;
             while (node->isInner()) {
                 pos = node->lowerBound(key);
                 PID nextPage = (pos == node->count) ? node->upperInnerNode : node->getChild(pos);
@@ -1947,18 +3037,56 @@ void initialize_system() {
 
 void flush_system() {
     if (bm_ptr != nullptr) {
-        bool can_attempt_update = true;
-        if (const char* block_path = getenv("BLOCK")) {
-            struct stat st {};
-            if (stat(block_path, &st) == 0) {
-                if (S_ISREG(st.st_mode) && st.st_size < static_cast<off_t>(pageSize)) {
-                    can_attempt_update = false;
-                }
-            }
-        }
-
+        bm_ptr->updateAllocCountSnapshot(bm_ptr->allocCount.load(std::memory_order_acquire));
         bm_ptr->flushAll();
     }
+}
+
+void warmup_storage_to_alloc_count() {
+    if (bm_ptr == nullptr || !bm_ptr->useTraditional) {
+        return;
+    }
+
+    const u64 alloc_limit = bm_ptr->allocCount.load(std::memory_order_acquire);
+    if (alloc_limit <= 1) {
+        return;
+    }
+
+    std::cerr << "[Calico Warmup] Sequentially faulting pid range [1, " << (alloc_limit - 1)
+              << "]" << std::endl;
+
+    for (PID pid = 1; pid < alloc_limit; ++pid) {
+        Page* page = bm_ptr->fixS(pid);
+        (void)page;
+        bm_ptr->unfixS(pid);
+    }
+
+    std::cerr << "[Calico Warmup] Completed sequential warmup through allocCount=" << alloc_limit
+              << std::endl;
+}
+
+std::vector<u64> snapshot_pid_to_frame_range(u64 start_pid, u64 count) {
+    std::vector<u64> frames;
+    if (bm_ptr == nullptr || !bm_ptr->useTraditional || count == 0) {
+        return frames;
+    }
+
+    const u64 alloc_limit = bm_ptr->allocCount.load(std::memory_order_acquire);
+    if (start_pid >= alloc_limit) {
+        return frames;
+    }
+
+    const u64 end_pid = std::min<u64>(alloc_limit, start_pid + count);
+    frames.reserve(end_pid - start_pid);
+    for (u64 pid = start_pid; pid < end_pid; ++pid) {
+        const u64 state_and_version = bm_ptr->getPageState(static_cast<PID>(pid)).stateAndVersion.load(std::memory_order_acquire);
+        if (PageState::getState(state_and_version) == PageState::Evicted) {
+            frames.push_back(BufferManager::invalidFrame);
+            continue;
+        }
+        frames.push_back(bm_ptr->resolveMappedFrame(static_cast<PID>(pid), state_and_version));
+    }
+    return frames;
 }
 
 // This function will be called from Python to shut down the system

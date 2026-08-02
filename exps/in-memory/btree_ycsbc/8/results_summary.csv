@@ -9,4 +9,4 @@ calico_openaddr_hash_nohuge,2.22427e+06,n/a,6.52737,11330.4,3120.06,0.275372
 calico_openaddr_hash_huge,2.53599e+06,n/a,5.38948,10691,3142.09,0.2939
 calico_lockfree_hash_nohuge,2.80064e+06,n/a,6.01555,8944.24,2390.78,0.267298
 calico_lockfree_hash_huge,3.60234e+06,n/a,4.84046,7549.56,2389.99,0.316573
-leanstore,n/a,n/a,n/a,n/a,n/a,n/a
+leanstore,6.66868e+06,31.7265,n/a,9408.27,19.9933,.0021

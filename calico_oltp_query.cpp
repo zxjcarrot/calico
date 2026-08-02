@@ -10,6 +10,19 @@
 
 using namespace std;
 
+static std::thread startBackgroundFreePageThread(std::atomic<bool>& keepRunning, unsigned nthreads) {
+    if (!bm.useTraditional) {
+        return std::thread();
+    }
+
+    return std::thread([&keepRunning, nthreads]() {
+        workerThreadId = static_cast<uint16_t>(std::min<unsigned>(nthreads, maxWorkerThreads - 1));
+        while (keepRunning.load(std::memory_order_relaxed)) {
+            bm.ensureFreePages();
+        }
+    });
+}
+
 // Helper to get RSS in KB
 long getProcessRSS() {
     std::ifstream stat_file("/proc/self/status");
@@ -197,6 +210,8 @@ int main(int argc, char** argv) {
         tradMode = "traditional-hash-unordered";
     else if (bm.hashMode == BufferManager::HashMode::OpenAddress)
         tradMode = "traditional-hash-open";
+    else if (bm.hashMode == BufferManager::HashMode::RobinHood)
+        tradMode = "traditional-hash-robinhood";
     else if (bm.hashMode == BufferManager::HashMode::Lockfree)
         tradMode = "traditional-hash-lockfree";
     const char* systemName = bm.useTraditional ? tradMode : (bm.useExmap ? "exmap" : "vmcache");
@@ -356,6 +371,7 @@ int main(int argc, char** argv) {
 
 
             thread statThread(phaseStatFn, currentSkew, firstPhase);
+            // thread freePageThread = startBackgroundFreePageThread(keepRunning, nthreads);
 
             parallel_for(0, nthreads, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
                 workerThreadId = worker;
@@ -449,6 +465,9 @@ int main(int argc, char** argv) {
             });
             
             statThread.join();
+                        // if (freePageThread.joinable()) {
+                        //     freePageThread.join();
+                        // }
             if (enablePerf) perf::Aggregator::instance().report(txTotal.load());
             
             firstPhase = false;
@@ -471,6 +490,13 @@ int main(int argc, char** argv) {
     vmcacheAdapter<item_t> item;
     vmcacheAdapter<stock_t> stock;
 
+    customer.tree.splitOrdered = true;
+    history.tree.splitOrdered = true;
+    order.tree.splitOrdered = true;
+    orderline.tree.splitOrdered = true;
+    item.tree.splitOrdered = true;
+    stock.tree.splitOrdered = true;
+
     TPCCWorkload<vmcacheAdapter> tpcc(warehouse, district, customer, customerwdl, history, neworder, order, order_wdc,
                                       orderline, item, stock, true, warehouseCount, true);
 
@@ -480,32 +506,32 @@ int main(int argc, char** argv) {
 
         parallel_for(1, warehouseCount + 1, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
             workerThreadId = worker;
-            // for (Integer w_id = begin; w_id < end; w_id++) {
-            //     tpcc.loadStock(w_id);
-            //     tpcc.loadDistrinct(w_id);
-            //     for (Integer d_id = 1; d_id <= 10; d_id++) {
-            //         tpcc.loadCustomer(w_id, d_id);
-            //         tpcc.loadOrders(w_id, d_id);
-            //     }
-            // }
-
             for (Integer w_id = begin; w_id < end; w_id++) {
                 tpcc.loadStock(w_id);
-            }
-            for (Integer w_id = begin; w_id < end; w_id++) {
                 tpcc.loadDistrinct(w_id);
-            }
-
-            for (Integer w_id = begin; w_id < end; w_id++) {
                 for (Integer d_id = 1; d_id <= 10; d_id++) {
                     tpcc.loadCustomer(w_id, d_id);
-                }
-            }
-            for (Integer w_id = begin; w_id < end; w_id++) {
-                for (Integer d_id = 1; d_id <= 10; d_id++) {
                     tpcc.loadOrders(w_id, d_id);
                 }
             }
+
+            // for (Integer w_id = begin; w_id < end; w_id++) {
+            //     tpcc.loadStock(w_id);
+            // }
+            // for (Integer w_id = begin; w_id < end; w_id++) {
+            //     tpcc.loadDistrinct(w_id);
+            // }
+
+            // for (Integer w_id = begin; w_id < end; w_id++) {
+            //     for (Integer d_id = 1; d_id <= 10; d_id++) {
+            //         tpcc.loadCustomer(w_id, d_id);
+            //     }
+            // }
+            // for (Integer w_id = begin; w_id < end; w_id++) {
+            //     for (Integer d_id = 1; d_id <= 10; d_id++) {
+            //         tpcc.loadOrders(w_id, d_id);
+            //     }
+            // }
         });
     }
     cerr << "space: " << (bm.allocCount.load() * pageSize) / (float)bm.gb << " GB " << endl;
@@ -513,6 +539,7 @@ int main(int argc, char** argv) {
     bm.readCount = 0;
     bm.writeCount = 0;
     thread statThread(statFn);
+    // thread freePageThread = startBackgroundFreePageThread(keepRunning, nthreads);
 
     parallel_for(0, nthreads, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
         workerThreadId = worker;
@@ -533,6 +560,9 @@ int main(int argc, char** argv) {
     });
 
     statThread.join();
+    // if (freePageThread.joinable()) {
+    //     freePageThread.join();
+    // }
 
     cerr << "space: " << (bm.allocCount.load() * pageSize) / (float)bm.gb << " GB " << endl;
     cerr << "[BufferManager] Total hole punches (madvise count) " << bm.holePunchCount.load() << endl;

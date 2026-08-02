@@ -1,6 +1,6 @@
 BaseConfig,HugePages_Avg_ms,NoHugePages_Avg_ms,Improvement_%
-calico_array,14592.63,28998.98,49.00
-calico_mmap,10318.01,20806.57,50.00
-calico_chained_hash,81663.01,104543.35,21.00
+calico_array,14487.16,29098.97,50.00
+calico_mmap,10234.01,21005.09,51.00
+calico_chained_hash,81663.01,105111.83,22.00
 calico_openaddr_hash,70826.56,80182.27,11.00
 calico_lockfree_hash,68710.45,95164.50,27.00

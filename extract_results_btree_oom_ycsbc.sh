@@ -7,7 +7,7 @@ set -e
 
 # Base directory for experiments
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-EXP_BASE_DIR="${SCRIPT_DIR}/exps/larger-than-memory/btree_ycsbc"
+EXP_BASE_DIR="${SCRIPT_DIR}/Calico-VLDB26/data/exps/larger-than-memory/btree_ycsbc"
 
 # Data sizes to process
 DATA_SIZES=(25000000 50000000 100000000 200000000 400000000)
@@ -63,8 +63,25 @@ extract_avg_throughput() {
         return
     fi
     
-    # Extract the throughput value from the avg_throughput row
-    awk -F',' '$1 == "avg_throughput" { print $2 }' "$tx_file"
+    # Try to find the summary line first
+    local summary_val=$(awk -F',' '$1 == "avg_throughput" { print $2 }' "$tx_file")
+    
+    if [ -n "$summary_val" ]; then
+        echo "$summary_val"
+    else
+        # Calculate average from data rows if summary is missing
+        # Skip header (NR>1) and ensure $2 is a number
+        awk -F',' '
+            NR > 1 && $2 ~ /^[0-9]+(\.[0-9]+)?$/ { 
+                sum += $2; 
+                count++; 
+            } 
+            END { 
+                if (count > 0) print sum / count; 
+                else print "n/a"; 
+            }
+        ' "$tx_file"
+    fi
 }
 
 # Function to extract average CPU utilization from iostat log
@@ -79,7 +96,7 @@ extract_avg_cpu_util() {
     # Extract the %user and %system columns (avg-cpu block), average (user+system)
     # Skip lines until we see "avg-cpu" header, then read the numeric line(s) that follow
     awk '
-        BEGIN { in_cpu_section = 0; count = 0; total_util = 0; }
+        BEGIN { in_cpu_section = 0; count = 0; }
         /avg-cpu/ { in_cpu_section = 1; next; }
         /Device/ { in_cpu_section = 0; }
         in_cpu_section && NF >= 3 {
@@ -88,14 +105,25 @@ extract_avg_cpu_util() {
             # We take $1 (%user) + $3 (%system) as active CPU utilization.
             if ($1 ~ /^[0-9.]+$/ && $3 ~ /^[0-9.]+$/) {
                 util = ($1 + $3);
-                total_util += util;
+                values[count] = util;
                 count++;
             }
         }
         END {
             if (count > 0) {
-                avg_util = total_util / count;
-                print avg_util;
+                # Only use last 40 seconds
+                start_idx = (count > 40) ? count - 40 : 0;
+                sum = 0;
+                samples = 0;
+                for (i = start_idx; i < count; i++) {
+                    sum += values[i];
+                    samples++;
+                }
+                if (samples > 0) {
+                    print sum / samples;
+                } else {
+                    print "n/a";
+                }
             } else {
                 print "n/a";
             }
@@ -150,9 +178,9 @@ extract_leanstore_metrics() {
     
     case "$metric" in
         "throughput")
-            # Extract OLTP TX column for LAST 60 SECONDS ONLY
+            # Extract OLTP TX column for LAST 40 SECONDS ONLY
             # Skip lines with "~Transactions", "+---", "| t ", and lines with 0 throughput
-            # Only consider the last 60 data points (1 per second)
+            # Only consider the last 40 data points (1 per second)
             awk '
                 /^\| [0-9]+/ && !/^\| t / {
                     split($0, fields, "|")
@@ -165,8 +193,8 @@ extract_leanstore_metrics() {
                 }
                 END {
                     if (count > 0) {
-                        # Only use last 60 seconds
-                        start_idx = (count > 60) ? count - 60 : 0
+                        # Only use last 40 seconds
+                        start_idx = (count > 40) ? count - 40 : 0
                         sum = 0
                         samples = 0
                         for (i = start_idx; i < count; i++) {
@@ -185,7 +213,7 @@ extract_leanstore_metrics() {
             ' "$tx_file"
             ;;
         "l1_per_tx")
-            # Extract L1/TX column average (LAST 60 SECONDS)
+            # Extract L1/TX column average (LAST 40 SECONDS)
             awk '
                 /^\| [0-9]+/ && !/^\| t / {
                     split($0, fields, "|")
@@ -198,7 +226,7 @@ extract_leanstore_metrics() {
                 }
                 END {
                     if (count > 0) {
-                        start_idx = (count > 60) ? count - 60 : 0
+                        start_idx = (count > 40) ? count - 40 : 0
                         sum = 0
                         samples = 0
                         for (i = start_idx; i < count; i++) {
@@ -214,7 +242,7 @@ extract_leanstore_metrics() {
             ' "$tx_file"
             ;;
         "llc_per_tx")
-            # Extract LLC/TX column average (LAST 60 SECONDS)
+            # Extract LLC/TX column average (LAST 40 SECONDS)
             awk '
                 /^\| [0-9]+/ && !/^\| t / {
                     split($0, fields, "|")
@@ -227,7 +255,7 @@ extract_leanstore_metrics() {
                 }
                 END {
                     if (count > 0) {
-                        start_idx = (count > 60) ? count - 60 : 0
+                        start_idx = (count > 40) ? count - 40 : 0
                         sum = 0
                         samples = 0
                         for (i = start_idx; i < count; i++) {
@@ -243,7 +271,7 @@ extract_leanstore_metrics() {
             ' "$tx_file"
             ;;
         "cycles_per_tx")
-            # Extract Cycles/TX column average (LAST 60 SECONDS)
+            # Extract Cycles/TX column average (LAST 40 SECONDS)
             awk '
                 /^\| [0-9]+/ && !/^\| t / {
                     split($0, fields, "|")
@@ -256,7 +284,7 @@ extract_leanstore_metrics() {
                 }
                 END {
                     if (count > 0) {
-                        start_idx = (count > 60) ? count - 60 : 0
+                        start_idx = (count > 40) ? count - 40 : 0
                         sum = 0
                         samples = 0
                         for (i = start_idx; i < count; i++) {
@@ -272,7 +300,7 @@ extract_leanstore_metrics() {
             ' "$tx_file"
             ;;
         "insts_per_tx")
-            # Extract Instrs/TX column average (LAST 60 SECONDS)
+            # Extract Instrs/TX column average (LAST 40 SECONDS)
             awk '
                 /^\| [0-9]+/ && !/^\| t / {
                     split($0, fields, "|")
@@ -285,7 +313,7 @@ extract_leanstore_metrics() {
                 }
                 END {
                     if (count > 0) {
-                        start_idx = (count > 60) ? count - 60 : 0
+                        start_idx = (count > 40) ? count - 40 : 0
                         sum = 0
                         samples = 0
                         for (i = start_idx; i < count; i++) {
@@ -354,10 +382,13 @@ echo "datasize,config_name,avg_throughput,avg_throughput_per_core,llc_miss_per_o
 configs=(
     "calico_mmap_nohuge"
     "calico_array_huge"
+    "predicache_ycsbc"
     "calico_lockfree_hash_huge"
     "calico_openaddr_hash_huge"
+    "calico_robinhood_hash_huge"
     "leanstore"
     "wiredtiger"
+    "lmdb"
 )
 
 echo "Extracting results from experiment files for all data sizes..."
@@ -423,7 +454,7 @@ for datasize in "${DATA_SIZES[@]}"; do
             cycles_per_op=$(extract_leanstore_metrics "$tx_file" "cycles_per_tx")
             insts_per_op=$(extract_leanstore_metrics "$tx_file" "insts_per_tx")
             ipc=$(extract_leanstore_metrics "$tx_file" "ipc")
-        elif [ "$config" == "wiredtiger" ]; then
+        elif [ "$config" == "wiredtiger" ] || [ "$config" == "lmdb" ]; then
             avg_throughput=$(extract_wiredtiger_metrics "$tx_file" "throughput")
             llc_miss_per_op=$(extract_wiredtiger_metrics "$tx_file" "llc_per_tx")
             dtlb_miss_per_op=$(extract_wiredtiger_metrics "$tx_file" "dtlb_per_tx")
@@ -489,7 +520,9 @@ echo
 echo "Configurations processed:"
 echo "  - calico_mmap_nohuge: without huge pages"
 echo "  - calico_array_huge: with huge pages"
+echo "  - predicache_ycsbc: PrediCache random-read"
 echo "  - calico_lockfree_hash_huge: with huge pages"
+echo "  - calico_robinhood_hash_huge: Robin Hood hash with huge pages"
 echo "  - leanstore"
 echo "  - wiredtiger"
 echo "  Total per data size: 5 configurations"

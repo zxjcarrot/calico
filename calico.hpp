@@ -9,7 +9,6 @@
 #include <unistd.h>
 
 #include <algorithm>
-#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -17,10 +16,15 @@
 #include <functional>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <thread>
 #include <vector>
 #include <span>
 #include "hash_tables.hpp"
+#ifdef BLOCK_SIZE
+#undef BLOCK_SIZE
+#endif
+#include "predictivetranslation-sigmod2026/third_party/concurrentqueue.hpp"
 
 // Extern declarations must come BEFORE headers that use them
 extern __thread uint16_t workerThreadId;
@@ -38,7 +42,11 @@ typedef uint32_t u32;
 typedef uint64_t u64;
 typedef u64 PID;  // page id type
 
-static constexpr u64 pageSize = 4096;
+#ifndef CALICO_PAGE_SIZE
+#define CALICO_PAGE_SIZE 4096
+#endif
+
+static constexpr u64 pageSize = CALICO_PAGE_SIZE;
 
 __attribute__((target("sse4.2"))) uint64_t hash64(uint64_t key, uint32_t seed);
 
@@ -81,10 +89,15 @@ void yield(u64 counter);
 struct PageState {
     std::atomic<u64> stateAndVersion;
 
+#if defined(CALICO_PAGESTATE_ALIGN64)
+    u8 cachelinePadding[64 - sizeof(std::atomic<u64>)] = {};
+#endif
+
     static const u64 Evicted = 0;
     static const u64 Unlocked = 1;
     static const u64 SharedBase = 2;
-    static const u64 MaxShared = 253;
+    static const u64 MaxShared = 252;
+    static const u64 ReadInFlight = 253;
     static const u64 Locked = 254;
     static const u64 Marked = 255;
 
@@ -175,6 +188,11 @@ struct PageState {
     static u64 getState(u64 v) { return v >> 56; };
     u64 getState() { return getState(stateAndVersion.load()); }
 
+    static inline bool isResidentState(u64 v) {
+        const u64 state = getState(v);
+        return state != Evicted && state != ReadInFlight;
+    }
+
     static u64 getFrameValue(u64 v) {
         if (!packedMode) return 0;
         return v & frameMask;
@@ -204,6 +222,42 @@ struct PageState {
     static u64 extractVersion(u64 v) {
         if (!packedMode) return 0;
         return (v & versionMaskPacked) >> 32;
+    }
+};
+
+#if defined(CALICO_PAGESTATE_ALIGN64)
+static_assert(sizeof(PageState) == 64, "PageState must occupy one cache line when CALICO_PAGESTATE_ALIGN64 is enabled");
+#endif
+
+struct AsyncReadRequest {
+    enum Status : u32 { Idle = 0, Submitted = 1, Completed = 2, Failed = 3, Rescuing = 4 };
+
+    std::atomic<PID> pid{std::numeric_limits<PID>::max()};
+    std::atomic<u32> frame{std::numeric_limits<u32>::max()};
+    std::atomic<uintptr_t> ownerInterface{0};
+    std::atomic<u64> token{0};
+    std::atomic<u64> submitMicros{0};
+    std::atomic<u64> completionMicros{0};
+    std::atomic<u64> lastWaitLogMicros{0};
+    std::atomic<u32> submitWorker{std::numeric_limits<u32>::max()};
+    std::atomic<u32> completionWorker{std::numeric_limits<u32>::max()};
+    std::atomic<u32> waiterCount{0};
+    std::atomic<int> result{0};
+    std::atomic<u32> status{Idle};
+
+    void reset() {
+        pid.store(std::numeric_limits<PID>::max(), std::memory_order_release);
+        frame.store(std::numeric_limits<u32>::max(), std::memory_order_release);
+        ownerInterface.store(0, std::memory_order_release);
+        token.store(0, std::memory_order_release);
+        submitMicros.store(0, std::memory_order_release);
+        completionMicros.store(0, std::memory_order_release);
+        lastWaitLogMicros.store(0, std::memory_order_release);
+        submitWorker.store(std::numeric_limits<u32>::max(), std::memory_order_release);
+        completionWorker.store(std::numeric_limits<u32>::max(), std::memory_order_release);
+        waiterCount.store(0, std::memory_order_release);
+        result.store(0, std::memory_order_release);
+        status.store(Idle, std::memory_order_release);
     }
 };
 
@@ -249,6 +303,25 @@ struct BufferManager;
 struct IOInterface {
     virtual void writePages(const std::vector<PID>& pages) = 0;
     virtual void readPages(const std::vector<PID>& pages, const std::vector<Page*>& destinations) = 0;
+    virtual bool supportsAsyncReads() const { return false; }
+    virtual void pollAsyncCompletions() {}
+    virtual bool submitAsyncRead(PID pid, Page* destination, AsyncReadRequest* request) {
+        (void)pid;
+        (void)destination;
+        (void)request;
+        return false;
+    }
+    virtual size_t submitAsyncReads(const PID* pids, Page* const* destinations, AsyncReadRequest* const* requests,
+                                    size_t count) {
+        size_t submitted = 0;
+        for (; submitted < count; ++submitted) {
+            if (!submitAsyncRead(pids[submitted], destinations[submitted], requests[submitted])) {
+                break;
+            }
+        }
+        return submitted;
+    }
+    virtual void waitForAsyncRead(AsyncReadRequest& request) { (void)request; }
     virtual ~IOInterface() {}
 };
 
@@ -275,18 +348,21 @@ struct IOUringInterface: public IOInterface {
     int blockfd;
     BufferManager* bm_ptr;
     struct io_uring ring;
+    std::atomic_flag submitLock = ATOMIC_FLAG_INIT;
+    std::atomic_flag completionLock = ATOMIC_FLAG_INIT;
 
     IOUringInterface(int blockfd, BufferManager* bm_ptr);
     ~IOUringInterface();
     virtual void writePages(const std::vector<PID>& pages);
     virtual void readPages(const std::vector<PID>& pages, const std::vector<Page*>& destinations);
-};
+    virtual bool supportsAsyncReads() const override { return true; }
+    virtual void pollAsyncCompletions() override;
+    virtual bool submitAsyncRead(PID pid, Page* destination, AsyncReadRequest* request) override;
+    virtual size_t submitAsyncReads(const PID* pids, Page* const* destinations, AsyncReadRequest* const* requests,
+                                    size_t count) override;
+    virtual void waitForAsyncRead(AsyncReadRequest& request) override;
 
-struct FreePartition {
-    std::atomic_flag lock = ATOMIC_FLAG_INIT;
-    std::vector<u32> frames;
-    u32 top = 0;
-    char cachline_pad0[64 - sizeof(std::atomic_flag) - sizeof(std::vector<u32>) - sizeof(u32)];
+    void reapCompletions(bool wait_for_one);
 };
 
 // Two-level indirection for PageState array
@@ -333,9 +409,15 @@ struct ThreeLevelPageStateArray {
 };
 
 struct PIDAllocator {
-    std::atomic<u64> next{0};
-    std::atomic<u64> end{0};
-    std::mutex lock;
+    u64 next{0};
+    u64 end{0};
+    std::atomic_flag lock = ATOMIC_FLAG_INIT;
+
+    inline void lockSpin() {
+        while (lock.test_and_set(std::memory_order_acquire)) _mm_pause();
+    }
+
+    inline void unlockSpin() { lock.clear(std::memory_order_release); }
 };
 
 struct BufferManager {
@@ -347,7 +429,16 @@ struct BufferManager {
     u64 physCount;
     struct exmap_user_interface* exmapInterface[maxWorkerThreads];
 
-    enum class HashMode { Array1Access = 0, Unordered = 1, OpenAddress = 2, Array = 3, Lockfree = 4, Array2Level = 5, Array3Level = 6 };
+    enum class HashMode {
+        Array1Access = 0,
+        Unordered = 1,
+        OpenAddress = 2,
+        Array = 3,
+        Lockfree = 4,
+        Array2Level = 5,
+        Array3Level = 6,
+        RobinHood = 7
+    };
 
     bool useTraditional;
     bool useMmapOSPageacche = false;
@@ -359,8 +450,7 @@ struct BufferManager {
 
     static constexpr u64 invalidFrame = std::numeric_limits<u64>::max();
     static constexpr PID invalidPID = std::numeric_limits<PID>::max();
-    static constexpr u32 freePartitionCount = 64;
-
+    static constexpr u32 invalidAsyncRequestSlot = std::numeric_limits<u32>::max();
     char cachline_pad0[64];
     ResidentPageSet residentSet;
 
@@ -374,6 +464,20 @@ struct BufferManager {
     char cachline_pad4[64];
     std::atomic<u64> holePunchCount;  // Counter for translation table hole-punching operations
     char cachline_pad5[64];
+    std::atomic<u64> asyncSubmitCount;
+    std::atomic<u64> asyncCoalescedCount;
+    std::atomic<u64> asyncGuardWaitCount;
+    std::atomic<u64> asyncSyncFaultCount;
+    std::atomic<u64> asyncFailedCompletionCount;
+    std::atomic<u64> asyncCompletionCount;
+    std::atomic<u64> asyncSubmitBackpressureCount;
+    std::atomic<u64> asyncSlowWaitCount;
+    std::atomic<u64> asyncInFlightCurrent;
+    std::atomic<u64> asyncInFlightPeak;
+    std::atomic<u64> asyncInFlightWeightedMicros;
+    std::atomic<u64> asyncInFlightStartMicros;
+    std::atomic<u64> asyncInFlightLastTransitionMicros;
+    mutable std::atomic_flag asyncInFlightStatsLock = ATOMIC_FLAG_INIT;
 
     Page* virtMem;
     Page* frameMem;
@@ -381,6 +485,7 @@ struct BufferManager {
     std::unique_ptr<TwoLevelPageStateArray> pageState2Level; // Two-level array (for Array2Level mode)
     std::unique_ptr<ThreeLevelPageStateArray> pageState3Level; // Three-level array (for Array3Level mode)
     std::unique_ptr<std::atomic<u64>[]> pidToFrameArray;
+    bool enableTranslationRefCount;
     std::atomic<u32>* translationRefCounts;  // Reference counts for OS page groups (lazily allocated via mmap)
     u64 numRefCountGroups;  // Number of OS page groups in translation array
     u64 translationOSPageSize;  // OS page size used for translation array (4KB or 2MB based on huge pages)
@@ -391,9 +496,14 @@ struct BufferManager {
     std::unique_ptr<std::atomic<PID>[]> frameToPidArray;
     std::unique_ptr<PartitionedMap<PID, u64>> pidToFrameHash;
     std::unique_ptr<PartitionedMap<u64, PID>> frameToPidHash;
-    std::array<FreePartition, freePartitionCount> freePartitions;
-    u32 partitionFrameSpan;
+    moodycamel::ConcurrentQueue<u32> freeFrameQueue;
+    std::unique_ptr<AsyncReadRequest[]> asyncReadRequests;
+    std::unique_ptr<std::atomic<u32>[]> pidToAsyncRequestSlot;
+    moodycamel::ConcurrentQueue<u32> freeAsyncRequestSlotQueue;
+    std::vector<std::unique_ptr<IOUringInterface>> ioUringInterfaces;
+    std::atomic<u64> nextAsyncReadToken;
     u64 batch;
+    bool useIOUring;
 
     PageState& getPageState(PID pid) {
         // if (hashMode == HashMode::Array2Level) {
@@ -431,17 +541,26 @@ struct BufferManager {
     Page* allocPage(PIDAllocator* allocator = nullptr);
     void updateAllocCountSnapshot(u64 value);
     Page* handleFault(PID pid);
+    Page* resolveOptimisticRead(PID pid, u64& version);
+    Page* waitForPendingRead(PID pid, u64 stateAndVersion, u64* resolvedVersion = nullptr);
     void readPage(PID pid, Page* dest);
     void evict();
+    bool submitAsyncPrefetch(PID pid);
+    void submitAsyncPrefetchPages(const PID* pages, int n_pages, const u32* offsets_within_pages = nullptr);
     void prefetchPages(const PID* pages, int n_pages, const u32* offsets_within_pages = nullptr);
+    void prefetchResidentPages(const PID* pages, int n_pages, const u32* offsets_within_pages = nullptr);
 
-    Page* acquireFrameForPid(PID pid);
+    Page* acquireFrameForPid(PID pid, bool allow_eviction = true);
     void releaseFrame(PID pid);
-    u32 popFreeFrame();
-
-    u32 partitionForFrame(u64 frame) const;
-    void lockPartition(u32 partition);
-    void unlockPartition(u32 partition);
+    u32 popFreeFrame(bool allow_eviction = true);
+    u64 resolveMappedFrame(PID pid, u64 stateAndVersion);
+    u32 resolveAsyncRequestSlot(PID pid, u64 stateAndVersion);
+    void releaseAsyncRequestSlot(PID pid, u32 slot);
+    bool finalizeCompletedAsyncRead(PID pid, u32 slot);
+    void recordAsyncInFlightTransition(u64 now_micros, int delta);
+    double averageAsyncInFlightIO(u64 now_micros) const;
+    void rollbackFailedAsyncRead(PID pid, u64 stateAndVersion);
+    bool asyncReadEnabled() const;
     
     IOInterface& getIOInterface();
 
@@ -481,41 +600,7 @@ struct GuardO {
 
     void init() {
         assert(pid != moved);
-        PageState& ps = bm.getPageState(pid);
-        for (u64 repeatCounter = 0;; repeatCounter++) {
-            u64 v = ps.stateAndVersion.load();
-            switch (PageState::getState(v)) {
-                case PageState::Marked: {
-                    u64 newV = PageState::sameVersion(v, PageState::Unlocked);
-                    if (ps.stateAndVersion.compare_exchange_weak(v, newV)) {
-                        ptr = reinterpret_cast<T*>(bm.residentPtr(pid, newV));
-                        version = newV;
-                        return;
-                    }
-                    break;
-                }
-                case PageState::Locked:
-                    break;
-                case PageState::Evicted:
-                    if (ps.tryLockX(v)) {
-                        ptr = reinterpret_cast<T*>(bm.handleFault(pid));
-                        bm.unfixX(pid);
-                        bm.ensureFreePages();
-                    }
-                    break;
-                default:
-#if defined(CALICO_SPECIALIZATION_CALICO)
-                    ptr = reinterpret_cast<T*>(bm.residentPtrCalico(pid, v));
-#elif defined(CALICO_SPECIALIZATION_HASH)
-                    ptr = reinterpret_cast<T*>(bm.residentPtrHash(pid, v));
-#else
-                    ptr = reinterpret_cast<T*>(bm.residentPtr(pid, v));
-#endif
-                    version = v;
-                    return;
-            }
-            yield(repeatCounter);
-        }
+        ptr = reinterpret_cast<T*>(bm.resolveOptimisticRead(pid, version));
     }
 
     // move assignment operator
@@ -613,47 +698,7 @@ struct GuardORelaxed {
 
     void init() {
         assert(pid != moved);
-        PageState& ps = bm.getPageState(pid);
-        for (u64 repeatCounter = 0;; repeatCounter++) {
-            u64 v = ps.stateAndVersion.load();
-            switch (PageState::getState(v)) {
-                // case PageState::Marked: {
-                //     u64 newV = PageState::sameVersion(v, PageState::Unlocked);
-                //     if (ps.stateAndVersion.compare_exchange_weak(v, newV)) {
-                //         ptr = reinterpret_cast<T*>(bm.residentPtr(pid, ps, newV));
-                //         version = newV;
-                //         return;
-                //     }
-                //     break;
-                // }
-                case PageState::Evicted:
-                    if (ps.tryLockX(v)) {
-                        try {
-                            ptr = reinterpret_cast<T*>(bm.handleFault(pid));
-                            bm.unfixX(pid);
-                            bm.ensureFreePages();
-                        } catch (...) {
-                            // Unlock page on failure to prevent livelock
-                            ps.unlockXEvicted();
-                            throw;
-                        }
-                    }
-                    break;
-                case PageState::Marked:
-                case PageState::Locked:// we can live with stale data here, fallthrough
-                default:
-#if defined(CALICO_SPECIALIZATION_CALICO)
-                    ptr = reinterpret_cast<T*>(bm.residentPtrCalico(pid, v));
-#elif defined(CALICO_SPECIALIZATION_HASH)
-                    ptr = reinterpret_cast<T*>(bm.residentPtrHash(pid, v));
-#else
-                    ptr = reinterpret_cast<T*>(bm.residentPtr(pid, v));
-#endif
-                    version = v;
-                    return;
-            }
-            yield(repeatCounter);
-        }
+        ptr = reinterpret_cast<T*>(bm.resolveOptimisticRead(pid, version));
     }
 
     // move assignment operator
@@ -873,6 +918,43 @@ double envOrDouble(const char* env, double value);
 
 struct BTreeNode;
 
+template <class T>
+static inline T loadUnaligned(void* p) {
+    T x;
+    memcpy(&x, p, sizeof(T));
+    return x;
+}
+
+// Keep the B-tree comparison fast path inline so the compiler can fold it into
+// lookup/update/scan call sites.
+static inline int cust_memcmp(const void* ptr1, const void* ptr2, size_t num) {
+    const unsigned char* p1 = static_cast<const unsigned char*>(ptr1);
+    const unsigned char* p2 = static_cast<const unsigned char*>(ptr2);
+    while (num-- > 0) {
+        if (*p1 != *p2) return static_cast<int>(*p1) - static_cast<int>(*p2);
+        ++p1;
+        ++p2;
+    }
+    return 0;
+}
+
+// Get order-preserving head of key (assuming little endian)
+static inline u32 head(u8* key, unsigned keyLen) {
+    switch (keyLen) {
+        case 0:
+            return 0;
+        case 1:
+            return static_cast<u32>(key[0]) << 24;
+        case 2:
+            return static_cast<u32>(__builtin_bswap16(loadUnaligned<u16>(key))) << 16;
+        case 3:
+            return (static_cast<u32>(__builtin_bswap16(loadUnaligned<u16>(key))) << 16) |
+                   (static_cast<u32>(key[2]) << 8);
+        default:
+            return __builtin_bswap32(loadUnaligned<u32>(key));
+    }
+}
+
 struct BTreeNodeHeader {
     static const unsigned underFullSize = (pageSize / 2) + (pageSize / 4);  // merge nodes more empty
     static const u64 noNeighbour = ~0ull;
@@ -924,7 +1006,7 @@ struct BTreeNode : public BTreeNodeHeader {
         u8 heap[pageSize - sizeof(BTreeNodeHeader)];                     // grows from back
     };
 
-    static constexpr unsigned maxKVSize = ((pageSize - sizeof(BTreeNodeHeader) - (2 * sizeof(Slot)))) / 4;
+    static constexpr unsigned maxKVSize = ((pageSize - sizeof(BTreeNodeHeader) - (2 * sizeof(Slot)))) / 2;
 
     BTreeNode(bool isLeaf) : BTreeNodeHeader(isLeaf) { dirty = true; }
 
@@ -952,8 +1034,50 @@ struct BTreeNode : public BTreeNodeHeader {
     void makeHint();
     void updateHint(unsigned slotId);
     void searchHint(u32 keyHead, u16& lowerOut, u16& upperOut);
-    u16 lowerBound(std::span<u8> skey, bool& foundExactOut);
-    u16 lowerBound(std::span<u8> key);
+    u16 lowerBound(std::span<u8> skey, bool& foundExactOut) {
+        foundExactOut = false;
+
+        int cmp = cust_memcmp(skey.data(), getPrefix(), std::min(skey.size(), static_cast<size_t>(prefixLen)));
+        if (cmp < 0) return 0;
+        if (cmp > 0) return count;
+        if (skey.size() < prefixLen) return 0;
+
+        u8* key = skey.data() + prefixLen;
+        unsigned keyLen = skey.size() - prefixLen;
+
+        u16 lower = 0;
+        u16 upper = count;
+        u32 keyHead = head(key, keyLen);
+        searchHint(keyHead, lower, upper);
+
+        while (lower < upper) {
+            u16 mid = ((upper - lower) / 2) + lower;
+            if (keyHead < slot[mid].head) {
+                upper = mid;
+            } else if (keyHead > slot[mid].head) {
+                lower = mid + 1;
+            } else {
+                int cmp = cust_memcmp(key, getKey(mid), std::min(static_cast<size_t>(keyLen), static_cast<size_t>(slot[mid].keyLen)));
+                if (cmp < 0) {
+                    upper = mid;
+                } else if (cmp > 0) {
+                    lower = mid + 1;
+                } else if (keyLen < slot[mid].keyLen) {
+                    upper = mid;
+                } else if (keyLen > slot[mid].keyLen) {
+                    lower = mid + 1;
+                } else {
+                    foundExactOut = true;
+                    return mid;
+                }
+            }
+        }
+        return lower;
+    }
+    u16 lowerBound(std::span<u8> key) {
+        bool ignore;
+        return lowerBound(key, ignore);
+    }
     void insertInPage(std::span<u8> key, std::span<u8> payload);
     bool removeSlot(unsigned slotId);
     bool removeInPage(std::span<u8> key);
@@ -1015,12 +1139,42 @@ struct HNSWMetaInfo {
     }
 };
 
+struct IVFMetaInfo {
+    static constexpr u64 magic = 0x4956464D45544131ULL;  // "IVFMETA1"
+    u64 magic_value = 0;
+    PID metadata_pid = BufferManager::invalidPID;
+    u64 max_elements = 0;
+    u32 dim = 0;
+    u32 num_clusters = 0;
+    u32 retrain_interval = 0;
+    u8 is_trained = 0;
+    u8 valid = 0;
+    u8 reserved[6] = {0};
+
+    bool isValid() const {
+        return valid != 0 && magic_value == magic && metadata_pid != BufferManager::invalidPID;
+    }
+
+    void clear() {
+        magic_value = 0;
+        metadata_pid = BufferManager::invalidPID;
+        max_elements = 0;
+        dim = 0;
+        num_clusters = 0;
+        retrain_interval = 0;
+        is_trained = 0;
+        valid = 0;
+        memset(reserved, 0, sizeof(reserved));
+    }
+};
+
 struct MetaDataPage {
     bool dirty;
     u8 padding[7] = {0};
     HNSWMetaInfo hnsw_meta;
+    IVFMetaInfo ivf_meta;
     u64 alloc_count_snapshot = 0;
-    PID roots[(pageSize - sizeof(dirty) - sizeof(padding) - sizeof(HNSWMetaInfo) - sizeof(alloc_count_snapshot)) /
+    PID roots[(pageSize - sizeof(dirty) - sizeof(padding) - sizeof(HNSWMetaInfo) - sizeof(IVFMetaInfo) - sizeof(alloc_count_snapshot)) /
               sizeof(PID)];
 
     PID getRoot(unsigned slot) { return roots[slot]; }
@@ -1031,6 +1185,8 @@ struct MetaDataPage {
 };
 
 void flush_system();
+void warmup_storage_to_alloc_count();
+std::vector<u64> snapshot_pid_to_frame_range(u64 start_pid, u64 count);
 
 static_assert(sizeof(MetaDataPage) <= pageSize, "MetaDataPage must fit within a single page");
 
@@ -1113,7 +1269,15 @@ struct BTree {
         GuardS<BTreeNode> node = findLeafS(key);
         bool found;
         unsigned pos = node->lowerBound(key, found);
+        bool next_prefetched = false;
         for (u64 repeatCounter = 0;; repeatCounter++) {  // XXX
+            // if (!next_prefetched) {
+            //     next_prefetched = true;
+            //     u32 offset = 0;
+            //     if (node->hasRightNeighbour()) {
+            //         bm.prefetchResidentPages(&node->nextLeafNode, 1, &offset);
+            //     }
+            // }
             if (pos < node->count) {
                 if (!fn(*node.ptr, pos)) return;
                 pos++;
@@ -1121,6 +1285,7 @@ struct BTree {
                 if (!node->hasRightNeighbour()) return;
                 pos = 0;
                 node = GuardS<BTreeNode>(node->nextLeafNode);
+                next_prefetched = false;
             }
         }
     }
@@ -1162,7 +1327,9 @@ struct vmcacheAdapter {
             memcpy(kk + node.prefixLen, node.getKey(slot), node.slot[slot].keyLen);
             typename Record::Key typedKey;
             Record::unfoldKey(kk, typedKey);
-            return found_record_cb(typedKey, *reinterpret_cast<const Record*>(node.getPayload(slot).data()));
+            auto payload = node.getPayload(slot);
+            assert(payload.size() == sizeof(Record));
+            return found_record_cb(typedKey, *reinterpret_cast<const Record*>(payload.data()));
         });
     }
     // -------------------------------------------------------------------------------------
@@ -1182,7 +1349,9 @@ struct vmcacheAdapter {
             memcpy(kk + node.prefixLen, node.getKey(slot), node.slot[slot].keyLen);
             typename Record::Key typedKey;
             Record::unfoldKey(kk, typedKey);
-            return found_record_cb(typedKey, *reinterpret_cast<const Record*>(node.getPayload(slot).data()));
+            auto payload = node.getPayload(slot);
+            assert(payload.size() == sizeof(Record));
+            return found_record_cb(typedKey, *reinterpret_cast<const Record*>(payload.data()));
         });
     }
     // -------------------------------------------------------------------------------------
@@ -1196,8 +1365,10 @@ struct vmcacheAdapter {
     void lookup1(const typename Record::Key& key, Fn fn) {
         u8 k[Record::maxFoldLength()];
         u16 l = Record::foldKey(k, key);
-        bool succ =
-            tree.lookup({k, l}, [&](std::span<u8> payload) { fn(*reinterpret_cast<const Record*>(payload.data())); });
+        bool succ = tree.lookup({k, l}, [&](std::span<u8> payload) {
+            assert(payload.size() == sizeof(Record));
+            fn(*reinterpret_cast<const Record*>(payload.data()));
+        });
         assert(succ);
     }
     // -------------------------------------------------------------------------------------
@@ -1205,7 +1376,10 @@ struct vmcacheAdapter {
     void update1(const typename Record::Key& key, Fn fn) {
         u8 k[Record::maxFoldLength()];
         u16 l = Record::foldKey(k, key);
-        tree.updateInPlace({k, l}, [&](std::span<u8> payload) { fn(*reinterpret_cast<Record*>(payload.data())); });
+        tree.updateInPlace({k, l}, [&](std::span<u8> payload) {
+            assert(payload.size() == sizeof(Record));
+            fn(*reinterpret_cast<Record*>(payload.data()));
+        });
     }
     // -------------------------------------------------------------------------------------
     // Returns false if the record was not found

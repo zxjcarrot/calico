@@ -131,12 +131,10 @@ HNSW<DistanceMetric>::HNSW(u64 max_elements, size_t dim, size_t M_param, size_t 
         }
     }
 
-    bool recovered = false;
     if (!skip_recovery_param && params_match) {
         this->metadata_pid = meta_info->metadata_pid;
         this->base_pid = meta_info->base_pid;
         this->max_elements_ = meta_info->max_elements;
-        recovered = true;
         recovered_from_disk_ = true;
         std::cout << "[HNSW Recovery] Recovered existing index. metadata_pid=" << this->metadata_pid
                   << " base_pid=" << this->base_pid << std::endl;

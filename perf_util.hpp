@@ -40,7 +40,7 @@ inline void log(const std::string& msg) {
 namespace perf
 {
 
-constexpr std::size_t kNumEvents = 8;
+constexpr std::size_t kNumEvents = 10;
 
 struct EventConfig {
    perf_type_id type;
@@ -71,6 +71,8 @@ inline const std::array<EventConfig, kNumEvents>& eventConfigs()
         {PERF_TYPE_HARDWARE, PERF_COUNT_HW_CACHE_MISSES, "llc_store_misses"},
         {PERF_TYPE_HW_CACHE, PERF_COUNT_HW_CACHE_DTLB | (PERF_COUNT_HW_CACHE_OP_READ << 8) | (PERF_COUNT_HW_CACHE_RESULT_ACCESS << 16), "dtlb_refs"},
         {PERF_TYPE_HW_CACHE, PERF_COUNT_HW_CACHE_DTLB | (PERF_COUNT_HW_CACHE_OP_READ << 8) | (PERF_COUNT_HW_CACHE_RESULT_MISS << 16), "dtlb_misses"},
+        {PERF_TYPE_HARDWARE, PERF_COUNT_HW_STALLED_CYCLES_FRONTEND, "stalled_cycles_frontend"},
+        {PERF_TYPE_HARDWARE, PERF_COUNT_HW_STALLED_CYCLES_BACKEND, "stalled_cycles_backend"},
     }};
     return events;
 }
@@ -85,16 +87,12 @@ public:
 
    void setAvailability(const std::array<bool, kNumEvents>& avail)
    {
-      bool anyNew = false;
       for (std::size_t i = 0; i < kNumEvents; i++) {
          bool prev = availability[i].load(std::memory_order_relaxed);
          if (!prev && avail[i]) {
             availability[i].store(true, std::memory_order_relaxed);
-            anyNew = true;
          }
       }
-      // if (anyNew)
-      //    printConfiguredEvents();
    }
 
    void add(const std::array<std::uint64_t, kNumEvents>& values)
@@ -173,6 +171,16 @@ public:
       os << "derived_dtlb_miss_rate,";
       if (availability[6].load(std::memory_order_relaxed) && availability[7].load(std::memory_order_relaxed) && snapshot[6])
          os << snapshot[7] / static_cast<double>(snapshot[6]) << ",n/a\n";
+      else
+         os << "n/a,n/a\n";
+      os << "derived_frontend_stall_rate,";
+      if (availability[1].load(std::memory_order_relaxed) && availability[8].load(std::memory_order_relaxed) && snapshot[1])
+         os << snapshot[8] / static_cast<double>(snapshot[1]) << ",n/a\n";
+      else
+         os << "n/a,n/a\n";
+      os << "derived_backend_stall_rate,";
+      if (availability[1].load(std::memory_order_relaxed) && availability[9].load(std::memory_order_relaxed) && snapshot[1])
+         os << snapshot[9] / static_cast<double>(snapshot[1]) << ",n/a\n";
       else
          os << "n/a,n/a\n";
 

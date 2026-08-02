@@ -8,6 +8,7 @@
 #include <sys/mman.h>
 #include <mutex>
 #include "absl/container/flat_hash_map.h"
+#include "third_party/robin_hood.h"
 
 // Custom allocator that applies MADV_HUGEPAGE to allocated memory
 template <typename T>
@@ -230,6 +231,97 @@ public:
 template <typename K, typename V, typename HashFunc>
 class ShardedOpenAddressMap<K, V, 1, HashFunc> : public PartitionedMap<K, V> {
    absl::flat_hash_map<K, V, HashFunc, std::equal_to<K>, HugePageAllocator<std::pair<const K, V>>> map;
+
+public:
+   void reserve(size_t entries) override {
+      map.reserve(entries);
+   }
+
+   void insertOrAssign(const K& key, const V& value) override {
+      map.insert_or_assign(key, value);
+   }
+
+   bool tryGet(const K& key, V& value) const override {
+      auto it = map.find(key);
+      if (it == map.end())
+         return false;
+      value = it->second;
+      return true;
+   }
+
+   bool erase(const K& key, V& value) override {
+      auto it = map.find(key);
+      if (it == map.end())
+         return false;
+      value = it->second;
+      map.erase(it);
+      return true;
+   }
+};
+
+// Sharded wrapper around martinus/robin-hood-hashing's flat map. The upstream
+// container owns its allocation strategy, so this baseline intentionally uses
+// its native allocator while sharing Calico's hash function and sharding policy
+// with the other translation maps.
+template <typename K, typename V, size_t ShardCount = 64, typename HashFunc = Hasher<K>>
+class ShardedRobinHoodMap : public PartitionedMap<K, V> {
+   static_assert((ShardCount & (ShardCount - 1)) == 0, "ShardCount must be a power of two");
+
+   struct Shard {
+      robin_hood::unordered_flat_map<K, V, HashFunc> map;
+      mutable std::shared_mutex mutex;
+   };
+
+   std::array<Shard, ShardCount> shards;
+   HashFunc hasher;
+
+   static constexpr size_t shardMask = ShardCount - 1;
+
+   size_t shardFor(const K& key) const {
+      return hasher(key) & shardMask;
+   }
+
+public:
+   void reserve(size_t entries) override {
+      const size_t perShard = (entries + ShardCount - 1) / ShardCount;
+      for (auto& shard : shards) {
+         std::unique_lock lock(shard.mutex);
+         shard.map.reserve(perShard);
+      }
+   }
+
+   void insertOrAssign(const K& key, const V& value) override {
+      auto& shard = shards[shardFor(key)];
+      std::unique_lock lock(shard.mutex);
+      shard.map.insert_or_assign(key, value);
+   }
+
+   bool tryGet(const K& key, V& value) const override {
+      auto& shard = shards[shardFor(key)];
+      std::shared_lock lock(shard.mutex);
+      auto it = shard.map.find(key);
+      if (it == shard.map.end())
+         return false;
+      value = it->second;
+      return true;
+   }
+
+   bool erase(const K& key, V& value) override {
+      auto& shard = shards[shardFor(key)];
+      std::unique_lock lock(shard.mutex);
+      auto it = shard.map.find(key);
+      if (it == shard.map.end())
+         return false;
+      value = it->second;
+      shard.map.erase(it);
+      return true;
+   }
+};
+
+// Single-threaded specialization with no mutex or sharding overhead.
+template <typename K, typename V, typename HashFunc>
+class ShardedRobinHoodMap<K, V, 1, HashFunc> : public PartitionedMap<K, V> {
+   robin_hood::unordered_flat_map<K, V, HashFunc> map;
 
 public:
    void reserve(size_t entries) override {

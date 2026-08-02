@@ -46,6 +46,30 @@ The graph BFS benchmark creates a synthetic graph with configurable size and per
 
 Results are stored in `exps/in-memory/graph_bfs/` with automatic extraction to `graph_results_summary.csv` and detailed analysis in `graph_analysis.txt`.
 
+### Focused Graph Prefetch Microbench
+
+To isolate whether group prefetch helps array translation more than hash-table translation and PrediCache, run:
+
+```bash
+./exp_graph_prefetch_microbench.sh
+```
+
+This microbench runs graph BFS with `PREFETCH=0/1` for:
+- `calico_array` (`TRADITIONAL=1 TRADHASH=0`)
+- `calico_hash_open` (`TRADITIONAL=1 TRADHASH=2`)
+- `predicache` (`predictivetranslation-sigmod2026/predicache_oltp_query`)
+
+By default it executes multiple start nodes and repeats, then generates:
+- `graph_prefetch_microbench_summary.csv` (per-run raw rows)
+- `graph_prefetch_microbench_aggregate.csv` (avg/std/min/max by mechanism + prefetch)
+- `graph_prefetch_effectiveness.csv` (per-mechanism prefetch gain)
+- `array_prefetch_advantage.csv` (array gain vs hash and PrediCache)
+
+Useful knobs:
+- `GRAPH_NODES`, `GRAPH_STARTS` (comma-separated), `REPEATS`
+- `EXP_BASE_DIR` to redirect outputs
+- `PREDICACHE_IO_MODE=uring|libaio` (default `uring`)
+
 ## Pybind
 ```bash
 git submodule update --init --recursive

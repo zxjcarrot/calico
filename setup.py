@@ -12,7 +12,7 @@ tpcc_sources = glob.glob('tpcc/*.cpp') # Fixed the extension from .pp to .cpp, a
 
 # Combine all C++ source files needed for the module.
 # You need bindings.cpp (for Python interface) and all your original source files.
-all_sources = ['bindings.cpp', 'calico.cpp', 'hnsw.cpp', 'diskann.cpp', 'distance_diskann.cpp'] + tpcc_sources
+all_sources = ['bindings.cpp', 'calico.cpp', 'hnsw.cpp', 'ivf.cpp', 'pdx.cpp', 'diskann.cpp', 'distance_diskann.cpp'] + tpcc_sources
 #all_sources = ['bindings.cpp', 'calico.cpp', 'hnsw.cpp'] + tpcc_sources
 # --- MODIFICATION START: Added OpenMP flags ---
 
@@ -34,9 +34,10 @@ else:
 
 
 # Compiler arguments translated from your Makefile
+opt_level = os.getenv("CALICO_OPT_LEVEL", "3")
 cpp_args = [
     '-std=c++20',
-    '-O2',
+    f'-O{opt_level}',
     '-DNDEBUG',
     '-g3', # Generates debug info
     '-fnon-call-exceptions',
@@ -46,6 +47,14 @@ cpp_args = [
     '-ffast-math', # fast math
     '-fno-omit-frame-pointer'
 ] + openmp_compile_args # Add the OpenMP compile args
+
+# Optional: extra compiler nudges for auto-vectorization.
+if sys.platform != "win32" and os.getenv("CALICO_ENABLE_AUTOVEC", "1") == "1":
+    cpp_args.extend([
+        '-ftree-vectorize',
+        '-fopenmp-simd',
+        '-fno-math-errno'
+    ])
 
 # Optional: control HNSW_DISABLE_OPTIMISTIC_READ via env for ablation builds
 if os.getenv("CALICO_HNSW_DISABLE_OPTIMISTIC_READ", "0") == "1":
@@ -59,6 +68,9 @@ elif specialization == "hash":
     cpp_args.append("-DCALICO_SPECIALIZATION_HASH")
 # If not set or other value, no specialization macro is defined (uses residentPtr for generality)
 
+page_size = os.getenv("CALICO_PAGE_SIZE", "8192")
+cpp_args.append(f"-DCALICO_PAGE_SIZE={page_size}")
+
 # Linker arguments, if any are needed
 linker_args = [] + openmp_link_args # Add the OpenMP link args
 
@@ -68,6 +80,8 @@ calico_module = Extension(
     'calico_py',  # This is the name of the Python module (import calico_py)
     
     sources=all_sources,
+
+    depends=['calico.hpp', 'hash_tables.hpp', 'third_party/robin_hood.h'],
     
     # Include directories for header files.
     include_dirs=[

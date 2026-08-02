@@ -22,7 +22,7 @@ echo "Graph experiment directory: ${GRAPH_EXP_DIR}"
 THREAD_COUNTS=(1 4 8 16 32)
 
 # Base configuration names
-BASE_CONFIGS=("calico_array" "calico_mmap" "calico_chained_hash" "calico_openaddr_hash" "calico_lockfree_hash")
+BASE_CONFIGS=("calico_array" "calico_mmap" "calico_chained_hash" "calico_openaddr_hash" "calico_robinhood_hash" "calico_lockfree_hash" "predicache")
 
 # All configuration combinations
 CONFIGS=()
@@ -203,9 +203,9 @@ Configuration Comparison:
 ========================
 
 Thread counts tested: ${THREAD_COUNTS[*]}
-Base Configs: calico_array, calico_mmap, calico_chained_hash, calico_openaddr_hash, calico_lockfree_hash
+Base Configs: calico_array, calico_mmap, calico_chained_hash, calico_openaddr_hash, calico_robinhood_hash, calico_lockfree_hash
 Combinations per base config: PREFETCH={0,1} × NOHUGEPAGE_FRAME_MEM={0,1} = 4 combinations
-Total configurations: 5 base configs × 4 combinations × ${#THREAD_COUNTS[@]} thread counts = $((5 * 4 * ${#THREAD_COUNTS[@]}))
+Total configurations: 7 base configs × 4 combinations × ${#THREAD_COUNTS[@]} thread counts = $((7 * 4 * ${#THREAD_COUNTS[@]}))
 
 EOF
 

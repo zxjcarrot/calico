@@ -1,16 +1,1 @@
-ts,visits,rmb,wmb,system,threads,nodes,neighbors_per_node
-0,349000,0,0,traditional-array1,1,5000000,22
-1,373000,0,0,traditional-array1,1,5000000,22
-2,366000,0,0,traditional-array1,1,5000000,22
-3,367000,0,0,traditional-array1,1,5000000,22
-4,377000,0,0,traditional-array1,1,5000000,22
-5,367000,0,0,traditional-array1,1,5000000,22
-6,367000,0,0,traditional-array1,1,5000000,22
-7,366000,0,0,traditional-array1,1,5000000,22
-8,367000,0,0,traditional-array1,1,5000000,22
-9,375000,0,0,traditional-array1,1,5000000,22
-10,366000,0,0,traditional-array1,1,5000000,22
-11,366000,0,0,traditional-array1,1,5000000,22
-12,366000,0,0,traditional-array1,1,5000000,22
-bfs nodes=5000000 neighbors_per_node=22 nthreads=1 start_indices=[0]
-BFS completed: nthreads=1 avg_traversal_time=13623ms overall_time=13627ms total_visited=5000000
+graph_bfs nodes=5000000 neighbors_per_node=44 visited=5000000 value_sum=110125024213 time_ms=7532

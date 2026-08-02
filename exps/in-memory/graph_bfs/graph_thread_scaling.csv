@@ -1,5 +1,5 @@
 ThreadCount,Avg_Time_ms,Best_Config,Best_Time_ms
-1,43666.95,calico_mmap_noprefetch_huge,9244
+1,56850.18,calico_openaddr_hash_noprefetch_huge,30844
 4,56272.57,calico_mmap_noprefetch_huge,9032.75
 8,54638.03,calico_mmap_noprefetch_huge,8770.5
 16,58743.15,calico_mmap_noprefetch_huge,9511.62
