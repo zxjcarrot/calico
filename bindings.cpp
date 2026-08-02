@@ -117,6 +117,11 @@ PYBIND11_MODULE(calico_py, m) {
             "Flushes and shuts down the Calico storage subsystem.");
         m.def("flush_storage", []() { flush_system(); },
           "Flushes all dirty pages managed by the Calico buffer pool to persistent storage.");
+        m.def("reset_path_cache", []() {
+            if (bm_ptr != nullptr) {
+                bm_ptr->resetPathCache();
+            }
+        }, "Invalidates thread-local translation path-cache entries.");
                 m.def("warmup_storage_to_alloc_count", []() { warmup_storage_to_alloc_count(); },
                     "Sequentially accesses pid 1 through allocCount-1 to fault recovered pages in ascending pid order.");
                 m.def("snapshot_pid_to_frame_range", [](u64 start_pid, u64 count) {

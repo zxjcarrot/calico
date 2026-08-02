@@ -330,6 +330,53 @@ TwoLevelPageStateArray::~TwoLevelPageStateArray() {
     }
 }
 
+// HashThenArrayPageStateArray implementation
+HashThenArrayPageStateArray::HashThenArrayPageStateArray(u64 virtCount)
+    : second_level_arrays(nullptr), total_entries(virtCount) {
+    u32 totalBits = bitsNeeded(virtCount);
+    topBits = (totalBits > bottomBits) ? (totalBits - bottomBits) : 0;
+    num_top_slots = 1U << topBits;
+    entries_per_slot = 1U << bottomBits;
+
+    std::cerr << "[HashThenArrayPageStateArray] virtCount=" << virtCount
+              << " totalBits=" << totalBits
+              << " topBits=" << topBits << " (" << num_top_slots << " slots)"
+              << " bottomBits=" << bottomBits << " (" << entries_per_slot << " entries/slot)"
+              << std::endl;
+
+    const size_t top_size = num_top_slots * sizeof(PageState*);
+    second_level_arrays = static_cast<PageState**>(allocHuge(top_size));
+    if (second_level_arrays == MAP_FAILED) {
+        die("allocHuge HashThenArray top level");
+    }
+
+    const size_t second_level_size = entries_per_slot * sizeof(PageState);
+    top_level.reserve(num_top_slots);
+    for (u32 i = 0; i < num_top_slots; ++i) {
+        second_level_arrays[i] = static_cast<PageState*>(allocHuge(second_level_size));
+        if (second_level_arrays[i] == MAP_FAILED) {
+            die("allocHuge HashThenArray second level");
+        }
+        for (u32 j = 0; j < entries_per_slot; ++j) {
+            second_level_arrays[i][j].init();
+        }
+        top_level.insertOrAssign(i, second_level_arrays[i]);
+    }
+}
+
+HashThenArrayPageStateArray::~HashThenArrayPageStateArray() {
+    if (second_level_arrays) {
+        const size_t second_level_size = entries_per_slot * sizeof(PageState);
+        for (u32 i = 0; i < num_top_slots; ++i) {
+            if (second_level_arrays[i]) {
+                munmap(second_level_arrays[i], second_level_size);
+            }
+        }
+        const size_t top_size = num_top_slots * sizeof(PageState*);
+        munmap(second_level_arrays, top_size);
+    }
+}
+
 // ThreeLevelPageStateArray implementation
 ThreeLevelPageStateArray::ThreeLevelPageStateArray(u64 virtCount) 
     : total_entries(virtCount) {
@@ -1000,9 +1047,13 @@ BufferManager::BufferManager(unsigned nthreads)
         hashMode = HashMode::Array3Level;
     else if (tradHashSetting == 7)
         hashMode = HashMode::RobinHood;
+    else if (tradHashSetting == 8)
+        hashMode = HashMode::HashThenArray;
     else
         hashMode = HashMode::Array1Access;
-    PageState::setPackedMode(hashMode == HashMode::Array1Access || hashMode == HashMode::Array2Level || hashMode == HashMode::Array3Level);
+    enablePathCache = envOr("PATH_CACHE", 0) != 0;
+    PageState::setPackedMode(hashMode == HashMode::Array1Access || hashMode == HashMode::Array2Level ||
+                             hashMode == HashMode::Array3Level || hashMode == HashMode::HashThenArray);
     virtMem = nullptr;
     frameMem = nullptr;
     bool disableHugePageForFrameMem = envOr("NOHUGEPAGE_FRAME_MEM", 0);
@@ -1040,7 +1091,8 @@ BufferManager::BufferManager(unsigned nthreads)
             if (virtCount * sizeof(std::atomic<u64>) >= 2 * mb)
                 madvise(pidToFrameArray.get(), virtCount * sizeof(std::atomic<u64>), MADV_HUGEPAGE);
             for (u64 i = 0; i < virtCount; i++) pidToFrameArray[i].store(invalidFrame, std::memory_order_relaxed);
-        } else if (hashMode == HashMode::Array1Access || hashMode == HashMode::Array2Level || hashMode == HashMode::Array3Level) {
+        } else if (hashMode == HashMode::Array1Access || hashMode == HashMode::Array2Level ||
+                   hashMode == HashMode::Array3Level || hashMode == HashMode::HashThenArray) {
             pidToFrameArray.reset();
             pidToFrameHash.reset();
             frameToPidHash.reset();
@@ -1109,15 +1161,22 @@ BufferManager::BufferManager(unsigned nthreads)
         if (virtMem == MAP_FAILED) die("mmap failed");
     }
 
-    // Allocate PageState array (single-level or two-level)
+    // Allocate the PageState translation structure.
     if (hashMode == HashMode::Array2Level) {
         pageState = nullptr;
         pageState2Level = std::make_unique<TwoLevelPageStateArray>(virtCount);
         pageState3Level.reset();
+        pageStateHashThenArray.reset();
     } else if (hashMode == HashMode::Array3Level) {
         pageState = nullptr;
         pageState2Level.reset();
         pageState3Level = std::make_unique<ThreeLevelPageStateArray>(virtCount);
+        pageStateHashThenArray.reset();
+    } else if (hashMode == HashMode::HashThenArray) {
+        pageState = nullptr;
+        pageState2Level.reset();
+        pageState3Level.reset();
+        pageStateHashThenArray = std::make_unique<HashThenArrayPageStateArray>(virtCount);
     } else {
         if (disableHugePageForTranslationArray) {
             pageState = (PageState*)mmap(NULL, virtCount * sizeof(PageState), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -1131,6 +1190,7 @@ BufferManager::BufferManager(unsigned nthreads)
         pageState3Level.reset();
         // print pageState address
         std::cerr << "pageState: " << (void*)pageState  << " length " << virtCount * sizeof(PageState) << std::endl;
+        pageStateHashThenArray.reset();
     }
     // Determine OS page size for translation array based on huge page usage
     // Must align with the actual allocation: 4KB if huge pages disabled, 2MB otherwise
@@ -1222,6 +1282,7 @@ BufferManager::BufferManager(unsigned nthreads)
          << " trad_hash:" << static_cast<int>(hashMode) << " exmap:" << useExmap << " hugepage: " << (disableHugePageForFrameMem == 0)
          << " hugepage for translation array: " << (disableHugePageForTranslationArray == 0)
          << " translation_refcount:" << enableTranslationRefCount
+         << " path_cache:" << enablePathCache
             << " use_io_uring:" << useIOUring
          << " num_threads:" << numThreads 
             << " ignore_pid_allocator:" << ignorePidAllocator()
@@ -1315,7 +1376,8 @@ PID BufferManager::toPID(void* page) {
     if (useTraditional) {
         auto idx = ptr - frameMem;
         assert(idx >= 0 && static_cast<u64>(idx) < physCount);
-        if (hashMode == HashMode::Array || hashMode == HashMode::Array1Access || hashMode == HashMode::Array2Level || hashMode == HashMode::Array3Level) {
+        if (hashMode == HashMode::Array || hashMode == HashMode::Array1Access || hashMode == HashMode::Array2Level ||
+            hashMode == HashMode::Array3Level || hashMode == HashMode::HashThenArray) {
             PID pid = frameToPidArray[static_cast<size_t>(idx)].load(std::memory_order_acquire);
             assert(pid != invalidPID);
             return pid;
@@ -1370,7 +1432,8 @@ Page* BufferManager::residentPtr(PID pid, u64 stateAndVersion) {
     assert(pid < virtCount);
     if (!useTraditional) return virtMem + pid;
 
-    if (hashMode == HashMode::Array1Access || hashMode == HashMode::Array2Level || hashMode == HashMode::Array3Level) {
+    if (hashMode == HashMode::Array1Access || hashMode == HashMode::Array2Level || hashMode == HashMode::Array3Level ||
+        hashMode == HashMode::HashThenArray) {
         //pthread_rwlock_rdlock(&pid_locks[pid_lock_shard(pid)]);
         u64 frame = PageState::extractFrame(stateAndVersion);
         // u64 v = ps.getFrameValue();
@@ -1407,7 +1470,8 @@ u64 BufferManager::resolveMappedFrame(PID pid, u64 stateAndVersion) {
         return invalidFrame;
     }
 
-    if (hashMode == HashMode::Array1Access || hashMode == HashMode::Array2Level || hashMode == HashMode::Array3Level) {
+    if (hashMode == HashMode::Array1Access || hashMode == HashMode::Array2Level || hashMode == HashMode::Array3Level ||
+        hashMode == HashMode::HashThenArray) {
         return PageState::extractFrame(stateAndVersion);
     }
     if (hashMode == HashMode::Array) {
@@ -1693,7 +1757,8 @@ Page* BufferManager::acquireFrameForPid(PID pid, bool allow_eviction) {
         //pthread_rwlock_wrlock(&pid_locks[pid_lock_shard(pid)]);
         pidToFrameArray[pid].store(static_cast<u64>(frame), std::memory_order_release);
         frameToPidArray[frame].store(pid, std::memory_order_release);
-    } else if (hashMode == HashMode::Array1Access || hashMode == HashMode::Array2Level || hashMode == HashMode::Array3Level) {
+    } else if (hashMode == HashMode::Array1Access || hashMode == HashMode::Array2Level ||
+               hashMode == HashMode::Array3Level || hashMode == HashMode::HashThenArray) {
         
         // Increment reference counter for this OS page group (Array1Access only)
         if (hashMode == HashMode::Array1Access && translationRefCounts) {
@@ -1742,7 +1807,8 @@ void BufferManager::releaseFrame(PID pid) {
         frameId = pidToFrameArray[pid].exchange(invalidFrame, std::memory_order_acq_rel);
         assert(frameId != invalidFrame);
         frameToPidArray[static_cast<size_t>(frameId)].store(invalidPID, std::memory_order_release);
-    } else if (hashMode == HashMode::Array1Access || hashMode == HashMode::Array2Level || hashMode == HashMode::Array3Level) {
+    } else if (hashMode == HashMode::Array1Access || hashMode == HashMode::Array2Level ||
+               hashMode == HashMode::Array3Level || hashMode == HashMode::HashThenArray) {
         //pthread_rwlock_wrlock(&pid_locks[pid_lock_shard(pid)]);
         frameId = getPageState(pid).getFrameValue();
         assert(frameId != PageState::packedInvalidFrame);
@@ -2265,9 +2331,9 @@ void BufferManager::submitAsyncPrefetchPages(const PID* pages, int n_pages, cons
         return;
     //}
 
-    if (!useTraditional || hashMode == HashMode::Array1Access) {
+    if (!useTraditional || hashMode == HashMode::Array1Access || hashMode == HashMode::HashThenArray) {
         for (int i = 0; i < n_pages; ++i) {
-            PageState& ps = pageState[pages[i]];
+            PageState& ps = getPageState(pages[i]);
             _mm_prefetch(reinterpret_cast<const char*>(&ps), _MM_HINT_T0);
         }
     }
@@ -2400,9 +2466,9 @@ void BufferManager::submitAsyncPrefetchPages(const PID* pages, int n_pages, cons
 
 void BufferManager::prefetchPages(const PID* pages, int n_pages, const u32* offsets_within_pages) {
     //if (!useTraditional || hashMode == HashMode::Array1Access || hashMode == HashMode::Array || hashMode == HashMode::Array2Level) {
-    if (!useTraditional || hashMode == HashMode::Array1Access) {
+    if (!useTraditional || hashMode == HashMode::Array1Access || hashMode == HashMode::HashThenArray) {
         for (int i = 0; i < n_pages; i++) {
-            PageState& ps = pageState[pages[i]];
+            PageState& ps = getPageState(pages[i]);
             char * tmp = (char*)&ps;
             _mm_prefetch(reinterpret_cast<const char*>(tmp), _MM_HINT_T0);
         }
@@ -2435,8 +2501,7 @@ void BufferManager::prefetchPages(const PID* pages, int n_pages, const u32* offs
         //     _mm_prefetch(reinterpret_cast<const char*>(tmp), _MM_HINT_T0);
         // }
 
-        //PageState& ps = getPageState(pid);
-        PageState& ps = pageState[pages[i]];
+        PageState& ps = getPageState(pid);
         u64 stateAndVersion = ps.stateAndVersion.load(std::memory_order_acquire);
         u64 state = PageState::getState(stateAndVersion);
 
@@ -2509,9 +2574,9 @@ void BufferManager::prefetchPages(const PID* pages, int n_pages, const u32* offs
 }
 
 void BufferManager::prefetchResidentPages(const PID* pages, int n_pages, const u32* offsets_within_pages) {
-    if (!useTraditional || hashMode == HashMode::Array1Access) {
+    if (!useTraditional || hashMode == HashMode::Array1Access || hashMode == HashMode::HashThenArray) {
         for (int i = 0; i < n_pages; i++) {
-            PageState& ps = pageState[pages[i]];
+            PageState& ps = getPageState(pages[i]);
             char* tmp = reinterpret_cast<char*>(&ps);
             _mm_prefetch(reinterpret_cast<const char*>(tmp), _MM_HINT_T0);
         }
@@ -2521,7 +2586,7 @@ void BufferManager::prefetchResidentPages(const PID* pages, int n_pages, const u
         PID pid = pages[i];
         assert(pid < virtCount);
 
-        u64 stateAndVersion = pageState[pid].stateAndVersion.load(std::memory_order_acquire);
+        u64 stateAndVersion = getPageState(pid).stateAndVersion.load(std::memory_order_acquire);
         u64 state = PageState::getState(stateAndVersion);
         if (state == PageState::Evicted || state == PageState::ReadInFlight || state == PageState::Locked) continue;
 

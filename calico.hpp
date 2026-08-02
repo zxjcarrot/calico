@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 #include <functional>
 #include <limits>
 #include <memory>
@@ -385,6 +386,38 @@ struct TwoLevelPageStateArray {
     }
 };
 
+// Robin Hood hash lookup followed by a second-level PageState array.
+// The top-level map is populated once during initialization and is read-only
+// while workers access the translation structure.
+struct HashThenArrayPageStateArray {
+    static constexpr u32 bottomBits = 19;
+    using TopLevelMap = ShardedRobinHoodMap<u32, PageState*, 1>;
+
+    TopLevelMap top_level;
+    PageState** second_level_arrays;
+    u32 num_top_slots;
+    u32 entries_per_slot;
+    u32 topBits;
+    u64 total_entries;
+
+    HashThenArrayPageStateArray(u64 virtCount);
+    ~HashThenArrayPageStateArray();
+
+    inline PageState* getSecondLevelArray(u32 top_idx) const {
+        PageState* second_level = nullptr;
+        if (!top_level.tryGet(top_idx, second_level) || second_level == nullptr) {
+            std::abort();
+        }
+        return second_level;
+    }
+
+    inline PageState& get(PID pid) const {
+        u32 top_idx = static_cast<u32>(pid >> bottomBits);
+        u32 bottom_idx = static_cast<u32>(pid & ((1ULL << bottomBits) - 1));
+        return getSecondLevelArray(top_idx)[bottom_idx];
+    }
+};
+
 // Three-level indirection for PageState array
 struct ThreeLevelPageStateArray {
     static constexpr u32 bottomBits = 19;   // Fixed at 19 bits for bottom-level index
@@ -437,7 +470,8 @@ struct BufferManager {
         Lockfree = 4,
         Array2Level = 5,
         Array3Level = 6,
-        RobinHood = 7
+        RobinHood = 7,
+        HashThenArray = 8
     };
 
     bool useTraditional;
@@ -484,6 +518,9 @@ struct BufferManager {
     PageState* pageState;                                    // Single-level array (for non-Array2Level/Array3Level modes)
     std::unique_ptr<TwoLevelPageStateArray> pageState2Level; // Two-level array (for Array2Level mode)
     std::unique_ptr<ThreeLevelPageStateArray> pageState3Level; // Three-level array (for Array3Level mode)
+    std::unique_ptr<HashThenArrayPageStateArray> pageStateHashThenArray;
+    bool enablePathCache;
+    std::atomic<u64> pathCacheEpoch{0};
     std::unique_ptr<std::atomic<u64>[]> pidToFrameArray;
     bool enableTranslationRefCount;
     std::atomic<u32>* translationRefCounts;  // Reference counts for OS page groups (lazily allocated via mmap)
@@ -506,14 +543,38 @@ struct BufferManager {
     bool useIOUring;
 
     PageState& getPageState(PID pid) {
-        // if (hashMode == HashMode::Array2Level) {
-        //     return pageState2Level->get(pid);
-        // }
-        // if (hashMode == HashMode::Array3Level) {
-        //     return pageState3Level->get(pid);
-        // }
+        if (hashMode == HashMode::HashThenArray) {
+            constexpr u64 bottomMask = (1ULL << HashThenArrayPageStateArray::bottomBits) - 1;
+            const u32 top_idx = static_cast<u32>(pid >> HashThenArrayPageStateArray::bottomBits);
+            const u32 bottom_idx = static_cast<u32>(pid & bottomMask);
+
+            struct PathCacheEntry {
+                const BufferManager* owner = nullptr;
+                u32 top_idx = 0;
+                u64 epoch = 0;
+                PageState* second_level = nullptr;
+            };
+            static thread_local PathCacheEntry cache;
+
+            const u64 epoch = pathCacheEpoch.load(std::memory_order_relaxed);
+            PageState* second_level = nullptr;
+            if (enablePathCache && cache.owner == this && cache.top_idx == top_idx && cache.epoch == epoch) {
+                second_level = cache.second_level;
+            } else {
+                second_level = pageStateHashThenArray->getSecondLevelArray(top_idx);
+                if (enablePathCache) {
+                    cache.owner = this;
+                    cache.top_idx = top_idx;
+                    cache.epoch = epoch;
+                    cache.second_level = second_level;
+                }
+            }
+            return second_level[bottom_idx];
+        }
         return pageState[pid];
     }
+
+    void resetPathCache() { pathCacheEpoch.fetch_add(1, std::memory_order_relaxed); }
     u64 pid_lock_shard(PID pid) {
         return pid % NUM_LOCK_SHARDS;
     }

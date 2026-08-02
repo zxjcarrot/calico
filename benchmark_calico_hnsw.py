@@ -1239,7 +1239,7 @@ def benchmark_calico_config(X_base, X_query, ground_truth, params, num_threads, 
     Benchmark a specific Calico configuration.
     
     Config environment variables should be set before calling this function:
-    - PHYSGB, TRADITIONAL, TRADHASH, NOHUGEPAGE_FRAME_MEM, PREFETCH
+    - PHYSGB, TRADITIONAL, TRADHASH, NOHUGEPAGE_FRAME_MEM, PREFETCH, PATH_CACHE
     
     Args:
         X_base: Base dataset (can be None if base_file is provided for streaming)
@@ -1277,6 +1277,7 @@ def benchmark_calico_config(X_base, X_query, ground_truth, params, num_threads, 
         'TRADHASH': os.environ.get('TRADHASH', 'N/A'),
         'NOHUGEPAGE_FRAME_MEM': os.environ.get('NOHUGEPAGE_FRAME_MEM', 'N/A'),
         'PREFETCH': os.environ.get('PREFETCH', 'N/A'),
+        'PATH_CACHE': os.environ.get('PATH_CACHE', 'N/A'),
         "NOHUGEPAGE_TRASNLATION_ARRAY": os.environ.get("NOHUGEPAGE_TRANSLATION_ARRAY", "N/A"),
     }
     results.update(env_config)
@@ -1479,7 +1480,8 @@ def benchmark_calico_config(X_base, X_query, ground_truth, params, num_threads, 
 
     ef_search = params.get("ef_search", 50) + 8 
     print(f"\nQuerying for k={k} nearest neighbors with ef_search={ef_search}, threads={num_threads}...")
-    
+    if hasattr(calico_py, 'reset_path_cache'):
+        calico_py.reset_path_cache()
     index_calico.reset_stats()
     collect_search_stats = _read_bool_env("CALICO_ENABLE_SEARCH_STATS", False)
 
