@@ -31,6 +31,10 @@ using namespace std;
 // Global BufferManager instance
 extern BufferManager* bm_ptr;
 
+// Logical scan order. Page IDs are allocated sequentially, then optionally
+// permuted to model a B-tree leaf scan over non-consecutive pages.
+static vector<PID> g_scanOrder;
+
 // Benchmark configuration
 struct OLAPConfig {
     enum class OpType {
@@ -44,6 +48,11 @@ struct OLAPConfig {
         Row,                 // Row-oriented layout (Array of Structures)
     };
 
+    enum class ScanMode {
+        Sequential,
+        Random,
+    };
+
     u64 numPages;           // Total number of pages available
     u64 scanPages;          // Number of pages to scan per query (default 25% of total)
     u64 scanStartPage;      // Starting page for scan (randomized)
@@ -51,12 +60,14 @@ struct OLAPConfig {
     unsigned nthreads;      // Number of worker threads
     OpType opType;          // Operation type
     LayoutType layoutType;  // Page layout type
+    ScanMode scanMode;      // Sequential heap scan or random leaf scan
     double selectivity;     // Filter selectivity (0.0 to 1.0)
     bool enablePerf;        // Enable performance counters
     
     OLAPConfig() : numPages(1000000), scanPages(0), scanStartPage(0), 
                    runForSec(30), nthreads(1), 
                    opType(OpType::FilteredCount), layoutType(LayoutType::Columnar),
+                   scanMode(ScanMode::Sequential),
                    selectivity(0.1), enablePerf(false) {
         // Default: scan 25% of total pages
         scanPages = numPages / 4;
@@ -174,7 +185,7 @@ static T envOr(const char* name, T defaultValue) {
 }
 
 // Initialize pages with linked structure (mimics B-tree leaf level)
-PID initializePagesColumnar(u64 numPages, unsigned nthreads) {
+PID initializePagesColumnar(u64 numPages, unsigned nthreads, OLAPConfig::ScanMode scanMode) {
     cerr << "Initializing " << numPages << " pages (columnar layout)..." << endl;
     
     std::vector<PID> pagePids;
@@ -189,15 +200,21 @@ PID initializePagesColumnar(u64 numPages, unsigned nthreads) {
         pagePids.push_back(pid);
         bm.unfixX(pid);
     }
+    g_scanOrder = pagePids;
+    if (scanMode == OLAPConfig::ScanMode::Random) {
+        std::mt19937_64 scanRng(42);
+        std::shuffle(g_scanOrder.begin(), g_scanOrder.end(), scanRng);
+    }
     // Initialize pages sequentially (no parallelization)
     for (u64 i = 0; i < numPages; i++) {
-        PID pid = pagePids[i];
+        PID pid = g_scanOrder[i];
         Page* rawPage = bm.fixX(pid);
         OLAPPageColumnar* page = reinterpret_cast<OLAPPageColumnar*>(rawPage);
 
         // Initialize header
+        rawPage->dirty = true;
         page->recordCount = OLAPPageColumnar::maxRecords();
-        page->nextPage = (i + 1 < numPages) ? pagePids[i + 1] : BufferManager::invalidPID;
+        page->nextPage = (i + 1 < numPages) ? g_scanOrder[i + 1] : BufferManager::invalidPID;
         page->pageId = i;
         page->sumValue = 0;
 
@@ -219,18 +236,17 @@ PID initializePagesColumnar(u64 numPages, unsigned nthreads) {
             }
         }
 
-        rawPage->dirty = true;
         bm.unfixX(pid);
     }
-    cout << "First page PID: " << pagePids.front() << endl;
+    cout << "First page PID: " << g_scanOrder.front() << endl;
     
     cerr << "Initialization complete. Space: " 
          << (bm.allocCount.load() * pageSize) / (float)BufferManager::gb << " GB" << endl;
-    return pagePids.front();
+    return g_scanOrder.front();
 }
 
 // Initialize pages with row-oriented layout
-PID initializePagesRow(u64 numPages, unsigned nthreads) {
+PID initializePagesRow(u64 numPages, unsigned nthreads, OLAPConfig::ScanMode scanMode) {
     cerr << "Initializing " << numPages << " pages (row-oriented layout)..." << endl;
     
     std::vector<PID> pagePids;
@@ -245,15 +261,21 @@ PID initializePagesRow(u64 numPages, unsigned nthreads) {
         pagePids.push_back(pid);
         bm.unfixX(pid);
     }
+    g_scanOrder = pagePids;
+    if (scanMode == OLAPConfig::ScanMode::Random) {
+        std::mt19937_64 scanRng(42);
+        std::shuffle(g_scanOrder.begin(), g_scanOrder.end(), scanRng);
+    }
     // Initialize pages sequentially (no parallelization)
     for (u64 i = 0; i < numPages; i++) {
-        PID pid = pagePids[i];
+        PID pid = g_scanOrder[i];
         Page* rawPage = bm.fixX(pid);
         OLAPPageRow* page = reinterpret_cast<OLAPPageRow*>(rawPage);
 
         // Initialize header
+        rawPage->dirty = true;
         page->recordCount = OLAPPageRow::maxRecords();
-        page->nextPage = (i + 1 < numPages) ? pagePids[i + 1] : BufferManager::invalidPID;
+        page->nextPage = (i + 1 < numPages) ? g_scanOrder[i + 1] : BufferManager::invalidPID;
         page->pageId = i;
         page->sumValue = 0;
 
@@ -275,14 +297,13 @@ PID initializePagesRow(u64 numPages, unsigned nthreads) {
             }
         }
 
-        rawPage->dirty = true;
         bm.unfixX(pid);
     }
-    cout << "First page PID: " << pagePids.front() << endl;
+    cout << "First page PID: " << g_scanOrder.front() << endl;
     
     cerr << "Initialization complete. Space: " 
          << (bm.allocCount.load() * pageSize) / (float)BufferManager::gb << " GB" << endl;
-    return pagePids.front();
+    return g_scanOrder.front();
 }
 
 // Worker function for filtered count - executes ONE query and returns
@@ -613,11 +634,13 @@ void runOLAPBenchmark(const OLAPConfig& config, PID firstPageId) {
     
     // Get layout type name
     const char* layoutName = (config.layoutType == OLAPConfig::LayoutType::Columnar) ? "columnar" : "row";
+    const char* scanModeName = config.scanMode == OLAPConfig::ScanMode::Sequential ? "sequential" : "random";
     
     cerr << "Running OLAP benchmark:" << endl;
     cerr << "  System: " << systemName << endl;
     cerr << "  Operation: " << opName << endl;
     cerr << "  Layout: " << layoutName << endl;
+    cerr << "  Scan mode: " << scanModeName << endl;
     cerr << "  Pages: " << config.numPages << endl;
     cerr << "  Threads: " << config.nthreads << endl;
     cerr << "  Selectivity: " << config.selectivity << endl;
@@ -638,7 +661,7 @@ void runOLAPBenchmark(const OLAPConfig& config, PID firstPageId) {
             }
         }
         
-        *out << "ts,queries_per_sec,rmb,wmb,system,threads,total_pages,operation,layout,selectivity" << endl;
+        *out << "ts,queries_per_sec,rmb,wmb,system,threads,total_pages,operation,layout,scan_mode,selectivity" << endl;
         u64 cnt = 0;
         u64 totalQueries = 0;
         u32 sleepSeconds = 5;
@@ -651,7 +674,7 @@ void runOLAPBenchmark(const OLAPConfig& config, PID firstPageId) {
             
             *out << cnt << "," << queries << "," << rmb << "," << wmb << "," 
                  << systemName << "," << config.nthreads << "," << config.numPages << "," 
-                 << opName << "," << layoutName << "," << config.selectivity << endl;
+                 << opName << "," << layoutName << "," << scanModeName << "," << config.selectivity << endl;
             cnt += sleepSeconds;  // Adjust timestamp for multi-second sleep
         }
         
@@ -659,7 +682,7 @@ void runOLAPBenchmark(const OLAPConfig& config, PID firstPageId) {
         double avgQueriesPerSec = (config.runForSec > 0) ? (double)totalQueries / config.runForSec : 0.0;
         *out << "avg_queries_per_sec," << avgQueriesPerSec << ",0,0," 
              << systemName << "," << config.nthreads << "," << config.numPages << "," 
-             << opName << "," << layoutName << "," << config.selectivity << endl;
+             << opName << "," << layoutName << "," << scanModeName << "," << config.selectivity << endl;
         
         keepRunning = false;
     };
@@ -672,15 +695,14 @@ void runOLAPBenchmark(const OLAPConfig& config, PID firstPageId) {
     
     // Launch worker threads - each continuously loops and executes queries
     vector<thread> workers;
-    std::unique_ptr<perf::Scope> perfScope;
-    
-    if (config.enablePerf) {
-        perfScope = std::make_unique<perf::Scope>();
-    }
     
     for (unsigned i = 0; i < config.nthreads; i++) {
         workers.emplace_back([&, i]() {
             workerThreadId = i;
+            std::unique_ptr<perf::Scope> perfScope;
+            if (config.enablePerf) {
+                perfScope = std::make_unique<perf::Scope>();
+            }
             
             // Random number generator for selecting random starting PIDs
             std::mt19937_64 rng(42 + i);  // Seed with thread ID for reproducibility
@@ -690,7 +712,7 @@ void runOLAPBenchmark(const OLAPConfig& config, PID firstPageId) {
             while (keepRunning.load()) {
                 // Randomly select starting PID for this query
                 u64 startOffset = dist(rng);
-                u64 startPid = firstPageId + startOffset;
+                u64 startPid = g_scanOrder[startOffset];
                 
                 // Execute one query - dispatch based on layout type
                 QueryStats stats;
@@ -728,6 +750,7 @@ void runOLAPBenchmark(const OLAPConfig& config, PID firstPageId) {
                 
                 // Query completed, increment progress
                 txProgress.fetch_add(1);
+                txTotal.fetch_add(1);
             }
         });
     }
@@ -739,10 +762,10 @@ void runOLAPBenchmark(const OLAPConfig& config, PID firstPageId) {
     }
     
     if (config.enablePerf) {
-        perf::Aggregator::instance().report(txProgress.load());
+        perf::Aggregator::instance().report(totalPagesScanned.load());
     }
     
-        const u64 totalQueries = txProgress.load();
+        const u64 totalQueries = txTotal.load();
         const double avgPages = totalQueries ? static_cast<double>(totalPagesScanned.load()) / totalQueries : 0.0;
         const double avgRecords = totalQueries ? static_cast<double>(totalRecordsCounted.load()) / totalQueries : 0.0;
         const double avgSum = totalQueries ? static_cast<double>(totalSum.load()) / totalQueries : 0.0;
@@ -828,10 +851,27 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
+
+    const char* scanModeStr = getenv("SCANMODE");
+    if (scanModeStr) {
+        string scanMode(scanModeStr);
+        std::transform(scanMode.begin(), scanMode.end(), scanMode.begin(), [](unsigned char c) { return std::tolower(c); });
+        if (scanMode == "sequential") {
+            config.scanMode = OLAPConfig::ScanMode::Sequential;
+        } else if (scanMode == "random") {
+            config.scanMode = OLAPConfig::ScanMode::Random;
+        } else {
+            cerr << "Unknown SCANMODE: " << scanMode << endl;
+            cerr << "Valid options: sequential, random" << endl;
+            return 1;
+        }
+    }
     
     cerr << "Configuration:" << endl;
     cerr << "  Layout: " << (config.layoutType == OLAPConfig::LayoutType::Columnar ? "columnar" : "row") << endl;
     cerr << "  Operation: " << (opTypeStr ? opTypeStr : "filtered_count") << endl;
+    cerr << "  Scan mode: "
+         << (config.scanMode == OLAPConfig::ScanMode::Sequential ? "sequential" : "random") << endl;
     
     // Initialize BufferManager (same as calico.cpp)
     // BufferManager constructor reads these environment variables:
@@ -848,9 +888,9 @@ int main(int argc, char** argv) {
     // Initialize pages with appropriate layout
     PID firstPageId;
     if (config.layoutType == OLAPConfig::LayoutType::Columnar) {
-        firstPageId = initializePagesColumnar(config.numPages, config.nthreads);
+        firstPageId = initializePagesColumnar(config.numPages, config.nthreads, config.scanMode);
     } else {
-        firstPageId = initializePagesRow(config.numPages, config.nthreads);
+        firstPageId = initializePagesRow(config.numPages, config.nthreads, config.scanMode);
     }
     
     // Run benchmark
