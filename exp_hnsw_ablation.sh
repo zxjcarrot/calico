@@ -3,58 +3,13 @@
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}" )" && pwd)"
-RUN_ID="${CALICO_ABLATION_RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
-DEFAULT_RESULTS_ROOT="${SCRIPT_DIR}/Calico-SIGMOD27/data/exps/in-memory/ablation_figure11_hash_then_array"
-RESULTS_BASE_DIR="${CALICO_ABLATION_RESULTS_DIR:-${DEFAULT_RESULTS_ROOT}_${RUN_ID}}"
-BLOCK_FILE="${BLOCK:-${TMPDIR:-/tmp}/calico-hash-then-array-figure11-${RUN_ID}.heapfile}"
-HEAPFILE_SIZE="${CALICO_HEAPFILE_SIZE:-24G}"
+RESULTS_BASE_DIR="${CALICO_ABLATION_RESULTS_DIR:-${SCRIPT_DIR}/Calico-SIGMOD27/data/exps/in-memory/ablation_figure11_hash_then_array}"
 LOCK_FILE="${CALICO_ABLATION_LOCK_FILE:-${TMPDIR:-/tmp}/calico-exp-hnsw-ablation.lock}"
-SCREEN_NAME="${CALICO_ABLATION_SCREEN_NAME:-calico-figure11-${RUN_ID}}"
-RUN_LOG="${CALICO_ABLATION_RUN_LOG:-${RESULTS_BASE_DIR}/ablation_runner.log}"
+BLOCK_FILE="${BLOCK:-${TMPDIR:-/tmp}/calico-hnsw-ablation.heapfile}"
+HEAPFILE_SIZE="${CALICO_HEAPFILE_SIZE:-24G}"
 PYTHON="${PYTHON:-python3}"
 
-usage() {
-  cat <<'EOF'
-Usage: ./exp_hnsw_ablation.sh [--background|--foreground]
-
-The default mode runs in the current shell. --background starts the same
-experiment in a detached screen session and returns immediately.
-EOF
-}
-
-MODE="foreground"
-case "${1:-}" in
-  "") ;;
-  --foreground) ;;
-  --background) MODE="background" ;;
-  --help|-h) usage; exit 0 ;;
-  *) usage >&2; exit 2 ;;
-esac
-
-if [[ "$MODE" == "background" ]]; then
-  if ! command -v screen >/dev/null 2>&1; then
-    echo "[ablation] --background requires screen." >&2
-    exit 1
-  fi
-  if screen -list 2>/dev/null | grep -Fq ".${SCREEN_NAME}"; then
-    echo "[ablation] Screen session already exists: ${SCREEN_NAME}" >&2
-    exit 1
-  fi
-
-  mkdir -p "$(dirname "$RUN_LOG")"
-  screen -dmS "$SCREEN_NAME" bash -c \
-    "cd '$SCRIPT_DIR' && \
-     env BLOCK='$BLOCK_FILE' CALICO_ABLATION_RESULTS_DIR='$RESULTS_BASE_DIR' \
-     CALICO_ABLATION_RUN_ID='$RUN_ID' '$SCRIPT_DIR/exp_hnsw_ablation.sh' --foreground \
-     > '$RUN_LOG' 2>&1; \
-     status=\$?; printf '\\n[screen] exit=%s\\n' \"\$status\" >> '$RUN_LOG'; \
-     exit \"\$status\""
-  echo "[ablation] Started screen session: ${SCREEN_NAME}"
-  echo "[ablation] Log: ${RUN_LOG}"
-  echo "[ablation] Results: ${RESULTS_BASE_DIR}"
-  exit 0
-fi
-
+# Only one runner may remove and rebuild the shared extension at a time.
 exec 9>"$LOCK_FILE"
 if ! flock -n 9; then
   echo "[ablation] Another HNSW ablation run is already using the build directory." >&2
@@ -65,6 +20,10 @@ fi
 prepare_heapfile() {
   if [[ ! -e "$BLOCK_FILE" ]]; then
     echo "[ablation] Creating sparse heapfile: ${BLOCK_FILE} (${HEAPFILE_SIZE})"
+    truncate -s "$HEAPFILE_SIZE" "$BLOCK_FILE"
+  elif [[ "${CALICO_RESET_BLOCK:-0}" == "1" ]]; then
+    echo "[ablation] Resetting heapfile: ${BLOCK_FILE} (${HEAPFILE_SIZE})"
+    truncate -s 0 "$BLOCK_FILE"
     truncate -s "$HEAPFILE_SIZE" "$BLOCK_FILE"
   fi
   export BLOCK="$BLOCK_FILE"
@@ -80,14 +39,15 @@ PHYSMEM=16G
 VIRTMEM=24G
 BUILD_THREADS=64
 SEARCH_THREADS=1
+PAGE_SIZE="${CALICO_PAGE_SIZE:-8192}"
 
 # Ablation stages from Figure 11 in main_revised.tex.
 # Fields: name:traditional:tradhash:nohuge_frame:nohuge_trans:optread_disabled:prefetch:path_cache:specialization
 AB_STAGES=(
   "1_hash_only:1:2:1:1:1:0:0:hash"                              # Open-address hash baseline
   "2_array_index:1:0:1:1:1:0:0:calico"                         # + direct array indexing
-  "3_hash_then_array:1:8:1:1:1:0:0:calico"                     # + Robin Hood top-level lookup
-  "4_hash_then_array_path:1:8:1:1:1:0:1:calico"                # + thread-local path cache
+  "3_hash_then_array:1:8:1:1:1:0:0:calico"                     # + Open-address top-level lookup
+  "4_hash_then_array_path:1:8:1:1:1:0:1:calico"                # + compiled path cache
   "5_hash_then_array_path_huge_frames:1:8:0:1:1:0:1:calico"    # + huge page frames
   "6_hash_then_array_path_huge_trans:1:8:0:0:1:0:1:calico"     # + huge translation-array pages
   "7_hash_then_array_path_optread:1:8:0:0:0:0:1:calico"       # + optimistic reads
@@ -112,6 +72,8 @@ run_stage() {
   export NOHUGEPAGE_TRANSLATION_ARRAY="$nohuge_trans"
   export PREFETCH="$prefetch"
   export PATH_CACHE="$path_cache"
+  export CALICO_BOUND_PATH_CACHE="$path_cache"
+  export CALICO_PAGE_SIZE="$PAGE_SIZE"
   export PHYSGB="$PHYSMEM"
   export VIRTGB="$VIRTMEM"
   export CALICO_RUN_LABEL="$name"
@@ -123,8 +85,8 @@ run_stage() {
     unset CALICO_HNSW_DISABLE_OPTIMISTIC_READ
   fi
 
-  # Clean and rebuild bindings for this configuration. The lock acquired by
-  # main prevents another ablation run from removing build/ concurrently.
+  # Clean and rebuild bindings for this configuration. The lock above prevents
+  # another ablation run from removing build/ concurrently.
   echo "[ablation] Cleaning previous build artifacts..."
   (cd "${SCRIPT_DIR}" && rm -rf build calico_py*.so && mkdir -p build)
   echo "[ablation] Rebuilding Python bindings..."
@@ -158,15 +120,28 @@ run_stage() {
 
 main() {
   echo "Ablation experiment on $DATASET (search_threads=${SEARCH_THREADS}, build_threads=${BUILD_THREADS})"
-  echo "Results directory: ${RESULTS_BASE_DIR}"
+  echo "Page size: ${PAGE_SIZE} bytes"
   echo "Heapfile: ${BLOCK_FILE}"
   prepare_heapfile
   mkdir -p "$RESULTS_BASE_DIR"
 
   # Remember original CALICO_HNSW_DISABLE_OPTIMISTIC_READ
   local orig_optread="${CALICO_HNSW_DISABLE_OPTIMISTIC_READ-}"
+  local start_stage="${CALICO_ABLATION_START_STAGE:-1}"
+  local end_stage="${CALICO_ABLATION_END_STAGE:-${#AB_STAGES[@]}}"
+  if (( start_stage < 1 || end_stage > ${#AB_STAGES[@]} || start_stage > end_stage )); then
+    echo "[ablation] Invalid stage range: ${start_stage}-${end_stage}" >&2
+    return 1
+  fi
 
+  echo "Stage range: ${start_stage}-${end_stage}"
+
+  local stage_index=0
   for s in "${AB_STAGES[@]}"; do
+    stage_index=$((stage_index + 1))
+    if (( stage_index < start_stage || stage_index > end_stage )); then
+      continue
+    fi
     run_stage "$s"
     sleep 2
   done
@@ -176,14 +151,6 @@ main() {
     export CALICO_HNSW_DISABLE_OPTIMISTIC_READ="$orig_optread"
   else
     unset CALICO_HNSW_DISABLE_OPTIMISTIC_READ
-  fi
-
-  if [[ "${CALICO_SKIP_EXTRACT:-0}" != "1" ]]; then
-    echo "[ablation] Extracting completed results..."
-    if ! CALICO_ABLATION_RESULTS_DIR="$RESULTS_BASE_DIR" \
-      "$SCRIPT_DIR/extract_results_hnsw_ablation.sh"; then
-      echo "[ablation] Warning: result extraction failed." >&2
-    fi
   fi
 
   echo "Ablation experiments completed. Results in $RESULTS_BASE_DIR"

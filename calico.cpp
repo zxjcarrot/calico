@@ -331,49 +331,70 @@ TwoLevelPageStateArray::~TwoLevelPageStateArray() {
 }
 
 // HashThenArrayPageStateArray implementation
-HashThenArrayPageStateArray::HashThenArrayPageStateArray(u64 virtCount)
-    : second_level_arrays(nullptr), total_entries(virtCount) {
+HashThenArrayPageStateArray::HashThenArrayPageStateArray(u64 virtCount, bool disableHugePages)
+    : second_level_arrays(nullptr), total_entries(virtCount), disable_huge_pages(disableHugePages) {
+    assert(virtCount > 0);
     u32 totalBits = bitsNeeded(virtCount);
     topBits = (totalBits > bottomBits) ? (totalBits - bottomBits) : 0;
-    num_top_slots = 1U << topBits;
-    entries_per_slot = 1U << bottomBits;
+    entries_per_slot = PID{1} << bottomBits;
+    num_top_slots = 1 + ((virtCount - 1) >> bottomBits);
+    top_level_entry_count = std::max(topLevelEntries, num_top_slots);
 
     std::cerr << "[HashThenArrayPageStateArray] virtCount=" << virtCount
               << " totalBits=" << totalBits
-              << " topBits=" << topBits << " (" << num_top_slots << " slots)"
+              << " topBits=" << topBits << " (" << num_top_slots << " valid slots, "
+              << top_level_entry_count << " hash entries)"
               << " bottomBits=" << bottomBits << " (" << entries_per_slot << " entries/slot)"
               << std::endl;
 
-    const size_t top_size = num_top_slots * sizeof(PageState*);
-    second_level_arrays = static_cast<PageState**>(allocHuge(top_size));
-    if (second_level_arrays == MAP_FAILED) {
-        die("allocHuge HashThenArray top level");
+    second_level_arrays = std::make_unique<std::atomic<PageState*>[]>(num_top_slots);
+    for (u64 top_key = 0; top_key < num_top_slots; ++top_key) {
+        second_level_arrays[top_key].store(nullptr, std::memory_order_relaxed);
     }
 
-    const size_t second_level_size = entries_per_slot * sizeof(PageState);
-    top_level.reserve(num_top_slots);
-    for (u32 i = 0; i < num_top_slots; ++i) {
-        second_level_arrays[i] = static_cast<PageState*>(allocHuge(second_level_size));
-        if (second_level_arrays[i] == MAP_FAILED) {
-            die("allocHuge HashThenArray second level");
-        }
-        for (u32 j = 0; j < entries_per_slot; ++j) {
-            second_level_arrays[i][j].init();
-        }
-        top_level.insertOrAssign(i, second_level_arrays[i]);
+    top_level.reserve(static_cast<size_t>(top_level_entry_count));
+    for (PID top_key = 0; top_key < top_level_entry_count; ++top_key) {
+        top_level.insertOrAssign(top_key, nullptr);
     }
 }
 
+PageState* HashThenArrayPageStateArray::allocateSecondLevelArray(PID top_key) const {
+    PageState* second_level = second_level_arrays[top_key].load(std::memory_order_acquire);
+    if (second_level != nullptr) {
+        return second_level;
+    }
+
+    std::lock_guard<std::mutex> lock(second_level_allocation_mutex);
+    second_level = second_level_arrays[top_key].load(std::memory_order_relaxed);
+    if (second_level != nullptr) {
+        return second_level;
+    }
+
+    const u64 slot_entries = entriesInSlot(top_key);
+    const size_t second_level_size = static_cast<size_t>(slot_entries) * sizeof(PageState);
+    void* allocation = mmap(nullptr, second_level_size, PROT_READ | PROT_WRITE,
+                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (allocation == MAP_FAILED) {
+        die("mmap HashThenArray second level");
+    }
+    madvise(allocation, second_level_size, disable_huge_pages ? MADV_NOHUGEPAGE : MADV_HUGEPAGE);
+
+    second_level = static_cast<PageState*>(allocation);
+    for (u64 j = 0; j < slot_entries; ++j) {
+        second_level[j].init();
+    }
+    second_level_arrays[top_key].store(second_level, std::memory_order_release);
+    return second_level;
+}
+
 HashThenArrayPageStateArray::~HashThenArrayPageStateArray() {
-    if (second_level_arrays) {
-        const size_t second_level_size = entries_per_slot * sizeof(PageState);
-        for (u32 i = 0; i < num_top_slots; ++i) {
-            if (second_level_arrays[i]) {
-                munmap(second_level_arrays[i], second_level_size);
-            }
+    for (PID top_key = 0; top_key < num_top_slots; ++top_key) {
+        PageState* second_level = second_level_arrays[top_key].load(std::memory_order_relaxed);
+        if (second_level != nullptr) {
+            const size_t second_level_size =
+                static_cast<size_t>(entriesInSlot(top_key)) * sizeof(PageState);
+            munmap(second_level, second_level_size);
         }
-        const size_t top_size = num_top_slots * sizeof(PageState*);
-        munmap(second_level_arrays, top_size);
     }
 }
 
@@ -1051,7 +1072,16 @@ BufferManager::BufferManager(unsigned nthreads)
         hashMode = HashMode::HashThenArray;
     else
         hashMode = HashMode::Array1Access;
-    enablePathCache = envOr("PATH_CACHE", 0) != 0;
+#if defined(CALICO_PATH_CACHE)
+    if (hashMode != HashMode::HashThenArray) {
+        die("CALICO_PATH_CACHE requires TRADHASH=8");
+    }
+#endif
+#if defined(CALICO_DIRECT_PAGE_STATE)
+    if (hashMode != HashMode::Array1Access) {
+        die("CALICO_DIRECT_PAGE_STATE requires TRADHASH=0");
+    }
+#endif
     PageState::setPackedMode(hashMode == HashMode::Array1Access || hashMode == HashMode::Array2Level ||
                              hashMode == HashMode::Array3Level || hashMode == HashMode::HashThenArray);
     virtMem = nullptr;
@@ -1176,7 +1206,8 @@ BufferManager::BufferManager(unsigned nthreads)
         pageState = nullptr;
         pageState2Level.reset();
         pageState3Level.reset();
-        pageStateHashThenArray = std::make_unique<HashThenArrayPageStateArray>(virtCount);
+        pageStateHashThenArray =
+            std::make_unique<HashThenArrayPageStateArray>(virtCount, disableHugePageForTranslationArray);
     } else {
         if (disableHugePageForTranslationArray) {
             pageState = (PageState*)mmap(NULL, virtCount * sizeof(PageState), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -1282,7 +1313,11 @@ BufferManager::BufferManager(unsigned nthreads)
          << " trad_hash:" << static_cast<int>(hashMode) << " exmap:" << useExmap << " hugepage: " << (disableHugePageForFrameMem == 0)
          << " hugepage for translation array: " << (disableHugePageForTranslationArray == 0)
          << " translation_refcount:" << enableTranslationRefCount
-         << " path_cache:" << enablePathCache
+#if defined(CALICO_PATH_CACHE)
+         << " path_cache:1"
+#else
+         << " path_cache:0"
+#endif
             << " use_io_uring:" << useIOUring
          << " num_threads:" << numThreads 
             << " ignore_pid_allocator:" << ignorePidAllocator()
@@ -1674,6 +1709,10 @@ Page* BufferManager::waitForPendingRead(PID pid, u64 stateAndVersion, u64* resol
 
 Page* BufferManager::resolveOptimisticRead(PID pid, u64& version) {
     PageState& ps = getPageState(pid);
+    return resolveOptimisticRead(pid, version, ps);
+}
+
+Page* BufferManager::resolveOptimisticRead(PID pid, u64& version, PageState& ps) {
     for (u64 repeatCounter = 0;; ++repeatCounter) {
         u64 v = ps.stateAndVersion.load(std::memory_order_acquire);
         switch (PageState::getState(v)) {
@@ -2033,6 +2072,10 @@ Page* BufferManager::fixX(PID pid) {
 
 Page* BufferManager::fixS(PID pid) {
     PageState& ps = getPageState(pid);
+    return fixS(pid, ps);
+}
+
+Page* BufferManager::fixS(PID pid, PageState& ps) {
     for (u64 repeatCounter = 0;; repeatCounter++) {
         u64 stateAndVersion = ps.stateAndVersion;
         u64 state = PageState::getState(stateAndVersion);
@@ -2101,6 +2144,8 @@ Page* BufferManager::fixS(PID pid) {
 }
 
 void BufferManager::unfixS(PID pid) { getPageState(pid).unlockS(); }
+
+void BufferManager::unfixS(PageState& ps) { ps.unlockS(); }
 
 void BufferManager::unfixX(PID pid) { getPageState(pid).unlockX(); }
 
@@ -2465,43 +2510,43 @@ void BufferManager::submitAsyncPrefetchPages(const PID* pages, int n_pages, cons
 }
 
 void BufferManager::prefetchPages(const PID* pages, int n_pages, const u32* offsets_within_pages) {
-    //if (!useTraditional || hashMode == HashMode::Array1Access || hashMode == HashMode::Array || hashMode == HashMode::Array2Level) {
-    if (!useTraditional || hashMode == HashMode::Array1Access || hashMode == HashMode::HashThenArray) {
-        for (int i = 0; i < n_pages; i++) {
-            PageState& ps = getPageState(pages[i]);
-            char * tmp = (char*)&ps;
-            _mm_prefetch(reinterpret_cast<const char*>(tmp), _MM_HINT_T0);
-        }
-    }
+    PageStateBatchResolver resolver(*this);
+    prefetchPages(pages, n_pages, offsets_within_pages, resolver);
+}
 
-    // if (!useTraditional) {
-    //     // In vmcache mode pages are addressed directly via virtMem, not frameMem.
-    //     for (int i = 0; i < n_pages; i++) {
-    //         PID pid = pages[i];
-    //         assert(pid < virtCount);
-    //         char* tmp = reinterpret_cast<char*>(virtMem + static_cast<size_t>(pid)) +
-    //                     (offsets_within_pages == nullptr ? 0 : offsets_within_pages[i]);
-    //         _mm_prefetch(reinterpret_cast<const char*>(tmp), _MM_HINT_T0);
-    //     }
-    //     return;
-    // }
+void BufferManager::prefetchPages(const PID* pages, int n_pages, const u32* offsets_within_pages,
+                                  PageStateBatchResolver& resolver) {
+    prefetchPagesWithResolver(pages, n_pages, offsets_within_pages, resolver);
+}
 
+void BufferManager::prefetchPages(const PID* pages, int n_pages, const u32* offsets_within_pages,
+                                  BoundDirectPageStateBatchResolver& resolver) {
+    prefetchPagesWithResolver(pages, n_pages, offsets_within_pages, resolver);
+}
+
+void BufferManager::prefetchPages(const PID* pages, int n_pages, const u32* offsets_within_pages,
+                                  BoundPageStateBatchResolver& resolver) {
+    prefetchPagesWithResolver(pages, n_pages, offsets_within_pages, resolver);
+}
+
+template <class Resolver>
+void BufferManager::prefetchPagesWithResolver(const PID* pages, int n_pages, const u32* offsets_within_pages,
+                                              Resolver& resolver) {
     // Use unique_ptr to defer allocation until we know we have pages to read
     std::unique_ptr<vector<PID>> pidsToRead;
     std::unique_ptr<vector<Page*>> destinations;
 
-    // Check which pages are not in memory and need to be loaded
-    for (int i = 0; i < n_pages; i++) {
+    if (!useTraditional || hashMode == HashMode::Array1Access || hashMode == HashMode::HashThenArray) {
+        for (int i = 0; i < n_pages; ++i) {
+            PageState& ps = resolver.resolve(pages[i]);
+            _mm_prefetch(reinterpret_cast<const char*>(&ps), _MM_HINT_T0);
+        }
+    }
+
+    for (int i = 0; i < n_pages; ++i) {
         PID pid = pages[i];
         assert(pid < virtCount);
-        // if (i + 1 < n_pages) {
-        //     // Prefetch next PageState
-        //     PageState& next_ps = getPageState(pages[i + 1]);
-        //     char* tmp = (char*)&next_ps;
-        //     _mm_prefetch(reinterpret_cast<const char*>(tmp), _MM_HINT_T0);
-        // }
-
-        PageState& ps = getPageState(pid);
+        PageState& ps = resolver.resolve(pid);
         u64 stateAndVersion = ps.stateAndVersion.load(std::memory_order_acquire);
         u64 state = PageState::getState(stateAndVersion);
 
@@ -2525,12 +2570,6 @@ void BufferManager::prefetchPages(const PID* pages, int n_pages, const u32* offs
                      : reinterpret_cast<char*>(frameMem + static_cast<size_t>(PageState::extractFrame(stateAndVersion)));
             tmp += (offsets_within_pages == nullptr ? 0 : offsets_within_pages[i]);
             _mm_prefetch(reinterpret_cast<const char*>(tmp), _MM_HINT_T0);
-            // if (offsets_within_pages != nullptr) {
-            //       // Touch the page to bring it into cache
-            //     //   char *tmp = (((char*)residentPtr(pid, stateAndVersion)) + offsets_within_pages[i]);
-            //     //   _mm_prefetch(reinterpret_cast<const char*>(tmp), _MM_HINT_T2);
-            //     //   _mm_prefetch(reinterpret_cast<const char*>(tmp) + 64, _MM_HINT_T2);
-            // }
             continue;
         }
 

@@ -19,6 +19,14 @@
 // Forward declaration
 class ThreadPool;
 
+#if defined(CALICO_BOUND_PATH_CACHE)
+using HNSWPageStateResolver = BufferManager::BoundPageStateBatchResolver;
+#elif defined(CALICO_DIRECT_PAGE_STATE)
+using HNSWPageStateResolver = BufferManager::BoundDirectPageStateBatchResolver;
+#else
+using HNSWPageStateResolver = BufferManager::PageStateBatchResolver;
+#endif
+
 // --- HNSW Metadata ---
 
 #include "utils.hpp"
@@ -454,7 +462,8 @@ class HNSW {
                                                    std::optional<std::pair<float, u32>> initial_entry_dist_pair);
     template <bool stats = false>
     std::pair<float, u32> findBestEntryPointForLevel(const float* query, u32 entry_point_id, int level,
-                                                     float entry_point_dist);
+                                                     float entry_point_dist,
+                                                     HNSWPageStateResolver& page_state_resolver);
     template <bool stats = false>
     std::pair<float, u32> searchBaseLayer(const float* query, u32 entry_point_id, int start_level, int end_level);
 

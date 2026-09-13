@@ -2,6 +2,12 @@ ARCH_FLAGS ?= -march=native
 CXX ?= g++
 STATIC_RUNTIME ?= 1
 CXXFLAGS :=  -DNDEBUG -O3 -std=c++23 -g3 -fno-omit-frame-pointer -fnon-call-exceptions -fasynchronous-unwind-tables $(ARCH_FLAGS)
+ifeq ($(PATH_CACHE),1)
+CXXFLAGS += -DCALICO_PATH_CACHE
+endif
+ifeq ($(TRADHASH),0)
+CXXFLAGS += -DCALICO_DIRECT_PAGE_STATE
+endif
 LDFLAGS :=
 ifeq ($(STATIC_RUNTIME),1)
 LDFLAGS += -static-libgcc -static-libstdc++

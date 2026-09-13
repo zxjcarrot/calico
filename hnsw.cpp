@@ -257,7 +257,9 @@ u32 HNSW<DistanceMetric>::getRandomLevel() {
 
 template <typename DistanceMetric>
 template <bool stats>
-std::pair<float, u32> HNSW<DistanceMetric>::findBestEntryPointForLevel(const float* query, u32 entry_point_id, int level, float entry_point_dist) {
+std::pair<float, u32> HNSW<DistanceMetric>::findBestEntryPointForLevel(
+    const float* query, u32 entry_point_id, int level, float entry_point_dist,
+    HNSWPageStateResolver& page_state_resolver) {
     u32 current_node_id = entry_point_id;
     float min_dist = entry_point_dist; // Use the pre-calculated distance
 
@@ -279,7 +281,11 @@ std::pair<float, u32> HNSW<DistanceMetric>::findBestEntryPointForLevel(const flo
         u32 best_neighbor_id = current_node_id;
 
         try {
+#if defined(CALICO_PATH_CACHE) || defined(CALICO_DIRECT_PAGE_STATE)
+            GuardS<HNSWPage> current_page_guard(getNodePID(current_node_id), page_state_resolver);
+#else
             GuardS<HNSWPage> current_page_guard(getNodePID(current_node_id));
+#endif
             NodeAccessor current_acc(current_page_guard.ptr, getNodeIndexInPage(current_node_id), this);
 
             // The first node is marked as visited here.
@@ -304,7 +310,8 @@ std::pair<float, u32> HNSW<DistanceMetric>::findBestEntryPointForLevel(const flo
                         offsets_within_pages.push_back(NodeAccessor::getVectorOffset(this, neighbor_id));
                     }
                 }
-                bm.prefetchPages(pages_to_prefetch.data(), pages_to_prefetch.size(), offsets_within_pages.data());
+                bm.prefetchPages(pages_to_prefetch.data(), pages_to_prefetch.size(), offsets_within_pages.data(),
+                                 page_state_resolver);
             }
 
             for (size_t i = 0; i < neighbors_span.size(); ++i) {
@@ -321,7 +328,7 @@ std::pair<float, u32> HNSW<DistanceMetric>::findBestEntryPointForLevel(const flo
                 if (!(visited_array[neighbor_id] == visited_array_tag)) {
                     visited_array[neighbor_id] = visited_array_tag;
 
-                    GuardO<HNSWPage> neighbor_page_guard(getNodePID(neighbor_id));
+                    GuardO<HNSWPage> neighbor_page_guard(getNodePID(neighbor_id), page_state_resolver);
                     NodeAccessor neighbor_acc(neighbor_page_guard.ptr, getNodeIndexInPage(neighbor_id), this);
 
                     float neighbor_dist;
@@ -354,10 +361,16 @@ template <bool stats>
 std::pair<float, u32> HNSW<DistanceMetric>::searchBaseLayer(const float* query, u32 entry_point_id, int start_level, int end_level) {
     u32 current_entry_point_id = entry_point_id;
     float current_dist;
+    HNSWPageStateResolver page_state_resolver(
+        bm
+#if defined(CALICO_BOUND_PATH_CACHE)
+        , base_pid, getNodePID(max_elements_ - 1)
+#endif
+    );
     
     // Calculate the distance for the initial entry point only ONCE.
     try {
-        GuardO<HNSWPage> initial_guard(getNodePID(current_entry_point_id));
+        GuardO<HNSWPage> initial_guard(getNodePID(current_entry_point_id), page_state_resolver);
         NodeAccessor initial_acc(initial_guard.ptr, getNodeIndexInPage(current_entry_point_id), this);
         if (stats) {
             current_dist = this->calculateDistance(query, initial_acc.getVector());
@@ -372,7 +385,8 @@ std::pair<float, u32> HNSW<DistanceMetric>::searchBaseLayer(const float* query, 
     
     for (int level = start_level; level >= end_level; --level) {
         // Pass the current best distance to the next level's search function.
-        auto result = findBestEntryPointForLevel<stats>(query, current_entry_point_id, level, current_dist);
+        auto result = findBestEntryPointForLevel<stats>(query, current_entry_point_id, level, current_dist,
+                                                        page_state_resolver);
         current_dist = result.first;
         current_entry_point_id = result.second;
     }
@@ -388,6 +402,12 @@ std::vector<std::pair<float, u32>> HNSW<DistanceMetric>::searchLayer(
     VisitedList* visited_nodes = visited_list_pool_->getFreeVisitedList();
     vl_type* visited_array = visited_nodes->mass;
     vl_type visited_array_tag = visited_nodes->curV;
+    HNSWPageStateResolver page_state_resolver(
+        bm
+#if defined(CALICO_BOUND_PATH_CACHE)
+        , base_pid, getNodePID(max_elements_ - 1)
+#endif
+    );
     
     std::priority_queue<std::pair<float, u32>> top_candidates; // Max-heap to keep the best results
     std::priority_queue<std::pair<float, u32>, std::vector<std::pair<float, u32>>, std::greater<std::pair<float, u32>>>
@@ -403,9 +423,13 @@ std::vector<std::pair<float, u32>> HNSW<DistanceMetric>::searchLayer(
         // Fallback: calculate distance if not provided or if IDs don't match
         try {
             #ifdef HNSW_DISABLE_OPTIMISTIC_READ
-            GuardS<HNSWPage> page_guard(getNodePID(entry_point_id));
+            #if defined(CALICO_PATH_CACHE) || defined(CALICO_DIRECT_PAGE_STATE)
+            GuardS<HNSWPage> page_guard(getNodePID(entry_point_id), page_state_resolver);
             #else
-            GuardO<HNSWPage> page_guard(getNodePID(entry_point_id));
+            GuardS<HNSWPage> page_guard(getNodePID(entry_point_id));
+            #endif
+            #else
+            GuardO<HNSWPage> page_guard(getNodePID(entry_point_id), page_state_resolver);
             #endif
             NodeAccessor acc(page_guard.ptr, getNodeIndexInPage(entry_point_id), this);
             float dist;
@@ -444,7 +468,7 @@ std::vector<std::pair<float, u32>> HNSW<DistanceMetric>::searchLayer(
         }
         u32 current_id = current_pair.second;
         try {
-            GuardO<HNSWPage> current_page_guard(getNodePID(current_id));
+            GuardO<HNSWPage> current_page_guard(getNodePID(current_id), page_state_resolver);
             NodeAccessor current_acc(current_page_guard.ptr, getNodeIndexInPage(current_id), this);
 
             if (current_acc.getLevel() < level) continue;
@@ -508,7 +532,8 @@ std::vector<std::pair<float, u32>> HNSW<DistanceMetric>::searchLayer(
                     }
                 }
 
-                bm.prefetchPages(pages_to_prefetch.data(), pages_to_prefetch.size(), offsets_within_pages.data());
+                bm.prefetchPages(pages_to_prefetch.data(), pages_to_prefetch.size(), offsets_within_pages.data(),
+                                 page_state_resolver);
             } else {
                 for (size_t i = 0; i < neighbors.size(); ++i) {
                     const u32& neighbor_id = neighbors[i];
@@ -538,9 +563,13 @@ std::vector<std::pair<float, u32>> HNSW<DistanceMetric>::searchLayer(
 
                 //if (!(visited_array[neighbor_id] == visited_array_tag)) {
                     #ifdef HNSW_DISABLE_OPTIMISTIC_READ
-                    GuardS<HNSWPage> neighbor_page_guard(getNodePID(neighbor_id));
+                    #if defined(CALICO_PATH_CACHE) || defined(CALICO_DIRECT_PAGE_STATE)
+                    GuardS<HNSWPage> neighbor_page_guard(getNodePID(neighbor_id), page_state_resolver);
                     #else
-                    GuardORelaxed<HNSWPage> neighbor_page_guard(getNodePID(neighbor_id));
+                    GuardS<HNSWPage> neighbor_page_guard(getNodePID(neighbor_id));
+                    #endif
+                    #else
+                    GuardORelaxed<HNSWPage> neighbor_page_guard(getNodePID(neighbor_id), page_state_resolver);
                     #endif
                     NodeAccessor neighbor_acc(neighbor_page_guard.ptr, getNodeIndexInPage(neighbor_id), this);
                     float neighbor_dist;
@@ -1260,7 +1289,11 @@ template std::vector<std::vector<std::pair<float, u32>>> HNSW<hnsw_distance::SIM
 // Explicit instantiation for internal templated helper methods
 template std::vector<std::pair<float, u32>> HNSW<hnsw_distance::SIMDAcceleratedL2>::searchLayer<true>(const float* query, u32 entry_point_id, u32 level, size_t ef, std::optional<std::pair<float, u32>> initial_entry_dist_pair);
 template std::vector<std::pair<float, u32>> HNSW<hnsw_distance::SIMDAcceleratedL2>::searchLayer<false>(const float* query, u32 entry_point_id, u32 level, size_t ef, std::optional<std::pair<float, u32>> initial_entry_dist_pair);
-template std::pair<float, u32> HNSW<hnsw_distance::SIMDAcceleratedL2>::findBestEntryPointForLevel<true>(const float* query, u32 entry_point_id, int level, float entry_point_dist);
-template std::pair<float, u32> HNSW<hnsw_distance::SIMDAcceleratedL2>::findBestEntryPointForLevel<false>(const float* query, u32 entry_point_id, int level, float entry_point_dist);
+template std::pair<float, u32> HNSW<hnsw_distance::SIMDAcceleratedL2>::findBestEntryPointForLevel<true>(
+    const float* query, u32 entry_point_id, int level, float entry_point_dist,
+    HNSWPageStateResolver& page_state_resolver);
+template std::pair<float, u32> HNSW<hnsw_distance::SIMDAcceleratedL2>::findBestEntryPointForLevel<false>(
+    const float* query, u32 entry_point_id, int level, float entry_point_dist,
+    HNSWPageStateResolver& page_state_resolver);
 template std::pair<float, u32> HNSW<hnsw_distance::SIMDAcceleratedL2>::searchBaseLayer<true>(const float* query, u32 entry_point_id, int start_level, int end_level);
 template std::pair<float, u32> HNSW<hnsw_distance::SIMDAcceleratedL2>::searchBaseLayer<false>(const float* query, u32 entry_point_id, int start_level, int end_level);

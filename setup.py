@@ -60,6 +60,19 @@ if sys.platform != "win32" and os.getenv("CALICO_ENABLE_AUTOVEC", "1") == "1":
 if os.getenv("CALICO_HNSW_DISABLE_OPTIMISTIC_READ", "0") == "1":
     cpp_args.append("-DHNSW_DISABLE_OPTIMISTIC_READ")
 
+# Compile the path-cache translation specialization into the hot path.
+if os.getenv("PATH_CACHE", "0") == "1":
+    cpp_args.append("-DCALICO_PATH_CACHE")
+
+# Bind one validated HashThenArray component for the complete HNSW search.
+if os.getenv("CALICO_BOUND_PATH_CACHE", "0") == "1":
+    cpp_args.append("-DCALICO_BOUND_PATH_CACHE")
+
+# Specialize direct-array builds so getPageState and HNSW page-state resolution
+# contain no runtime mode test.
+if os.getenv("TRADHASH") == "0":
+    cpp_args.append("-DCALICO_DIRECT_PAGE_STATE")
+
 # Optional: control specialization via env for ablation builds
 specialization = os.getenv("CALICO_SPECIALIZATION", "")
 if specialization == "calico":

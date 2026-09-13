@@ -386,36 +386,57 @@ struct TwoLevelPageStateArray {
     }
 };
 
-// Robin Hood hash lookup followed by a second-level PageState array.
+// Open-address hash lookup followed by a second-level PageState array.
 // The top-level map is populated once during initialization and is read-only
 // while workers access the translation structure.
 struct HashThenArrayPageStateArray {
-    static constexpr u32 bottomBits = 19;
-    using TopLevelMap = ShardedRobinHoodMap<u32, PageState*, 1>;
+    static constexpr u64 topLevelEntries = 128;
+    static constexpr u32 bottomBits = 32;
+    static constexpr PID bottomMask = (PID{1} << bottomBits) - 1;
+    using TopLevelMap = ShardedOpenAddressMap<PID, PageState*, 1>;
 
     TopLevelMap top_level;
-    PageState** second_level_arrays;
-    u32 num_top_slots;
-    u32 entries_per_slot;
+    std::unique_ptr<std::atomic<PageState*>[]> second_level_arrays;
+    u64 num_top_slots;  // Valid top-level components for virtCount.
+    u64 top_level_entry_count;  // Includes dummy entries kept in the hash map.
+    u64 entries_per_slot;
     u32 topBits;
     u64 total_entries;
+    bool disable_huge_pages;
+    mutable std::mutex second_level_allocation_mutex;
 
-    HashThenArrayPageStateArray(u64 virtCount);
+    HashThenArrayPageStateArray(u64 virtCount, bool disableHugePages);
     ~HashThenArrayPageStateArray();
 
-    inline PageState* getSecondLevelArray(u32 top_idx) const {
-        PageState* second_level = nullptr;
-        if (!top_level.tryGet(top_idx, second_level) || second_level == nullptr) {
+    inline u64 entriesInSlot(PID top_key) const {
+        const u64 slot_begin = top_key << bottomBits;
+        const u64 remaining = total_entries - slot_begin;
+        return remaining < entries_per_slot ? remaining : entries_per_slot;
+    }
+
+    inline PageState* getSecondLevelArray(PID top_key) const {
+        if (top_key >= num_top_slots) {
             std::abort();
         }
-        return second_level;
+        PageState* unused = nullptr;
+        if (!top_level.tryGet(top_key, unused)) {
+            std::abort();
+        }
+        PageState* second_level = second_level_arrays[top_key].load(std::memory_order_acquire);
+        if (second_level != nullptr) {
+            return second_level;
+        }
+        return allocateSecondLevelArray(top_key);
     }
 
     inline PageState& get(PID pid) const {
-        u32 top_idx = static_cast<u32>(pid >> bottomBits);
-        u32 bottom_idx = static_cast<u32>(pid & ((1ULL << bottomBits) - 1));
-        return getSecondLevelArray(top_idx)[bottom_idx];
+        const PID top_key = pid >> bottomBits;
+        const u32 bottom_idx = static_cast<u32>(pid & bottomMask);
+        return getSecondLevelArray(top_key)[bottom_idx];
     }
+
+   private:
+    PageState* allocateSecondLevelArray(PID top_key) const;
 };
 
 // Three-level indirection for PageState array
@@ -519,8 +540,18 @@ struct BufferManager {
     std::unique_ptr<TwoLevelPageStateArray> pageState2Level; // Two-level array (for Array2Level mode)
     std::unique_ptr<ThreeLevelPageStateArray> pageState3Level; // Three-level array (for Array3Level mode)
     std::unique_ptr<HashThenArrayPageStateArray> pageStateHashThenArray;
-    bool enablePathCache;
-    std::atomic<u64> pathCacheEpoch{0};
+#if defined(CALICO_PATH_CACHE)
+    struct PathCacheEntry {
+        PID top_key = invalidPID;
+        PageState* second_level = nullptr;
+    };
+
+    static inline PathCacheEntry& localPathCache() {
+        static thread_local PathCacheEntry cache;
+        return cache;
+    }
+#endif
+
     std::unique_ptr<std::atomic<u64>[]> pidToFrameArray;
     bool enableTranslationRefCount;
     std::atomic<u32>* translationRefCounts;  // Reference counts for OS page groups (lazily allocated via mmap)
@@ -543,38 +574,129 @@ struct BufferManager {
     bool useIOUring;
 
     PageState& getPageState(PID pid) {
+#if defined(CALICO_PATH_CACHE)
+        const PID top_key = pid >> HashThenArrayPageStateArray::bottomBits;
+        const u32 bottom_idx = static_cast<u32>(pid);
+        PathCacheEntry& cache = localPathCache();
+        PageState* second_level = cache.second_level;
+        if (cache.top_key != top_key) [[unlikely]] {
+            second_level = pageStateHashThenArray->getSecondLevelArray(top_key);
+            cache.top_key = top_key;
+            cache.second_level = second_level;
+        }
+        return second_level[bottom_idx];
+#elif defined(CALICO_DIRECT_PAGE_STATE)
+        return pageState[pid];
+#else
         if (hashMode == HashMode::HashThenArray) {
-            constexpr u64 bottomMask = (1ULL << HashThenArrayPageStateArray::bottomBits) - 1;
-            const u32 top_idx = static_cast<u32>(pid >> HashThenArrayPageStateArray::bottomBits);
-            const u32 bottom_idx = static_cast<u32>(pid & bottomMask);
-
-            struct PathCacheEntry {
-                const BufferManager* owner = nullptr;
-                u32 top_idx = 0;
-                u64 epoch = 0;
-                PageState* second_level = nullptr;
-            };
-            static thread_local PathCacheEntry cache;
-
-            const u64 epoch = pathCacheEpoch.load(std::memory_order_relaxed);
-            PageState* second_level = nullptr;
-            if (enablePathCache && cache.owner == this && cache.top_idx == top_idx && cache.epoch == epoch) {
-                second_level = cache.second_level;
-            } else {
-                second_level = pageStateHashThenArray->getSecondLevelArray(top_idx);
-                if (enablePathCache) {
-                    cache.owner = this;
-                    cache.top_idx = top_idx;
-                    cache.epoch = epoch;
-                    cache.second_level = second_level;
-                }
-            }
-            return second_level[bottom_idx];
+            const PID top_key = pid >> HashThenArrayPageStateArray::bottomBits;
+            const u32 bottom_idx = static_cast<u32>(pid);
+            return pageStateHashThenArray->getSecondLevelArray(top_key)[bottom_idx];
         }
         return pageState[pid];
+#endif
     }
 
-    void resetPathCache() { pathCacheEpoch.fetch_add(1, std::memory_order_relaxed); }
+    class PageStateBatchResolver {
+       public:
+        explicit PageStateBatchResolver(BufferManager& buffer_manager)
+            : buffer_manager(buffer_manager)
+#if defined(CALICO_PATH_CACHE)
+              , cache(localPathCache()), top_key(cache.top_key), second_level(cache.second_level)
+#endif
+        {}
+
+        ~PageStateBatchResolver() {
+#if defined(CALICO_PATH_CACHE)
+            cache.top_key = top_key;
+            cache.second_level = second_level;
+#endif
+        }
+
+        inline PageState& resolve(PID pid) {
+#if defined(CALICO_PATH_CACHE)
+            const PID pid_top_key = pid >> HashThenArrayPageStateArray::bottomBits;
+            if (pid_top_key != top_key) [[unlikely]] {
+                second_level = buffer_manager.pageStateHashThenArray->getSecondLevelArray(pid_top_key);
+                top_key = pid_top_key;
+            }
+            return second_level[static_cast<u32>(pid)];
+#else
+            return buffer_manager.getPageState(pid);
+#endif
+        }
+
+       private:
+        BufferManager& buffer_manager;
+#if defined(CALICO_PATH_CACHE)
+        PathCacheEntry& cache;
+        PID top_key;
+        PageState* second_level;
+#endif
+    };
+
+    // Resolves a direct-array page state through one search-local base pointer.
+    class BoundDirectPageStateBatchResolver {
+       public:
+        explicit BoundDirectPageStateBatchResolver(BufferManager& buffer_manager)
+            : base(buffer_manager.pageState) {}
+
+        inline PageState& resolve(PID pid) { return base[pid]; }
+
+       private:
+        PageState* base;
+    };
+
+    // Resolves a caller-validated PID range through one second-level array.
+    // The range check happens once; resolve() is direct indexing in release builds.
+    class BoundPageStateBatchResolver {
+       public:
+        BoundPageStateBatchResolver(BufferManager& buffer_manager, PID first_pid, PID last_pid)
+            : buffer_manager(buffer_manager)
+#if defined(CALICO_PATH_CACHE)
+              , cache(localPathCache()), top_key(first_pid >> HashThenArrayPageStateArray::bottomBits),
+                second_level(nullptr)
+#endif
+        {
+#if defined(CALICO_PATH_CACHE)
+            if ((last_pid >> HashThenArrayPageStateArray::bottomBits) != top_key) {
+                die("Bound PageState range crosses a HashThenArray top-level component");
+            }
+            if (cache.top_key == top_key) {
+                second_level = cache.second_level;
+            } else {
+                second_level = buffer_manager.pageStateHashThenArray->getSecondLevelArray(top_key);
+            }
+#else
+            (void)first_pid;
+            (void)last_pid;
+#endif
+        }
+
+        ~BoundPageStateBatchResolver() {
+#if defined(CALICO_PATH_CACHE)
+            cache.top_key = top_key;
+            cache.second_level = second_level;
+#endif
+        }
+
+        inline PageState& resolve(PID pid) {
+#if defined(CALICO_PATH_CACHE)
+            assert((pid >> HashThenArrayPageStateArray::bottomBits) == top_key);
+            return second_level[static_cast<u32>(pid)];
+#else
+            return buffer_manager.getPageState(pid);
+#endif
+        }
+
+       private:
+        BufferManager& buffer_manager;
+#if defined(CALICO_PATH_CACHE)
+        PathCacheEntry& cache;
+        PID top_key;
+        PageState* second_level;
+#endif
+    };
     u64 pid_lock_shard(PID pid) {
         return pid % NUM_LOCK_SHARDS;
     }
@@ -587,7 +709,9 @@ struct BufferManager {
     Page* fixX(PID pid);
     void unfixX(PID pid);
     Page* fixS(PID pid);
+    Page* fixS(PID pid, PageState& page_state);
     void unfixS(PID pid);
+    void unfixS(PageState& page_state);
 
     bool isValidPtr(void* page);
     PID toPID(void* page);
@@ -603,12 +727,22 @@ struct BufferManager {
     void updateAllocCountSnapshot(u64 value);
     Page* handleFault(PID pid);
     Page* resolveOptimisticRead(PID pid, u64& version);
+    Page* resolveOptimisticRead(PID pid, u64& version, PageState& page_state);
     Page* waitForPendingRead(PID pid, u64 stateAndVersion, u64* resolvedVersion = nullptr);
     void readPage(PID pid, Page* dest);
     void evict();
     bool submitAsyncPrefetch(PID pid);
     void submitAsyncPrefetchPages(const PID* pages, int n_pages, const u32* offsets_within_pages = nullptr);
     void prefetchPages(const PID* pages, int n_pages, const u32* offsets_within_pages = nullptr);
+    void prefetchPages(const PID* pages, int n_pages, const u32* offsets_within_pages,
+                       PageStateBatchResolver& resolver);
+    void prefetchPages(const PID* pages, int n_pages, const u32* offsets_within_pages,
+                       BoundDirectPageStateBatchResolver& resolver);
+    void prefetchPages(const PID* pages, int n_pages, const u32* offsets_within_pages,
+                       BoundPageStateBatchResolver& resolver);
+    template <class Resolver>
+    void prefetchPagesWithResolver(const PID* pages, int n_pages, const u32* offsets_within_pages,
+                                   Resolver& resolver);
     void prefetchResidentPages(const PID* pages, int n_pages, const u32* offsets_within_pages = nullptr);
 
     Page* acquireFrameForPid(PID pid, bool allow_eviction = true);
@@ -640,16 +774,24 @@ struct GuardO {
     PID pid;
     T* ptr;
     u64 version;
+    PageState* page_state;
     static const u64 moved = ~0ull;
 
     // constructor
-    explicit GuardO(u64 pid) : pid(pid), ptr(nullptr) { init(); }
+    explicit GuardO(u64 pid) : pid(pid), ptr(nullptr), page_state(nullptr) { init(); }
+
+    template <class Resolver>
+    GuardO(u64 pid, Resolver& resolver)
+        : pid(pid), ptr(nullptr), page_state(nullptr) {
+        init(resolver);
+    }
 
     template <class T2>
     GuardO(u64 pid, GuardO<T2>& parent) {
         parent.checkVersionAndRestart();
         this->pid = pid;
         ptr = nullptr;
+        page_state = nullptr;
         init();
     }
 
@@ -657,11 +799,20 @@ struct GuardO {
         pid = other.pid;
         ptr = other.ptr;
         version = other.version;
+        page_state = other.page_state;
     }
 
     void init() {
         assert(pid != moved);
-        ptr = reinterpret_cast<T*>(bm.resolveOptimisticRead(pid, version));
+        page_state = &bm.getPageState(pid);
+        ptr = reinterpret_cast<T*>(bm.resolveOptimisticRead(pid, version, *page_state));
+    }
+
+    template <class Resolver>
+    void init(Resolver& resolver) {
+        assert(pid != moved);
+        page_state = &resolver.resolve(pid);
+        ptr = reinterpret_cast<T*>(bm.resolveOptimisticRead(pid, version, *page_state));
     }
 
     // move assignment operator
@@ -670,8 +821,10 @@ struct GuardO {
         pid = other.pid;
         ptr = other.ptr;
         version = other.version;
+        page_state = other.page_state;
         other.pid = moved;
         other.ptr = nullptr;
+        other.page_state = nullptr;
         return *this;
     }
 
@@ -683,7 +836,7 @@ struct GuardO {
 
     void checkVersionAndRestart() {
         if (pid != moved) {
-            PageState& ps = bm.getPageState(pid);
+            PageState& ps = *page_state;
             u64 stateAndVersion = ps.stateAndVersion.load();
             if (version == stateAndVersion)  // fast path, nothing changed
                 return;
@@ -711,6 +864,7 @@ struct GuardO {
         checkVersionAndRestart();
         pid = moved;
         ptr = nullptr;
+        page_state = nullptr;
     }
 };
 
@@ -721,10 +875,17 @@ struct GuardORelaxed {
     PID pid;
     T* ptr;
     u64 version;
+    PageState* page_state;
     static const u64 moved = ~0ull;
 
     // constructor
-    explicit GuardORelaxed(u64 pid) : pid(pid), ptr(nullptr) { init(); }
+    explicit GuardORelaxed(u64 pid) : pid(pid), ptr(nullptr), page_state(nullptr) { init(); }
+
+    template <class Resolver>
+    GuardORelaxed(u64 pid, Resolver& resolver)
+        : pid(pid), ptr(nullptr), page_state(nullptr) {
+        init(resolver);
+    }
 
     template <class T2>
     GuardORelaxed(u64 pid, GuardO<T2>& parent) {
@@ -732,6 +893,7 @@ struct GuardORelaxed {
         //parent.checkVersionAndRestart();
         this->pid = pid;
         ptr = nullptr;
+        page_state = nullptr;
         init();
     }
 
@@ -740,6 +902,7 @@ struct GuardORelaxed {
         pid = other.pid;
         ptr = other.ptr;
         version = other.version;
+        page_state = other.page_state;
     }
 
 
@@ -747,6 +910,7 @@ struct GuardORelaxed {
     GuardORelaxed(u64 pid, GuardORelaxed<T2>& parent) {
         this->pid = pid;
         ptr = nullptr;
+        page_state = nullptr;
         init();
     }
 
@@ -754,12 +918,21 @@ struct GuardORelaxed {
         pid = other.pid;
         ptr = other.ptr;
         version = other.version;
+        page_state = other.page_state;
     }
 
 
     void init() {
         assert(pid != moved);
-        ptr = reinterpret_cast<T*>(bm.resolveOptimisticRead(pid, version));
+        page_state = &bm.getPageState(pid);
+        ptr = reinterpret_cast<T*>(bm.resolveOptimisticRead(pid, version, *page_state));
+    }
+
+    template <class Resolver>
+    void init(Resolver& resolver) {
+        assert(pid != moved);
+        page_state = &resolver.resolve(pid);
+        ptr = reinterpret_cast<T*>(bm.resolveOptimisticRead(pid, version, *page_state));
     }
 
     // move assignment operator
@@ -768,8 +941,10 @@ struct GuardORelaxed {
         pid = other.pid;
         ptr = other.ptr;
         version = other.version;
+        page_state = other.page_state;
         other.pid = moved;
         other.ptr = nullptr;
+        other.page_state = nullptr;
         return *this;
     }
 
@@ -781,7 +956,7 @@ struct GuardORelaxed {
 
     void checkVersionAndRestart() {
         if (pid != moved) {
-            PageState& ps = bm.getPageState(pid);
+            PageState& ps = *page_state;
             u64 stateAndVersion = ps.stateAndVersion.load();
             if (version == stateAndVersion)  // fast path, nothing changed
                 return;
@@ -820,6 +995,7 @@ struct GuardORelaxed {
         checkVersionAndRestart();
         pid = moved;
         ptr = nullptr;
+        page_state = nullptr;
     }
 };
 
@@ -913,16 +1089,32 @@ template <class T>
 struct GuardS {
     PID pid;
     T* ptr;
+    PageState* page_state;
     static const u64 moved = ~0ull;
 
     // constructor
-    explicit GuardS(u64 pid) : pid(pid) { ptr = reinterpret_cast<T*>(bm.fixS(pid)); }
+    explicit GuardS(u64 pid)
+        : pid(pid), ptr(nullptr), page_state(&bm.getPageState(pid))
+    {
+        ptr = reinterpret_cast<T*>(bm.fixS(pid, *page_state));
+    }
 
-    GuardS(GuardO<T>&& other) {
+    template <class Resolver>
+    GuardS(u64 pid, Resolver& resolver)
+        : pid(pid), ptr(nullptr), page_state(&resolver.resolve(pid)) {
+        ptr = reinterpret_cast<T*>(bm.fixS(pid, *page_state));
+    }
+
+    GuardS(GuardO<T>&& other)
+        : pid(moved), ptr(nullptr), page_state(nullptr)
+    {
         assert(other.pid != moved);
-        if (bm.getPageState(other.pid).tryLockS(other.version)) {  // XXX: optimize?
+        PageState& other_page_state = *other.page_state;
+        if (other_page_state.tryLockS(other.version)) {
             pid = other.pid;
             ptr = other.ptr;
+            page_state = other.page_state;
+            other.page_state = nullptr;
             other.pid = moved;
             other.ptr = nullptr;
         } else {
@@ -930,12 +1122,12 @@ struct GuardS {
         }
     }
 
-    GuardS(GuardS&& other) {
-        if (pid != moved) bm.unfixS(pid);
-        pid = other.pid;
-        ptr = other.ptr;
+    GuardS(GuardS&& other)
+        : pid(other.pid), ptr(other.ptr), page_state(other.page_state)
+    {
         other.pid = moved;
         other.ptr = nullptr;
+        other.page_state = nullptr;
     }
 
     // assignment operator
@@ -943,11 +1135,13 @@ struct GuardS {
 
     // move assignment operator
     GuardS& operator=(GuardS&& other) {
-        if (pid != moved) bm.unfixS(pid);
+        if (pid != moved) unfix();
         pid = other.pid;
         ptr = other.ptr;
+        page_state = other.page_state;
         other.pid = moved;
         other.ptr = nullptr;
+        other.page_state = nullptr;
         return *this;
     }
 
@@ -956,7 +1150,7 @@ struct GuardS {
 
     // destructor
     ~GuardS() {
-        if (pid != moved) bm.unfixS(pid);
+        if (pid != moved) unfix();
     }
 
     T* operator->() {
@@ -966,9 +1160,16 @@ struct GuardS {
 
     void release() {
         if (pid != moved) {
-            bm.unfixS(pid);
+            unfix();
             pid = moved;
+            ptr = nullptr;
+            page_state = nullptr;
         }
+    }
+
+   private:
+    void unfix() {
+        bm.unfixS(*page_state);
     }
 };
 
