@@ -3,9 +3,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SOURCE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-RESULTS_ROOT="${CALICO_SECTION3_RESULTS_ROOT:-/home/ubuntu/calico-section3/results}"
-BIN_DIR="${CALICO_SECTION3_BIN_DIR:-/home/ubuntu/calico-section3/bin}"
-BLOCK_FILE="${CALICO_SECTION3_BLOCK:-/home/ubuntu/calico-section3/section3.heapfile}"
+RESULTS_ROOT="${CALICO_SECTION3_RESULTS_ROOT:-${CALICO_RESULTS_DIR:-${SOURCE_DIR}/exps}/in-memory/section3}"
+BIN_DIR="${CALICO_SECTION3_BIN_DIR:-${SOURCE_DIR}/build/section3}"
+BLOCK_FILE="${CALICO_SECTION3_BLOCK:-${BIN_DIR}/section3.heapfile}"
 MODE="${1:-full}"
 ONLY="${2:-all}"
 RUN_ID="${CALICO_SECTION3_RUN_ID:-robinhood_${MODE}_$(date -u +%Y%m%dT%H%M%SZ)}"
@@ -24,7 +24,7 @@ if [[ -e "${RUN_DIR}" ]]; then
     exit 1
 fi
 
-mkdir -p "${RUN_DIR}" "${BIN_DIR}"
+mkdir -p "${RUN_DIR}" "${BIN_DIR}" "$(dirname "${BLOCK_FILE}")"
 exec > >(tee -a "${RUN_DIR}/runner.log") 2>&1
 
 echo "run_id=${RUN_ID}"

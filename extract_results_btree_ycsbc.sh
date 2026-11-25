@@ -7,7 +7,7 @@ set -e
 
 # Base directory for experiments
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-EXP_BASE_DIR="${SCRIPT_DIR}/Calico-VLDB26/data/exps/in-memory/btree_ycsbc"
+EXP_BASE_DIR="${EXP_BASE_DIR:-${CALICO_RESULTS_DIR:-${SCRIPT_DIR}/exps}/in-memory/btree_ycsbc}"
 
 # Thread counts to process
 THREAD_COUNTS=(1 4 8 16 32 64 128)

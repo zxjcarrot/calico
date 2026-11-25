@@ -6,7 +6,7 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-GRAPH_EXP_DIR="${SCRIPT_DIR}/exps/in-memory/graph_bfs"
+GRAPH_EXP_DIR="${GRAPH_EXP_DIR:-${CALICO_RESULTS_DIR:-${SCRIPT_DIR}/exps}/in-memory/graph_bfs}"
 
 # Check if graph experiment directory exists
 if [ ! -d "${GRAPH_EXP_DIR}" ]; then

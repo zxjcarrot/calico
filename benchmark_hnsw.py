@@ -2,9 +2,13 @@ import numpy as np
 import time
 import os
 import sys
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+DATA_ROOT = Path(os.environ.get('CALICO_DATA_DIR', SCRIPT_DIR / 'data')).expanduser().resolve()
 
 # Add local hnswlib directory to Python path
-sys.path.insert(0, './hnswlib')
+sys.path.insert(0, str(SCRIPT_DIR / 'hnswlib'))
 import hnswlib
 
 # Import USearch for comparison
@@ -642,7 +646,7 @@ if __name__ == "__main__":
     dataset_name = "sift1m"
     
     if dataset_name == "sift1m":
-        DATA_DIR = "./data/sift1m"
+        DATA_DIR = str(DATA_ROOT / "sift1m")
         BASE_FILE = os.path.join(DATA_DIR, "sift_base.fvecs")
         QUERY_FILE = os.path.join(DATA_DIR, "sift_query.fvecs")
         GT_FILE = os.path.join(DATA_DIR, "sift_groundtruth.ivecs")
@@ -662,7 +666,7 @@ if __name__ == "__main__":
     else:
         #sift10m
         import h5py
-        mat_path = "./data/SIFT10M/SIFT10Mfeatures.mat"
+        mat_path = str(DATA_ROOT / "SIFT10M" / "SIFT10Mfeatures.mat")
         f = h5py.File(mat_path, 'r')
         vector = f['fea']
         
@@ -677,7 +681,7 @@ if __name__ == "__main__":
         X_base_float32 = np.ascontiguousarray(X_base, dtype=np.float32)
         X_query_float32 = np.ascontiguousarray(X_query, dtype=np.float32)
         
-        ground_truth = np.load("./data/SIFT10M/ground_truth_indices.npy")
+        ground_truth = np.load(DATA_ROOT / "SIFT10M" / "ground_truth_indices.npy")
         # import faiss
         # index_flat = faiss.IndexFlatL2(X_base_float32.shape[1]) 
 

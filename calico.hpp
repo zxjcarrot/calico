@@ -25,7 +25,7 @@
 #ifdef BLOCK_SIZE
 #undef BLOCK_SIZE
 #endif
-#include "predictivetranslation-sigmod2026/third_party/concurrentqueue.hpp"
+#include "third_party/concurrentqueue.hpp"
 
 // Extern declarations must come BEFORE headers that use them
 extern __thread uint16_t workerThreadId;

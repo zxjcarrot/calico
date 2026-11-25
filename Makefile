@@ -15,14 +15,14 @@ endif
 
 all: calico_oltp_query calico_olap_query calico_oltp_query_special calico_oltp_query_special_pad64
 
-calico.o: calico.cpp calico.hpp hash_tables.hpp third_party/robin_hood.h tpcc/*pp
+calico.o: calico.cpp calico.hpp hash_tables.hpp third_party/robin_hood.h third_party/concurrentqueue.hpp tpcc/*pp
 	$(CXX) $(CXXFLAGS) -c calico.cpp -o calico.o
 # -DCALICO_SPECIALIZATION_CALICO
 
-calico_special.o: calico.cpp calico.hpp hash_tables.hpp third_party/robin_hood.h tpcc/*pp
+calico_special.o: calico.cpp calico.hpp hash_tables.hpp third_party/robin_hood.h third_party/concurrentqueue.hpp tpcc/*pp
 	$(CXX) $(CXXFLAGS) -c calico.cpp -o calico_special.o  -DCALICO_SPECIALIZATION_CALICO
 
-calico_special_pad64.o: calico.cpp calico.hpp hash_tables.hpp third_party/robin_hood.h tpcc/*pp
+calico_special_pad64.o: calico.cpp calico.hpp hash_tables.hpp third_party/robin_hood.h third_party/concurrentqueue.hpp tpcc/*pp
 	$(CXX) $(CXXFLAGS) -c calico.cpp -o calico_special_pad64.o -DCALICO_SPECIALIZATION_CALICO -DCALICO_PAGESTATE_ALIGN64
 
 calico_oltp_query: calico_oltp_query.cpp tpcc/*pp calico.o

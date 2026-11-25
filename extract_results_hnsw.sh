@@ -3,8 +3,8 @@
 # Extract and summarize HNSW benchmark results
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DATASET="${1:-${DATASET:-sift10M}}"
-RESULTS_ROOT_DIR="${SCRIPT_DIR}/Calico-VLDB26/data/exps/in-memory/hnsw"
-RESULTS_BASE_DIR="${RESULTS_ROOT_DIR}/${DATASET}"
+RESULTS_ROOT_DIR="${RESULTS_ROOT_DIR:-${CALICO_RESULTS_DIR:-${SCRIPT_DIR}/exps}/in-memory/hnsw}"
+RESULTS_BASE_DIR="${RESULTS_BASE_DIR:-${RESULTS_ROOT_DIR}/${DATASET}}"
 OUTPUT_CSV="${RESULTS_BASE_DIR}/hnsw_results_summary.csv"
 LEGACY_OUTPUT_CSV="${RESULTS_ROOT_DIR}/hnsw_results_summary.csv"
 MEMORY_BW_METRIC="${MEMORY_BW_METRIC:-nps1_die_to_dram}"

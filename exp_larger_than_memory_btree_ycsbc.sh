@@ -6,7 +6,8 @@
 
 # Base directory for experiments
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-EXP_BASE_DIR="${SCRIPT_DIR}/Calico-VLDB26/data/exps/larger-than-memory/btree_ycsbc"
+cd "$SCRIPT_DIR"
+EXP_BASE_DIR="${EXP_BASE_DIR:-${CALICO_RESULTS_DIR:-${SCRIPT_DIR}/exps}/larger-than-memory/btree_ycsbc}"
 
 # Data sizes to test (doubling from 50M to 400M)
 DATA_SIZES=(50000000 100000000 200000000 400000000)

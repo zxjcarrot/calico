@@ -7,6 +7,10 @@ import sys
 import shutil
 import argparse
 import signal
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+DATA_ROOT = Path(os.environ.get('CALICO_DATA_DIR', SCRIPT_DIR / 'data')).expanduser().resolve()
 
 # --- Dependency Imports ---
 import calico_py
@@ -230,9 +234,9 @@ def main():
         required=True,
         help="Which implementation to profile.",
     )
-    parser.add_argument("--base_file", default="./data/sift1m/sift_base.fvecs")
-    parser.add_argument("--query_file", default="./data/sift1m/sift_query.fvecs")
-    parser.add_argument("--gt_file", default="./data/sift1m/sift_groundtruth.ivecs")
+    parser.add_argument("--base_file", default=str(DATA_ROOT / "sift1m" / "sift_base.fvecs"))
+    parser.add_argument("--query_file", default=str(DATA_ROOT / "sift1m" / "sift_query.fvecs"))
+    parser.add_argument("--gt_file", default=str(DATA_ROOT / "sift1m" / "sift_groundtruth.ivecs"))
     parser.add_argument("--threads", type=int, default=0)
     parser.add_argument("--pause", action='store_true', help="Enable pauses for profiler attachment.")
     args = parser.parse_args()

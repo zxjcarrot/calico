@@ -94,7 +94,7 @@ calico_module = Extension(
     
     sources=all_sources,
 
-    depends=['calico.hpp', 'hash_tables.hpp', 'third_party/robin_hood.h'],
+    depends=['calico.hpp', 'hash_tables.hpp', 'third_party/robin_hood.h', 'third_party/concurrentqueue.hpp'],
     
     # Include directories for header files.
     include_dirs=[

@@ -7,7 +7,8 @@ set -e
 
 # Base directory for experiments
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-EXP_BASE_DIR="$SCRIPT_DIR/Calico-VLDB26/data/exps/in-memory/tpcc"
+cd "$SCRIPT_DIR"
+EXP_BASE_DIR="${EXP_BASE_DIR:-${CALICO_RESULTS_DIR:-${SCRIPT_DIR}/exps}/in-memory/tpcc}"
 
 default_block_path() {
     if [ -n "${BLOCK:-}" ]; then
@@ -633,7 +634,7 @@ done
 
 echo
 echo "Running results extraction for all thread counts..."
-./extract_results_btree_ycsbc.sh
+./extract_results_btree_tpcc.sh
 
 echo
 echo "Experiment completed! Check ${EXP_BASE_DIR} for all results."

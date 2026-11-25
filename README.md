@@ -7,23 +7,77 @@ Calico is a high-performance buffer pool that combines the best aspects of diffe
 
 The key insight is that user-space indirection with huge page optimization can eliminate the traditional performance trade-offs between direct memory mapping and flexible buffer pool management.
 
+## Reproducible Paths
+
+Experiment scripts locate the repository from their own location. Run the commands
+below from the repository root; you can move the checkout without editing scripts.
+By default, datasets live in `data/` and experiment results in `exps/`, independently
+of the manuscript directories.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `CALICO_DATA_DIR` | `<repository>/data` | Dataset root for HNSW, DiskANN, and the IVF experiment runner |
+| `CALICO_RESULTS_DIR` | `<repository>/exps` | Shared result root for experiment runners and extraction scripts |
+| `BLOCK` | See the selected runner | Backing file or block device; most runners use `<repository>/heapfile` |
+
+To use another location, export the same settings when running experiments and
+extracting results. Use absolute overrides constructed from your current directory:
+
+```bash
+export CALICO_DATA_DIR="$PWD/data"
+export CALICO_RESULTS_DIR="$PWD/exps"
+
+# Run and summarize an experiment after preparing the required datasets.
+DATASET=sift1m bash exp_hnsw.sh
+bash extract_results_hnsw.sh sift1m
+```
+
+Expected dataset files relative to `CALICO_DATA_DIR` are:
+
+| Dataset | Directory | Files |
+| --- | --- | --- |
+| SIFT1M | `sift1m/` | `sift_base.fvecs`, `sift_query.fvecs`, `sift_groundtruth.ivecs` |
+| SIFT10M | `SIFT10M/` | `SIFT10Mfeatures.mat`, `ground_truth_indices.npy` |
+| DEEP10M | `deep10M/` | `base.10M.fbin`, `query.public.10K.fbin`, `groundtruth.ibin` |
+
+The Section 3 runner also supports a smaller reproduction run without a vector
+dataset:
+
+```bash
+bash section3_repro/run_robinhood_section3.sh smoke btree
+```
+
+Its default results go to `exps/in-memory/section3/<run-id>/`, and binaries and the
+backing file go to `build/section3/`. Override these with
+`CALICO_SECTION3_RESULTS_ROOT`, `CALICO_SECTION3_BIN_DIR`, and
+`CALICO_SECTION3_BLOCK`. HNSW ablations retain `CALICO_ABLATION_RESULTS_DIR`.
+Existing results remain in their original locations; set `CALICO_RESULTS_DIR` to
+the previous result root to summarize them.
+
+Baseline comparisons that select PrediCache require its source and Python module
+under `predictivetranslation-sigmod2026/`; initialize LeanStore and pybind11 with
+`git submodule update --init --recursive`. Individual benchmark configurations and
+memory requirements are specified in their experiment scripts.
+
 ## Automated Experiments
 
 The repository includes a comprehensive experiment suite for evaluating different buffer management strategies:
 
 ```bash
-# Run full multi-threaded experiment suite
-./exp_in_memory.sh
+# Run the multi-threaded B-tree lookup experiment suite
+bash exp_in_memory_btree_ycsbc.sh
 ```
 
-This script tests 5 configurations across 5 thread counts (1, 4, 8, 16, 32 threads):
+The script specifies the enabled configurations and thread counts. Buffer manager
+configurations include:
 - **calico_mmap**: Virtual memory cache using mmap (`TRADITIONAL=0`)
 - **calico_array**: Traditional buffer pool with array translator (`TRADITIONAL=1 TRADHASH=0`)
 - **calico_array_nohuge**: Array translator without huge pages for frame memory
 - **calico_unordered_hash**: Traditional buffer pool with std::unordered_map (`TRADHASH=1`)
 - **calico_openaddr_hash**: Traditional buffer pool with open addressing hash (`TRADHASH=2`)
 
-Results are automatically organized in `exps/in-memory/` with subdirectories for each thread count and a comprehensive summary in `results_summary.txt`.
+Results are organized in `exps/in-memory/btree_ycsbc/`, with subdirectories for
+each thread count and extracted CSV summaries.
 
 ### Graph BFS Benchmark Suite
 
@@ -109,41 +163,68 @@ TRADITIONAL=1 TRADHASH=0 python benchmark_hnsw.py
 * `TRADITIONAL=1` turns on the in-process buffer pool instead of the default vmcache/exmap fault-driven path. Pages are tracked with the lock-free frame array.
 * `TRADHASH=1` (only relevant together with `TRADITIONAL=1`) uses the sharded `std::unordered_map` translator, retaining per-shard read/write locks.
 * `TRADHASH=2` enables the new open-addressing translator, which keeps the same sharding layout but uses probing tables to avoid chaining overhead.
-* `TRADHASH=3` selects the single-access array translator, embedding the frame id directly into the page state to minimize metadata fetches.
+* `TRADHASH=0` selects the single-access array translator, embedding the frame id directly into the page state to minimize metadata fetches.
 * Leave both knobs unset to keep the original vmcache behaviour (`TRADITIONAL=0`, `EXMAP=0`), or combine `EXMAP=1` with `TRADITIONAL=0` to exercise the kernel-assisted variant.
 
-calico mmap: `TRADITIONAL=0 TRADHASH=0 RNDREAD=1 BLOCK=/home/zxjcarrot/Workspace/calico/heapfile THREADS=1 DATASIZE=2e7 ./calico`
+calico mmap: `TRADITIONAL=0 TRADHASH=0 RNDREAD=1 BLOCK=./heapfile THREADS=1 DATASIZE=2e7 ./calico_oltp_query`
 
-calico array (single access): `TRADITIONAL=1 TRADHASH=0 RNDREAD=1 BLOCK=/home/zxjcarrot/Workspace/calico/heapfile THREADS=1 DATASIZE=2e7 ./calico`
+calico array (single access): `TRADITIONAL=1 TRADHASH=0 RNDREAD=1 BLOCK=./heapfile THREADS=1 DATASIZE=2e7 ./calico_oltp_query`
 
-calico hash (unordered): `TRADITIONAL=1 TRADHASH=1 RNDREAD=1 BLOCK=/home/zxjcarrot/Workspace/calico/heapfile THREADS=1 DATASIZE=2e7 ./calico`
+calico hash (unordered): `TRADITIONAL=1 TRADHASH=1 RNDREAD=1 BLOCK=./heapfile THREADS=1 DATASIZE=2e7 ./calico_oltp_query`
 
-calico hash (open addressing): `TRADITIONAL=1 TRADHASH=2 RNDREAD=1 BLOCK=/home/zxjcarrot/Workspace/calico/heapfile THREADS=1 DATASIZE=2e7 ./calico`
+calico hash (open addressing): `TRADITIONAL=1 TRADHASH=2 RNDREAD=1 BLOCK=./heapfile THREADS=1 DATASIZE=2e7 ./calico_oltp_query`
 
-calico array (double access): `TRADITIONAL=1 TRADHASH=3 RNDREAD=1 BLOCK=/home/zxjcarrot/Workspace/calico/heapfile THREADS=1 DATASIZE=2e7 ./calico`
+calico array (double access): `TRADITIONAL=1 TRADHASH=3 RNDREAD=1 BLOCK=./heapfile THREADS=1 DATASIZE=2e7 ./calico_oltp_query`
 
-Graph BFS benchmark: `GRAPH=1 GRAPHN=10000 GRAPHSTART=0 ./calico`
+Graph BFS benchmark: `GRAPH=1 GRAPHN=10000 GRAPHSTART=0 ./calico_oltp_query`
 
 * `GRAPHN` controls the number of nodes/pages in the graph (default 1024).
 * `GRAPHSTART` selects the starting node index for the breadth-first search (default 0).
 
 ## Example Command Lines
 
-* TPC-C, 4 threads, 2 warehouses: `BLOCK=/dev/nvme0n1 THREADS=4 DATASIZE=2 ./calico`
-* random read, 10 threads, 1 million tuples: `RNDREAD=1 BLOCK=/dev/md0 THREADS=10 DATASIZE=1e6 ./calico`
+* TPC-C, 4 threads, 2 warehouses: `BLOCK=/dev/nvme0n1 THREADS=4 DATASIZE=2 ./calico_oltp_query`
+* random read, 10 threads, 1 million tuples: `RNDREAD=1 BLOCK=/dev/md0 THREADS=10 DATASIZE=1e6 ./calico_oltp_query`
 
 ## Dependencies and Configuration
 
-We need the libaoi library. On Ubuntu: `sudo apt install libaio-dev`.
+The C++ build requires libaio, liburing, and Abseil. The Python extension also
+requires Eigen and pybind11. On Ubuntu:
+
+```bash
+sudo apt install build-essential libaio-dev liburing-dev libabsl-dev libeigen3-dev
+python3 -m pip install pybind11 numpy h5py hnswlib
+git submodule update --init --recursive
+make -j"$(nproc)"
+python3 setup.py build_ext --inplace
+```
+
 You will probably also need to set `vm.overcommit_memory = 1` in `/etc/sysctl.conf`. Otherwise larger values of VIRTGB will not work.
 
 If you want to use EXMAP, you need the [exmap kernel module](https://github.com/tuhhosg/exmap).
 
 ## Citation
 
-Please cite the paper as follows:
+If you use Calico in your research, please cite our paper:
 
+```bibtex
+@article{zhou2026calico,
+  author    = {Xinjing Zhou and Jinming Hu and Andrew Pavlo and Michael Stonebraker},
+  title     = {Making Array-Based Translation Practical for Modern, High-Performance Buffer Management},
+  journal   = {Proceedings of the ACM on Management of Data},
+  volume    = {4},
+  number    = {6},
+  articleno = {361},
+  year      = {2026},
+  month     = dec,
+  doi       = {10.1145/3856356},
+  url       = {https://doi.org/10.1145/3856356},
+}
 ```
+
+VMCache reference:
+
+```bibtex
 @inproceedings{vmcache,
   author    = {Viktor Leis and Adnan Alhomssi and Tobias Ziegler and Yannick Loeck and Christian Dietrich},
   title     = {Virtual-Memory Assisted Buffer Management},

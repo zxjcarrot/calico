@@ -1,10 +1,12 @@
 #!/bin/bash
 
 # --- Configuration ---
-# source ~/anaconda3/etc/profile.d/conda.sh
-# conda activate fl-dedup
+# Activate your Python environment before running this script.
 
-PYTHON_CMD=$(which python3)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
+PYTHON_CMD="${PYTHON_EXECUTABLE:-$(command -v python3)}"
 BENCHMARK_SCRIPT="benchmark_diskann.py"
 FLAMEGRAPH_DIR="./FlameGraph"
 
@@ -29,7 +31,7 @@ profile_target_full_flow() {
 
     # 1. Start Python script in background, logging to both screen and file
     echo "Starting Python script..."
-    $PYTHON_CMD $BENCHMARK_SCRIPT --profile "$target_name" --pause 2>&1 | tee "$log_file" &
+    "$PYTHON_CMD" "$BENCHMARK_SCRIPT" --profile "$target_name" --pause 2>&1 | tee "$log_file" &
     PYTHON_BG_PID=$!
 
     # 2. Wait for the FIRST pause (before build)

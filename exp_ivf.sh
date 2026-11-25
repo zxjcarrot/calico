@@ -63,6 +63,7 @@ else
     #THREAD_COUNTS=(128)
 fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
 USER_DATASET_URL_OVERRIDE="${DATASET_URL:-}"
 USER_DATASET_ROOT_DIR_OVERRIDE="${DATASET_ROOT_DIR:-}"
 USER_DATASET_ARCHIVE_PATH_OVERRIDE="${DATASET_ARCHIVE_PATH:-}"
@@ -138,7 +139,7 @@ configure_dataset() {
             DATASET="dbpedia_openai_1m"
             DATASET_BUFFER_POOL_SIZE="9G"
             DATASET_URL="${DATASET_URL:-https://storage.googleapis.com/ann-filtered-benchmark/datasets/dbpedia_openai_1M.tgz}"
-            DATASET_ROOT_DIR="${DATASET_ROOT_DIR:-${SCRIPT_DIR}/data/ann-filtered-benchmark}"
+            DATASET_ROOT_DIR="${DATASET_ROOT_DIR:-${CALICO_DATA_DIR:-${SCRIPT_DIR}/data}/ann-filtered-benchmark}"
             DATASET_ARCHIVE_PATH="${DATASET_ARCHIVE_PATH:-${DATASET_ROOT_DIR}/dbpedia_openai_1M.tgz}"
             DATASET_H5_FILENAME="${DATASET_H5_FILENAME:-dbpedia_openai_1M.h5}"
             DATASET_LOCAL_FILE="${DATASET_LOCAL_FILE:-${DATASET_ROOT_DIR}/${DATASET_H5_FILENAME}}"
@@ -152,7 +153,7 @@ configure_dataset() {
             DATASET="gist1m"
             DATASET_BUFFER_POOL_SIZE="5G"
             DATASET_URL="${DATASET_URL:-http://ann-benchmarks.com/gist-960-euclidean.hdf5}"
-            DATASET_ROOT_DIR="${DATASET_ROOT_DIR:-${SCRIPT_DIR}/data/ann-benchmarks/gist-960-euclidean}"
+            DATASET_ROOT_DIR="${DATASET_ROOT_DIR:-${CALICO_DATA_DIR:-${SCRIPT_DIR}/data}/ann-benchmarks/gist-960-euclidean}"
             DATASET_LOCAL_FILE="${DATASET_LOCAL_FILE:-${DATASET_ROOT_DIR}/gist-960-euclidean.hdf5}"
             DATASET_PAGE_SIZE_BYTES="${DATASET_PAGE_SIZE_BYTES:-4096}"
             DATASET_DOWNLOAD_MODE="direct_hdf5"
@@ -161,7 +162,7 @@ configure_dataset() {
             DATASET="msong"
             DATASET_BUFFER_POOL_SIZE="3G"
             DATASET_URL="${DATASET_URL:-https://www.cse.cuhk.edu.hk/systems/hash/gqr/dataset/msong.tar.gz}"
-            DATASET_ROOT_DIR="${DATASET_ROOT_DIR:-${SCRIPT_DIR}/data/gqr/msong}"
+            DATASET_ROOT_DIR="${DATASET_ROOT_DIR:-${CALICO_DATA_DIR:-${SCRIPT_DIR}/data}/gqr/msong}"
             DATASET_ARCHIVE_PATH="${DATASET_ARCHIVE_PATH:-${DATASET_ROOT_DIR}/msong.tar.gz}"
             DATASET_LOCAL_FILE="${DATASET_LOCAL_FILE:-${DATASET_ROOT_DIR}/msong-ivf.hdf5}"
             DATASET_PAGE_SIZE_BYTES="${DATASET_PAGE_SIZE_BYTES:-4096}"
@@ -170,7 +171,7 @@ configure_dataset() {
         sift1m|sift1M)
             DATASET="sift1m"
             DATASET_BUFFER_POOL_SIZE="0.5G"
-            DATASET_ROOT_DIR="${DATASET_ROOT_DIR:-${SCRIPT_DIR}/data/sift1m}"
+            DATASET_ROOT_DIR="${DATASET_ROOT_DIR:-${CALICO_DATA_DIR:-${SCRIPT_DIR}/data}/sift1m}"
             DATASET_LOCAL_FILE="${DATASET_LOCAL_FILE:-${DATASET_ROOT_DIR}/sift1m-ivf.hdf5}"
             DATASET_SOURCE_BASE_FILE="${DATASET_SOURCE_BASE_FILE:-${DATASET_ROOT_DIR}/sift_base.fvecs}"
             DATASET_SOURCE_QUERY_FILE="${DATASET_SOURCE_QUERY_FILE:-${DATASET_ROOT_DIR}/sift_query.fvecs}"
@@ -183,7 +184,7 @@ configure_dataset() {
             DATASET="sift10M"
             DATASET_BUFFER_POOL_SIZE="7G"
             dataset_base_limit_default="10000000"
-            DATASET_ROOT_DIR="${DATASET_ROOT_DIR:-${SCRIPT_DIR}/data/SIFT10M}"
+            DATASET_ROOT_DIR="${DATASET_ROOT_DIR:-${CALICO_DATA_DIR:-${SCRIPT_DIR}/data}/SIFT10M}"
             DATASET_LOCAL_FILE="${DATASET_LOCAL_FILE:-${DATASET_ROOT_DIR}/sift10M-ivf.hdf5}"
             DATASET_SOURCE_MAT_FILE="${DATASET_SOURCE_MAT_FILE:-$(first_existing_path_or_default \
                 "${DATASET_ROOT_DIR}/SIFT10Mfeatures.mat" \
@@ -305,7 +306,7 @@ configure_experiment_mode() {
 
     ACTIVE_EXPERIMENT_MODE="$experiment_mode"
     ACTIVE_DATASET_RESULTS_DIR_NAME="$(dataset_results_dir_name "$DATASET" "$ACTIVE_BUFFER_POOL_SIZE")"
-    RESULTS_BASE_DIR="${SCRIPT_DIR}/Calico-VLDB26/data/exps/${ACTIVE_EXPERIMENT_MODE}/ivf/${ACTIVE_DATASET_RESULTS_DIR_NAME}"
+    RESULTS_BASE_DIR="${CALICO_RESULTS_DIR:-${SCRIPT_DIR}/exps}/${ACTIVE_EXPERIMENT_MODE}/ivf/${ACTIVE_DATASET_RESULTS_DIR_NAME}"
 
     apply_buffer_pool_size "$ACTIVE_BUFFER_POOL_SIZE"
     apply_prefetch_window_for_mode "$ACTIVE_PREFETCH_WINDOW_SIZE"
@@ -1568,7 +1569,7 @@ main() {
             echo ""
 
             echo "Extracting IVF results for ${DATASET} (${ACTIVE_EXPERIMENT_MODE})..."
-            RESULTS_ROOT_DIR="${SCRIPT_DIR}/Calico-VLDB26/data/exps/${ACTIVE_EXPERIMENT_MODE}/ivf" ./extract_results_ivf.sh "$ACTIVE_DATASET_RESULTS_DIR_NAME"
+            RESULTS_ROOT_DIR="${CALICO_RESULTS_DIR:-${SCRIPT_DIR}/exps}/${ACTIVE_EXPERIMENT_MODE}/ivf" ./extract_results_ivf.sh "$ACTIVE_DATASET_RESULTS_DIR_NAME"
         done
     done
 

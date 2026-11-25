@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+DATA_ROOT = Path(os.environ.get('CALICO_DATA_DIR', SCRIPT_DIR / 'data')).expanduser().resolve()
 
 # Resolve local modules from the repository root instead of the caller's cwd.
 for path_entry in (
@@ -2266,7 +2267,7 @@ if __name__ == "__main__":
     
     # Load dataset
     if args.dataset == "sift1m":
-        DATA_DIR = str(SCRIPT_DIR / "data" / "sift1m")
+        DATA_DIR = str(DATA_ROOT / "sift1m")
         BASE_FILE = os.path.join(DATA_DIR, "sift_base.fvecs")
         QUERY_FILE = os.path.join(DATA_DIR, "sift_query.fvecs")
         GT_FILE = os.path.join(DATA_DIR, "sift_groundtruth.ivecs")
@@ -2286,7 +2287,7 @@ if __name__ == "__main__":
         print(f"Query vectors shape: {X_query.shape}")
         print(f"Ground truth shape: {ground_truth.shape}")
     elif args.dataset == "deep10M":
-        DATA_DIR = str(SCRIPT_DIR / "data" / "deep10M")
+        DATA_DIR = str(DATA_ROOT / "deep10M")
         BASE_FILE = os.path.join(DATA_DIR, "base.10M.fbin")
         QUERY_FILE = os.path.join(DATA_DIR, "query.public.10K.fbin")
         GT_FILE = os.path.join(DATA_DIR, "groundtruth.ibin")
@@ -2306,7 +2307,7 @@ if __name__ == "__main__":
         print(f"Query vectors shape: {X_query.shape}")
         print(f"Ground truth shape: {ground_truth.shape}")
     elif args.dataset == "sift10M":
-        DATA_DIR = str(SCRIPT_DIR / "data" / "SIFT10M")
+        DATA_DIR = str(DATA_ROOT / "SIFT10M")
         MAT_FILE = os.path.join(DATA_DIR, "SIFT10Mfeatures.mat")
         GT_FILE = os.path.join(DATA_DIR, "ground_truth_indices.npy")
 

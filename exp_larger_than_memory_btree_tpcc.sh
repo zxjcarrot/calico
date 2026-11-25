@@ -7,7 +7,8 @@
 
 # Base directory for experiments
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-EXP_BASE_DIR="${SCRIPT_DIR}/Calico-VLDB26/data/exps/larger-than-memory/btree_tpcc"
+cd "$SCRIPT_DIR"
+EXP_BASE_DIR="${EXP_BASE_DIR:-${CALICO_RESULTS_DIR:-${SCRIPT_DIR}/exps}/larger-than-memory/btree_tpcc}"
 
 # Data sizes to test (in warehouses)
 DATA_SIZES=(20 40 80 100 200 400 800)

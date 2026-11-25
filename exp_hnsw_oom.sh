@@ -30,8 +30,9 @@ export VIRTGB=16G
 #PHYSGB_VALUES=(10 5 2.5)
 PHYSGB_VALUES=(10 5 2.5 1.5)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
 USER_BLOCK_OVERRIDE="${BLOCK:-}"
-RESULTS_BASE_DIR="${SCRIPT_DIR}/Calico-VLDB26/data/exps/larger-than-memory/hnsw-${DATASET}"
+RESULTS_BASE_DIR="${RESULTS_BASE_DIR:-${CALICO_RESULTS_DIR:-${SCRIPT_DIR}/exps}/larger-than-memory/hnsw-${DATASET}}"
 
 # Calico configurations to test
 # Format: config_name:TRADITIONAL:TRADHASH:NOHUGEPAGE_FRAME_MEM:PREFETCH:LIBRARY

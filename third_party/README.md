@@ -11,3 +11,14 @@
 
 The commit is pinned here so experiment builds do not depend on the mutable
 `master` URL used to import the file.
+
+## concurrentqueue.hpp
+
+- Project: `cameron314/concurrentqueue`
+- Source: `concurrentqueue.h`
+- Imported unchanged from the local PrediCache dependency's `third_party/concurrentqueue.hpp`.
+- SHA-256: `524bc2de581ecc95e632ee6aac2676d6a1029a692a9c1b4a32e4a80608abad5e`
+- License: Simplified BSD (the complete notice is retained in the header).
+
+Calico vendors this header directly so its core build does not require a separate
+PrediCache checkout.

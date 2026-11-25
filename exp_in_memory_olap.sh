@@ -8,7 +8,8 @@ set -e
 
 # Base directory for experiments
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-EXP_BASE_DIR="${SCRIPT_DIR}/exps/in-memory/olap_row"
+cd "$SCRIPT_DIR"
+EXP_BASE_DIR="${EXP_BASE_DIR:-${CALICO_RESULTS_DIR:-${SCRIPT_DIR}/exps}/in-memory/olap_row}"
 
 # Fixed page size: 8KB
 FIXED_PAGE_SIZE_KB=8

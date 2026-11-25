@@ -25,8 +25,8 @@ export POOLGB=14G
 THREAD_COUNTS=(1 4 8 16 32 64)
 #THREAD_COUNTS=(128)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-USER_BLOCK_OVERRIDE="${BLOCK:-}"
 cd "$SCRIPT_DIR"
+USER_BLOCK_OVERRIDE="${BLOCK:-}"
 
 default_block_path() {
     if [ -n "$USER_BLOCK_OVERRIDE" ]; then
@@ -257,7 +257,7 @@ if ! PYTHONPATH="${SCRIPT_DIR}/predictivetranslation-sigmod2026:${SCRIPT_DIR}:${
 fi
 
 # Base directory for results
-RESULTS_BASE_DIR="${SCRIPT_DIR}/Calico-VLDB26/data/exps/in-memory/hnsw/${DATASET}/"
+RESULTS_BASE_DIR="${RESULTS_BASE_DIR:-${CALICO_RESULTS_DIR:-${SCRIPT_DIR}/exps}/in-memory/hnsw/${DATASET}/}"
 
 # Usearch index file location (built once, used by all search runs)
 USEARCH_INDEX_FILE="${SCRIPT_DIR}/exps/usearch_index.bin"

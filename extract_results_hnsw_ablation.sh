@@ -3,7 +3,7 @@
 # Extract and summarize Ablation benchmark results
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-RESULTS_BASE_DIR="${CALICO_ABLATION_RESULTS_DIR:-${SCRIPT_DIR}/Calico-SIGMOD27/data/exps/in-memory/ablation_figure11_hash_then_array}"
+RESULTS_BASE_DIR="${CALICO_ABLATION_RESULTS_DIR:-${CALICO_RESULTS_DIR:-${SCRIPT_DIR}/exps}/in-memory/ablation_figure11_hash_then_array}"
 OUTPUT_CSV="${RESULTS_BASE_DIR}/ablation_results_summary.csv"
 
 # Configuration names (directories)

@@ -2,7 +2,7 @@
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DATASET="${1:-${DATASET:-all}}"
-RESULTS_ROOT_DIR="${RESULTS_ROOT_DIR:-${SCRIPT_DIR}/Calico-VLDB26/data/exps/in-memory/ivf}"
+RESULTS_ROOT_DIR="${RESULTS_ROOT_DIR:-${CALICO_RESULTS_DIR:-${SCRIPT_DIR}/exps}/in-memory/ivf}"
 LEGACY_OUTPUT_CSV="${RESULTS_ROOT_DIR}/ivf_results_summary.csv"
 MEMORY_BW_METRIC="${MEMORY_BW_METRIC:-nps1_die_to_dram}"
 

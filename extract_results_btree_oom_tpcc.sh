@@ -11,7 +11,7 @@ detect_script_dir() {
 }
 
 SCRIPT_DIR="$(detect_script_dir)"
-EXP_BASE_DIR="${SCRIPT_DIR}/Calico-VLDB26/data/exps/larger-than-memory/btree_tpcc"
+EXP_BASE_DIR="${EXP_BASE_DIR:-${CALICO_RESULTS_DIR:-${SCRIPT_DIR}/exps}/larger-than-memory/btree_tpcc}"
 
 # Warehouse scales to process (must match exp_larger_than_memory_btree_tpcc.sh)
 DATA_SIZES=(20 40 80 100 200 400 800)

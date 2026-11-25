@@ -2,7 +2,7 @@ vmcache
 heapfile
 calico
 *~
-exps/in-memory
+exps/
 data/
 *.so
 build/*

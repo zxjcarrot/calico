@@ -3,7 +3,8 @@
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}" )" && pwd)"
-RESULTS_BASE_DIR="${CALICO_ABLATION_RESULTS_DIR:-${SCRIPT_DIR}/Calico-SIGMOD27/data/exps/in-memory/ablation_figure11_hash_then_array}"
+cd "$SCRIPT_DIR"
+RESULTS_BASE_DIR="${CALICO_ABLATION_RESULTS_DIR:-${CALICO_RESULTS_DIR:-${SCRIPT_DIR}/exps}/in-memory/ablation_figure11_hash_then_array}"
 LOCK_FILE="${CALICO_ABLATION_LOCK_FILE:-${TMPDIR:-/tmp}/calico-exp-hnsw-ablation.lock}"
 BLOCK_FILE="${BLOCK:-${TMPDIR:-/tmp}/calico-hnsw-ablation.heapfile}"
 HEAPFILE_SIZE="${CALICO_HEAPFILE_SIZE:-24G}"

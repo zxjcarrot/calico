@@ -6,7 +6,7 @@
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DATASET="${1:-${DATASET:-deep10M}}"
-RESULTS_BASE_DIR="${SCRIPT_DIR}/Calico-VLDB26/data/exps/larger-than-memory/hnsw-${DATASET}"
+RESULTS_BASE_DIR="${RESULTS_BASE_DIR:-${CALICO_RESULTS_DIR:-${SCRIPT_DIR}/exps}/larger-than-memory/hnsw-${DATASET}}"
 
 # Output CSV file
 OUTPUT_CSV="${RESULTS_BASE_DIR}/hnsw_oom_results_summary.csv"
